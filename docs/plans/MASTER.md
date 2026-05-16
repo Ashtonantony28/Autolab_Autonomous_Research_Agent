@@ -25,7 +25,7 @@ These are documented as ADRs as they're decided.
 | 1 | Data models & state | `phase_1.md` | ✅ done |
 | 2 | VeriCoT verification engine ⭐ | `phase_2.md` | ✅ done |
 | 3 | Individual agents (5) | `phase_3.md` | ✅ done |
-| 4 | Orchestration | `phase_4.md` | pending |
+| 4 | Orchestration | `phase_4.md` | ✅ done |
 | 5 | Tools & integrations | `phase_5.md` | pending |
 | 6 | Monitoring & dashboard | `phase_6.md` | pending |
 | 7 | Benchmark & hardening | `phase_7.md` | pending |

@@ -129,3 +129,34 @@ make test       -> 98 passed in 0.84s
 
 ### Next
 Phase 4 — Orchestration. LangGraph StateGraph wiring all 5 agents with conditional edges on verifier verdict, HITL interrupt() nodes, and retry/escalation recovery.
+
+---
+
+## Phase 4 — Orchestration ✅
+
+**Date:** 2026-05-16
+
+### Shipped
+- `orchestrator/routing.py` — `route_after_agent(state, *, terminal)` returning `next`/`hitl`/`end` based on `hitl_pending` and `confidence`.
+- `orchestrator/recovery.py` — `with_retries` async helper with exponential backoff and type-filtered re-raise.
+- `orchestrator/checkpoints.py` — `hitl_node` using LangGraph's `interrupt()`, plus `new_in_process_saver` returning a `MemorySaver`.
+- `orchestrator/graph.py` — `build_graph(*, llm, simulator, checkpointer)` wiring the four producing agents + HITL node into a compiled `StateGraph`. Conditional edges after every agent.
+- Tests: 4 routing + 5 recovery + 3 graph integration (full run, HITL pause + resume, multi-thread isolation). All green.
+- Hardened the agent test helpers to namespace symbol names by agent so multiple agents on one `FakeLLMClient` don't collide on formalize-prompt keys.
+
+### Coverage on `autolab.orchestrator`: **97%**
+
+### Gates
+```
+make lint       -> All checks passed; 67 files already formatted
+make typecheck  -> Success: no issues found in 67 source files
+make test       -> 110 passed in 1.13s
+```
+
+### Deferred / watching
+- The `_make_router` factory closes over the target name but ignores it (router function uses `route_after_agent`'s static decision). Kept the parameter for readability; safe to remove if Phase 5 doesn't need it.
+- LangGraph's `MemorySaver` is in-process only. ADR-0004's Redis-backed external checkpointer (`RedisCheckpointer`) is intentionally a separate concern — coexistence pattern lives until Phase 6 wires it through the dashboard.
+- The HITL `interrupt()` discards the resume payload; Phase 6's dashboard will surface and consume it.
+
+### Next
+Phase 5 — Tools & integrations. arxiv + PubMed clients with caching; flesh out `LabSimulator` with noise + multiple instruments behind a `HardwareAdapter` protocol; multimodal RAG using chromadb (`--extra rag`).
