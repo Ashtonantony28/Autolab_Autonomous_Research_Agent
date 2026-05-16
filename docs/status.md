@@ -94,3 +94,38 @@ verification cov-> 95% (>=90 target)
 
 ### Next
 Phase 3 — Individual agents. Build BaseAgent ABC + Research → Design → Execute → Analysis → VerificationMonitor in order. Each agent extends `BaseAgent`, which enforces produce → verify → state-update.
+
+---
+
+## Phase 3 — Individual Agents ✅
+
+**Date:** 2026-05-16
+
+### Shipped
+- `agents/base.py` — `BaseAgent[PayloadT]` generic ABC with template `__call__`: produce → verify → HITL-or-state-update. `AgentDecision` StrEnum (PASS/RETRY/ESCALATE). `HITL_THRESHOLD = 0.7`.
+- `agents/research.py` — `ResearchAgent` emitting `Hypothesis`. Two LLM calls (hypothesis + trace).
+- `agents/design.py` — `DesignAgent` emitting `ExperimentDesign` for the latest Hypothesis.
+- `agents/execute.py` — `ExecuteAgent` running `LabSimulator` and emitting `ExperimentResult`.
+- `agents/analysis.py` — `AnalysisAgent` emitting `AnalysisReport` (new model added to state/models.py with ranked dense interpretations).
+- `agents/verification_monitor.py` — `VerificationMonitor.decide(verdict)` returning PASS/RETRY/ESCALATE based on a 0.7 / 0.4 split.
+- `tools/lab_hardware/simulator.py` — stub `LabSimulator` (will grow in Phase 5).
+- `verification/llm.py` — added `ClaudeLLMClient` real adapter. Not exercised in tests; live tests gated on `RUN_LIVE_TESTS=1`.
+- New tests: 18 agent tests (research, design, execute, analysis, verification monitor) + 3 model tests for `AnalysisReport`/`Interpretation`.
+- ADR-0006 (AgentOutput + HITL threshold placement).
+
+### Coverage on `autolab.agents`: **100%**
+
+### Gates
+```
+make lint       -> All checks passed
+make typecheck  -> Success: no issues found in 62 source files
+make test       -> 98 passed in 0.84s
+```
+
+### Deferred / watching
+- `ClaudeLLMClient` not exercised — Phase 4 or Phase 7 should add a live smoke test under `RUN_LIVE_TESTS=1` once an API key is available.
+- The reasoning traces produced in tests are deliberately trivial (P → P) just to clear the verifier. Real agents will need richer traces; this is fine because the verifier remains the source of truth.
+- `AnalysisReport` is not currently appended to state by the AnalysisAgent — see ADR-0006.
+
+### Next
+Phase 4 — Orchestration. LangGraph StateGraph wiring all 5 agents with conditional edges on verifier verdict, HITL interrupt() nodes, and retry/escalation recovery.

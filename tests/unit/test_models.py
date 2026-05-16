@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from autolab.state.models import (
+    AnalysisReport,
     Citation,
     ConfidenceScore,
     ExperimentDesign,
@@ -16,6 +17,7 @@ from autolab.state.models import (
     ExperimentResult,
     HITLRequest,
     Hypothesis,
+    Interpretation,
     Measurement,
     ReasoningStep,
     ReasoningTrace,
@@ -91,6 +93,17 @@ class TestRoundtrip:
         )
         assert HITLRequest.model_validate_json(h.model_dump_json()) == h
 
+    def test_analysis_report(self) -> None:
+        r = AnalysisReport(
+            result_id=uuid4(),
+            interpretations=(
+                Interpretation(statement="a", rank=0, likelihood=0.8),
+                Interpretation(statement="b", rank=1, likelihood=0.2),
+            ),
+            summary="primary signal real",
+        )
+        assert AnalysisReport.model_validate_json(r.model_dump_json()) == r
+
 
 class TestValidation:
     def test_confidence_out_of_range(self) -> None:
@@ -140,6 +153,21 @@ class TestValidation:
                 estimated_cost_usd=-1.0,
                 estimated_duration_minutes=1.0,
             )
+
+    def test_analysis_report_requires_dense_ranks(self) -> None:
+        with pytest.raises(ValidationError):
+            AnalysisReport(
+                result_id=uuid4(),
+                interpretations=(
+                    Interpretation(statement="a", rank=0, likelihood=0.5),
+                    Interpretation(statement="b", rank=2, likelihood=0.5),  # gap
+                ),
+                summary="x",
+            )
+
+    def test_analysis_report_requires_at_least_one_interpretation(self) -> None:
+        with pytest.raises(ValidationError):
+            AnalysisReport(result_id=uuid4(), interpretations=(), summary="x")
 
     def test_unknown_field_rejected(self) -> None:
         with pytest.raises(ValidationError):

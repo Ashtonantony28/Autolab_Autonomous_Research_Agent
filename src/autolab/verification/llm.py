@@ -9,9 +9,12 @@ specific SDK.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-LLMPurpose = Literal["formalize", "commonsense"]
+# A short stable string identifying the call site (e.g. "formalize",
+# "commonsense", "research.hypothesis"). Used for prompt routing and
+# fake-LLM lookup keys.
+LLMPurpose = str
 
 
 @runtime_checkable
@@ -42,4 +45,45 @@ class FakeLLMClient:
         return self._responses[key]
 
 
-__all__ = ["FakeLLMClient", "LLMClient", "LLMPurpose"]
+class ClaudeLLMClient:
+    """Thin async adapter over `anthropic.AsyncAnthropic`.
+
+    Constructed but never invoked during unit/integration tests — every
+    test path uses `FakeLLMClient`. The `RUN_LIVE_TESTS=1` env flag gates
+    any test that actually calls Claude (none in Phase 3).
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = "claude-sonnet-4-6",
+        max_tokens: int = 4096,
+    ) -> None:
+        if not api_key:
+            raise ValueError("ClaudeLLMClient requires a non-empty api_key")
+        self._api_key = api_key
+        self._model = model
+        self._max_tokens = max_tokens
+
+    async def call(self, purpose: LLMPurpose, prompt: str) -> str:
+        # Lazy import so the verification module doesn't pay the anthropic
+        # import cost when only FakeLLMClient is in use.
+        from anthropic import AsyncAnthropic
+        from anthropic.types import TextBlock
+
+        client = AsyncAnthropic(api_key=self._api_key)
+        response = await client.messages.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=[
+                {"role": "user", "content": f"[purpose={purpose}]\n\n{prompt}"},
+            ],
+        )
+        for block in response.content:
+            if isinstance(block, TextBlock):
+                return block.text
+        raise RuntimeError(f"Claude returned no text content for purpose={purpose!r}")
+
+
+__all__ = ["ClaudeLLMClient", "FakeLLMClient", "LLMClient", "LLMPurpose"]

@@ -194,7 +194,36 @@ class HITLRequest(_Mutable):
     created_at: datetime = Field(default_factory=_utc_now)
 
 
+class Interpretation(_Frozen):
+    """One candidate explanation for an ExperimentResult."""
+
+    statement: str
+    rank: int = Field(ge=0)
+    likelihood: Confidence
+
+
+class AnalysisReport(_Frozen):
+    """Ranked interpretations produced by the Analysis Agent."""
+
+    id: UUID = Field(default_factory=uuid4)
+    result_id: UUID
+    interpretations: tuple[Interpretation, ...]
+    summary: str
+    created_at: datetime = Field(default_factory=_utc_now)
+
+    @field_validator("interpretations")
+    @classmethod
+    def _ranks_are_dense(cls, interps: tuple[Interpretation, ...]) -> tuple[Interpretation, ...]:
+        if not interps:
+            raise ValueError("AnalysisReport must have at least one interpretation")
+        ranks = sorted(i.rank for i in interps)
+        if ranks != list(range(len(ranks))):
+            raise ValueError(f"interpretation ranks must be dense 0-based, got {ranks}")
+        return interps
+
+
 __all__ = [
+    "AnalysisReport",
     "Citation",
     "CitationSource",
     "ClaimType",
@@ -206,6 +235,7 @@ __all__ = [
     "ExperimentStatus",
     "HITLRequest",
     "Hypothesis",
+    "Interpretation",
     "Measurement",
     "ParameterValue",
     "ReasoningStep",
