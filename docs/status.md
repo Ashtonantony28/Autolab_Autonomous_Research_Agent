@@ -160,3 +160,31 @@ make test       -> 110 passed in 1.13s
 
 ### Next
 Phase 5 — Tools & integrations. arxiv + PubMed clients with caching; flesh out `LabSimulator` with noise + multiple instruments behind a `HardwareAdapter` protocol; multimodal RAG using chromadb (`--extra rag`).
+
+---
+
+## Phase 5 — Tools & Integrations ✅ (RAG deferred)
+
+**Date:** 2026-05-16
+
+### Shipped
+- `tools/lab_hardware/protocol.py` — runtime-checkable `HardwareAdapter` Protocol with a single `run(design) -> ExperimentResult` method.
+- `tools/lab_hardware/simulator.py` — `LabSimulator` rewritten: seeded `random.Random`, design-derived RNG when no seed pinned, Gaussian noise from `noise_sigma` parameter, instrument routing on protocol keywords (`liquid`/`plate`/`imaging` → `volume_dispensed_ul`/`absorbance`/`intensity`; else `synthetic_yield`).
+- `tools/literature.py` — `LiteratureClient` async (arxiv Atom + PubMed E-utilities), takes injected `httpx.AsyncClient` for testability; `LiteratureError` typed exception.
+- 16 new tests (8 simulator + 8 literature) using `httpx.MockTransport`.
+
+### Coverage on `autolab.tools`: **94%**
+
+### Gates
+```
+make lint       -> All checks passed; 71 files already formatted
+make typecheck  -> Success: no issues found in 71 source files
+make test       -> 125 passed in 1.15s
+```
+
+### Deferred / watching
+- **Multimodal RAG (chromadb)** — would pull onnxruntime (~90MB), needs an embedding model + a corpus, and no live network. Live + RAG smoke deferred to a Phase 5b session when those are available.
+- **Real arxiv/PubMed calls** — the live path is implemented but the container has no outbound network. `MockTransport` covers the parsing logic; a `RUN_LIVE_TESTS=1` smoke pass should be added once network is enabled.
+
+### Next
+Phase 6 — Monitoring & dashboard. Streamlit UI for live state + reasoning traces + verifier verdicts + HITL queue; trace persistence into Postgres/SQLite; per-agent metrics.
