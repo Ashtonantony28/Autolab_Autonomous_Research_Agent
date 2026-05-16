@@ -14,7 +14,7 @@ def test_package_version_is_pinned() -> None:
 
 
 def test_cli_main_prints_banner(capsys: pytest.CaptureFixture[str]) -> None:
-    cli.main()
+    cli.main([])
     captured = capsys.readouterr()
     assert "AutoLab v0.0.0" in captured.out
     assert "skeleton OK" in captured.out
