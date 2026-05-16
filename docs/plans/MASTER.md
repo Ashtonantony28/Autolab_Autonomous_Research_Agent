@@ -21,9 +21,9 @@ These are documented as ADRs as they're decided.
 
 | Phase | Title | Plan | Status |
 |---|---|---|---|
-| 0 | Foundation | `phase_0.md` | in progress |
-| 1 | Data models & state | `phase_1.md` | pending |
-| 2 | VeriCoT verification engine ⭐ | `phase_2.md` | pending |
+| 0 | Foundation | `phase_0.md` | ✅ done |
+| 1 | Data models & state | `phase_1.md` | ✅ done |
+| 2 | VeriCoT verification engine ⭐ | `phase_2.md` | in progress |
 | 3 | Individual agents (5) | `phase_3.md` | pending |
 | 4 | Orchestration | `phase_4.md` | pending |
 | 5 | Tools & integrations | `phase_5.md` | pending |

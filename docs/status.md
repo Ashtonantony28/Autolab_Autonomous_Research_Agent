@@ -30,3 +30,34 @@ make run        -> AutoLab v0.0.0 - skeleton OK
 
 ### Next
 Phase 1 — data models & state. Plan to be written in `docs/plans/phase_1.md` before any code.
+
+---
+
+## Phase 1 — Data Models & State ✅
+
+**Date:** 2026-05-16
+
+### Shipped
+- `state/models.py` — 13 Pydantic v2 models (Hypothesis, ExperimentDesign, ExperimentResult, ReasoningTrace, VerificationResult, ConfidenceScore, HITLRequest, etc.), all frozen value types where appropriate, strict validation (range checks, no forward references in step indices, dense index requirements, no duplicate verdict indices).
+- `state/schema.py` — `AutoLabState` TypedDict with `Annotated[list[...], add]` reducers, `empty_state()` factory.
+- `state/store.py` — async SQLAlchemy 2.0 persistence (JSON blob per entity + projected columns), `StateStore` class with `create_run`/`append`/`load_*`.
+- `state/checkpointer.py` — `Checkpointer` protocol + `InMemoryCheckpointer` + `RedisCheckpointer` (RedisCheckpointer untested without live Redis).
+- 30 tests total — 16 unit (models), 4 schema, 4 store integration, 3 checkpointer, plus the 3 carry-over smoke tests.
+- ADR-0003 (SQLite-in-tests, Postgres-in-prod), ADR-0004 (LangGraph checkpoint integration deferred to Phase 4).
+
+### Coverage on `autolab.state`: **93%** (target was ≥80%)
+
+### Gates
+```
+make lint       -> All checks passed; 44 files already formatted
+make typecheck  -> Success: no issues found in 44 source files
+make test       -> 30 passed in 1.42s
+```
+
+### Deferred / watching
+- `RedisCheckpointer` is implemented but not covered (no Redis service). Will gate behind `RUN_LIVE_TESTS=1` once a CI service container exists.
+- Alembic init not run in this phase — there's nothing Postgres-specific to migrate yet. Will land alongside the first Postgres-only need.
+- LangGraph `BaseCheckpointSaver` adapter deferred to Phase 4 per ADR-0004.
+
+### Next
+Phase 2 — VeriCoT verification engine. ⭐ Foundation phase. TDD-first, ≥90% coverage target, 20 golden traces.
