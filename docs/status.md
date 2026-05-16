@@ -216,3 +216,41 @@ make test       -> 138 passed in 1.35s
 
 ### Next
 Phase 7 — Benchmark & hardening: error-injection harness for the verifier, 3 simulator-driven benchmark scenarios, hardening pass.
+
+---
+
+## Phase 7 — Benchmark & Hardening ✅
+
+**Date:** 2026-05-16
+
+### Shipped
+- `scripts/error_injection.py` — runs all 20 golden fixtures through the Verifier, reports catch rate. **Catch rate: 10/10 (100%)** against the ≥80% DoD target. Valid traces correctly admitted: 10/10.
+- `scripts/run_benchmark.py` — three end-to-end scenarios (`protein_crystallization`, `compound_activity`, `materials_optimization`) driving the full StateGraph against the `LabSimulator`. All three complete with `consistency_score=1.0`.
+- `autolab run "<question>"` CLI subcommand wiring `ClaudeLLMClient` (when `ANTHROPIC_API_KEY` is set) or `FakeLLMClient` otherwise.
+- 2 integration tests gating both benchmarks; `docs/benchmarks/v1.md` summary written.
+
+### Gates
+```
+make lint       -> All checks passed; 82 files already formatted
+make typecheck  -> Success: no issues found in 79 source files
+make test       -> 140 passed in 1.39s
+```
+
+### Final coverage by module
+```
+autolab.state          93%
+autolab.verification   95%
+autolab.agents        100%
+autolab.orchestrator   97%
+autolab.tools          94%
+autolab.monitoring    100%
+```
+
+### Final summary
+All 7 phases complete. The system runs end-to-end: a research question flows through five verified agents into a structured result + analysis, with HITL escalation on low-confidence verdicts and full state persistence.
+
+**Limitations explicitly documented:**
+- No live Anthropic API exercise in CI (no key in container).
+- No real lab hardware — simulator only.
+- Multimodal RAG (chromadb) deferred as Phase 5b.
+- Streamlit dashboard rendered only via the pure-data helper; visual QA owed.
