@@ -188,3 +188,31 @@ make test       -> 125 passed in 1.15s
 
 ### Next
 Phase 6 — Monitoring & dashboard. Streamlit UI for live state + reasoning traces + verifier verdicts + HITL queue; trace persistence into Postgres/SQLite; per-agent metrics.
+
+---
+
+## Phase 6 — Monitoring & Dashboard ✅
+
+**Date:** 2026-05-16
+
+### Shipped
+- `monitoring/tracer.py` — `RunTracer.record_state(run_id, state)` appends new entities to the StateStore. Seen-set keyed by (run, kind, id) so verifications don't collide with the traces they reference. Idempotent across calls.
+- `monitoring/metrics.py` — `Metrics` collection with per-agent counters (invocations, avg latency, avg consistency, HITL escalations) and a JSON-friendly `snapshot()`.
+- `monitoring/dashboard.py` — Streamlit UI with **lazy** streamlit import so the module is safe to test. Pure-data helper `render_trace_table(state)` returns a list-of-lists that's fully unit-testable.
+- 14 new tests (4 metrics + 6 dashboard + 3 tracer integration).
+
+### Coverage on `autolab.monitoring`: **100%**
+
+### Gates
+```
+make lint       -> All checks passed; 76 files already formatted
+make typecheck  -> Success: no issues found in 76 source files
+make test       -> 138 passed in 1.35s
+```
+
+### Deferred / watching
+- `streamlit run autolab.monitoring.dashboard` not exercised here (no browser). The data layer is fully unit-tested; visual QA owed when a display is available.
+- Tracer is idempotent **within a process**; survival across restarts is owed to the StateStore (which already persists durably).
+
+### Next
+Phase 7 — Benchmark & hardening: error-injection harness for the verifier, 3 simulator-driven benchmark scenarios, hardening pass.

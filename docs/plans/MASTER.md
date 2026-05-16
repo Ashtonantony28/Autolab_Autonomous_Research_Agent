@@ -27,8 +27,8 @@ These are documented as ADRs as they're decided.
 | 3 | Individual agents (5) | `phase_3.md` | ✅ done |
 | 4 | Orchestration | `phase_4.md` | ✅ done |
 | 5 | Tools & integrations | `phase_5.md` | ✅ done (RAG deferred) |
-| 6 | Monitoring & dashboard | `phase_6.md` | pending |
-| 7 | Benchmark & hardening | `phase_7.md` | pending |
+| 6 | Monitoring & dashboard | `phase_6.md` | ✅ done |
+| 7 | Benchmark & hardening | `phase_7.md` | in progress |
 
 ## High-level arc
 
