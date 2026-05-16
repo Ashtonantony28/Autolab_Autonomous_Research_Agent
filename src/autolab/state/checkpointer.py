@@ -43,9 +43,7 @@ class InMemoryCheckpointer:
 class RedisCheckpointer:
     """Redis-backed checkpointer. Each thread is one key."""
 
-    def __init__(
-        self, client: "aioredis.Redis[str]", *, namespace: str = "autolab:ckpt"
-    ) -> None:
+    def __init__(self, client: aioredis.Redis[str], *, namespace: str = "autolab:ckpt") -> None:
         self._client = client
         self._ns = namespace
 

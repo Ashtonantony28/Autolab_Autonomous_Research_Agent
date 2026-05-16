@@ -34,6 +34,8 @@ dependencies = [
   "httpx>=0.27",
   # Structured logging — never print().
   "structlog>=24.1",
+  # YAML — golden traces for the verifier are authored in YAML for readability.
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +60,7 @@ dev = [
   "mypy>=1.11",
   # Stubs for typed third-party packages.
   "types-redis",
+  "types-PyYAML",
 ]
 
 [build-system]
