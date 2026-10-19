@@ -1,11 +1,15 @@
 """Aggregate per-step verdicts into a single consistency_score.
 
-Definition (intentionally simple, ADR-0005):
+Definition (ADR-0005, amended by ADR-0007):
     score = (#VALID + 0.5 * #UNGROUNDED) / N
 
 INVALID contributes 0. UNGROUNDED contributes 0.5 because "we couldn't
 prove it either way" is weaker than "we proved it valid" but stronger than
 "we proved it invalid." Empty traces score 0.0.
+
+Any INVALID step caps the score at `INVALID_SCORE_CAP`, strictly below
+`RETRY_THRESHOLD`, so a refuted step can never be diluted into a pass by
+surrounding VALID steps.
 """
 
 from __future__ import annotations
@@ -13,11 +17,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
+from autolab.config import RETRY_THRESHOLD
 from autolab.state.models import StepVerdict
 
 _VALID_WEIGHT: Final[float] = 1.0
 _UNGROUNDED_WEIGHT: Final[float] = 0.5
 _INVALID_WEIGHT: Final[float] = 0.0
+_INVALID_CAP_MARGIN: Final[float] = 0.01
+INVALID_SCORE_CAP: Final[float] = RETRY_THRESHOLD - _INVALID_CAP_MARGIN
 
 
 def consistency_score(verdicts: Sequence[StepVerdict]) -> float:
@@ -25,6 +32,7 @@ def consistency_score(verdicts: Sequence[StepVerdict]) -> float:
     if not verdicts:
         return 0.0
     total = 0.0
+    has_invalid = False
     for v in verdicts:
         if v.verdict == "VALID":
             total += _VALID_WEIGHT
@@ -32,7 +40,9 @@ def consistency_score(verdicts: Sequence[StepVerdict]) -> float:
             total += _UNGROUNDED_WEIGHT
         else:
             total += _INVALID_WEIGHT
-    return total / len(verdicts)
+            has_invalid = True
+    score = total / len(verdicts)
+    return min(score, INVALID_SCORE_CAP) if has_invalid else score
 
 
 def summarize(verdicts: Sequence[StepVerdict]) -> str:
@@ -48,4 +58,4 @@ def summarize(verdicts: Sequence[StepVerdict]) -> str:
     )
 
 
-__all__ = ["consistency_score", "summarize"]
+__all__ = ["INVALID_SCORE_CAP", "consistency_score", "summarize"]

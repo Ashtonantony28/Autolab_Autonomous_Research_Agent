@@ -48,8 +48,8 @@ def test_invalid_inference_is_detected() -> None:
     assert out.counter_model  # Z3 returns a model
 
 
-def test_contradictory_premises_entail_anything() -> None:
-    # ex falso quodlibet: from a contradiction anything follows.
+def test_contradictory_premises_are_rejected() -> None:
+    # Ex falso quodlibet must not be admitted: an unsat premise set is INVALID.
     s = Z3Solver()
     out = s.check_entailment(
         premises=[
@@ -58,7 +58,28 @@ def test_contradictory_premises_entail_anything() -> None:
         ],
         claim=SmtFormula(_bool("Q") + "\n" + _bool("P"), "Q"),
     )
-    assert out.verdict == "VALID"
+    assert out.verdict == "INVALID"
+    assert out.reason == "premises_inconsistent"
+
+
+def test_arithmetic_contradiction_is_rejected() -> None:
+    s = Z3Solver()
+    decl = "(declare-const x Int)"
+    out = s.check_entailment(
+        premises=[SmtFormula(decl, "(> x 5)"), SmtFormula(decl, "(< x 3)")],
+        claim=SmtFormula(decl, "(= x 100)"),
+    )
+    assert out.verdict == "INVALID"
+    assert out.reason == "premises_inconsistent"
+
+
+def test_consistent_premises_still_entail() -> None:
+    s = Z3Solver()
+    out = s.check_entailment(
+        premises=[SmtFormula(_bool("P"), "P")],
+        claim=SmtFormula(_bool("P"), "(or P (not P))"),
+    )
+    assert (out.verdict, out.reason) == ("VALID", "entailed")
 
 
 def test_arithmetic_entailment() -> None:

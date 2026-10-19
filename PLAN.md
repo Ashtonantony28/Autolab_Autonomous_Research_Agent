@@ -16,7 +16,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | ID | Title | Depends on | Owns (files) | Status |
 |---|---|---|---|---|
 | SG0 | Shared interfaces | — | `state/models.py`, `verification/llm.py`, `config.py`, `state/schema.py` | done (PR open) |
-| SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | todo |
+| SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | done (PR pending) |
 | SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | todo |
 | SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | todo |
 | SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | todo |
@@ -58,7 +58,9 @@ Goal: the verifier never admits an invalid step as VALID (no false negatives) on
 - Property test (`hypothesis`): generate random propositional traces over 3–5 atoms. A brute-force truth-table oracle decides entailment, and the verifier's verdict must match the oracle on every generated trace.
 
 **Acceptance:** all golden traces classify correctly. The error-injection harness reports catch rate 100% and a real precision figure, replacing the placeholder. The property test passes with at least 500 examples. Verification coverage stays at or above 95%.
-**Verify:** `uv run pytest tests/unit/verification tests/integration/verification -q` · `uv run python -m scripts.error_injection` · `uv run pytest --cov=autolab.verification --cov-fail-under=95 tests/unit/verification tests/integration/verification`
+**Verify:** `uv run pytest tests/unit/verification tests/integration/verification -q` · `uv run python -m scripts.error_injection` · `uv run pytest --cov=autolab.verification --cov-fail-under=95 tests`
+
+**Result (2026-10-19):** files changed: `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `vericot.py` (premise pool only), `tests/fixtures/golden_traces.py`, `scripts/error_injection.py`, and the verification tests. ADR-0007 added. Tests added: 67, including 40 new golden traces (60 in total) and `test_soundness_property.py` (500 examples, about 6 s). Verify: 117 verification tests passed. Error injection: catch rate 34/34 (100%), precision 100%, 26/26 valid traces admitted. Lint and mypy are clean. The full suite passes (223). `autolab.verification` coverage is 97.9% over `tests`. As built: the solver checks premise consistency first (`premises_inconsistent`); only VALID steps support later steps; `referenced_step_indices` restricts the premise pool; any INVALID step caps the score at `RETRY_THRESHOLD - 0.01`; `Formalizer` uses `call_structured`, and its vocabulary commits atomically after the Z3 parse check. `golden_traces.build` is the shared fixture builder. Open: a trace whose only flaw is UNGROUNDED steps can still pass (ADR-0007), and an INVALID step now always escalates rather than retrying (relevant to SG4).
 
 ### SG2: Checker latency budget
 

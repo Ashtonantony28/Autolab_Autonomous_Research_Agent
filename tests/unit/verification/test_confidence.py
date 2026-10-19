@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from autolab.config import PASS_THRESHOLD, RETRY_THRESHOLD
 from autolab.state.models import StepVerdict, Verdict
-from autolab.verification.confidence import consistency_score, summarize
+from autolab.verification.confidence import INVALID_SCORE_CAP, consistency_score, summarize
 
 
 def _v(idx: int, kind: Verdict) -> StepVerdict:
@@ -32,10 +33,23 @@ def test_all_ungrounded_scores_half() -> None:
     assert consistency_score(verdicts) == 0.5
 
 
-def test_mixed_score() -> None:
-    # 2 VALID, 1 INVALID, 1 UNGROUNDED -> (2 + 0.5) / 4 = 0.625
-    verdicts = [_v(0, "VALID"), _v(1, "VALID"), _v(2, "INVALID"), _v(3, "UNGROUNDED")]
-    assert consistency_score(verdicts) == pytest.approx(0.625)
+def test_mixed_score_without_invalid() -> None:
+    # 3 VALID, 1 UNGROUNDED -> (3 + 0.5) / 4 = 0.875
+    verdicts = [_v(0, "VALID"), _v(1, "VALID"), _v(2, "VALID"), _v(3, "UNGROUNDED")]
+    assert consistency_score(verdicts) == pytest.approx(0.875)
+
+
+def test_any_invalid_caps_score_below_retry_threshold() -> None:
+    # 9 VALID + 1 INVALID would be 0.9 under the plain formula.
+    verdicts = [_v(i, "VALID") for i in range(9)] + [_v(9, "INVALID")]
+    score = consistency_score(verdicts)
+    assert score == INVALID_SCORE_CAP
+    assert score < RETRY_THRESHOLD < PASS_THRESHOLD
+
+
+def test_cap_never_raises_a_low_score() -> None:
+    verdicts = [_v(0, "VALID"), _v(1, "INVALID"), _v(2, "INVALID"), _v(3, "INVALID")]
+    assert consistency_score(verdicts) == pytest.approx(0.25)
 
 
 def test_summary_includes_counts() -> None:

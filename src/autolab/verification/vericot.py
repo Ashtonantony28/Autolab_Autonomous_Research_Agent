@@ -7,8 +7,9 @@ Public entry point:
 
 For each step:
   1. Formalize the step into SMT (using the growing vocabulary).
-  2. Collect premises (prior steps + caller-supplied extras).
-  3. Ask Z3 whether `premises ⊨ claim`.
+  2. Collect premises: prior VALID steps (only the cited ones when the step
+     has `referenced_step_indices`) + `context.facts` (ADR-0007).
+  3. Ask Z3 whether the premises are consistent and `premises ⊨ claim`.
   4. Record a `StepVerdict`. `premise`-typed steps are tagged VALID by
      construction since they're definitions, not inferences.
 
@@ -74,7 +75,8 @@ class Verifier:
                 extra_premises=extra_premises,
             )
             verdicts.append(verdict)
-            if formula is not None:
+            # Only VALID steps (assumed premises, entailed inferences) may support later steps.
+            if formula is not None and verdict.verdict == "VALID":
                 formalized[step.index] = formula
 
         score = consistency_score(verdicts)
