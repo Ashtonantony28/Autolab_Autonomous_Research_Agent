@@ -16,7 +16,7 @@ from uuid import uuid4
 from langgraph.types import Command
 
 from autolab.agents.analysis import build_analysis_prompt, build_analysis_trace_prompt
-from autolab.agents.common import measurement_facts, result_claim
+from autolab.agents.common import design_claim, design_facts, measurement_facts, result_claim
 from autolab.agents.design import build_design_prompt, build_design_trace_prompt
 from autolab.agents.execute import build_execute_trace_prompt
 from autolab.agents.research import build_hypothesis_prompt, build_trace_prompt
@@ -139,7 +139,8 @@ def _seed(fake: FakeLLMClient, sc: Scenario) -> ExperimentResult:
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=build_design_trace_prompt(sc.hypothesis, sc.design),
-        conclusion=sc.design.protocol,
+        conclusion=design_claim(sc.design),
+        facts=design_facts(sc.design),
     )
 
     result = ExperimentResult(

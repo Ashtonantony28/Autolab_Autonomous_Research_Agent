@@ -27,7 +27,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | done (PR pending) |
 | SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | done (PR pending) |
 | SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | todo |
-| SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | todo |
+| SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (PR pending) |
 | SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | todo |
 | SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | todo |
 
@@ -219,6 +219,24 @@ Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high f
   - `approve` on a verification escalation still runs the policy triggers (cost, duration, contradiction) before the payload is merged (AUDIT-5 #3, medium, folded in).
   - **Flip:** `test_audit_5.py` #2 and #3.
   - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/unit/agents tests/integration/orchestrator -q` · `uv run python -m scripts.run_benchmark` (each scenario still pauses on its policy trigger).
+
+  **Result (2026-10-19):** Files changed: `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py`, `tests/unit/orchestrator/test_hitl_node.py` (new), `tests/unit/agents/test_design.py`, and the Resolution lines for #2 and #3 in AUDIT-5.md. The new binding also changed the Design trace fixtures in `tests/unit/agents/test_identity.py`, `tests/integration/orchestrator/test_graph.py`, `tests/audit/test_audit_5.py` and `scripts/run_benchmark.py`: each now concludes `design_claim(d)` with `facts=design_facts(d)` instead of `d.protocol`. `tests/fixtures/agent_helpers.py`, `verification/*` and `golden_traces.py` are untouched.
+
+  Tests added: 8 functions (10 cases). There are 4 Design binding tests: the fact list, the claim sentence, a trace derived from the facts that passes, and a trace stating cost 500 / duration 240 / a parameter against the facts, which is `premises_inconsistent` and not admitted (3 cases). There are 4 `hitl` node tests: re-pause on policy then merge, merge when the policy is quiet, no re-check of a `policy` request, and `merged_policy` key handling. Xfails flipped: AUDIT-5 #2 and #3. **One audit assertion changed** (agreed with the coordinator): in #2, `confidence == 1.0` became `< 1.0`. The repro's trace concludes the bare protocol, which is no longer the payload claim, so it is unbound (score 0.0). The `hitl_pending` and withheld-payload assertions are unchanged.
+
+  Verify: lint and mypy clean. Full suite 641 passed, 13 skipped, 23 xfailed. The SG12 verify set: 90 passed, 5 xfailed (AUDIT-5 #1, #4, #5). Benchmark: each scenario pauses once on its policy trigger (duration 120 min; cost $15; cost $25) and completes at confidence 1.0. Error injection 34/34 (100%), precision 100%, 26/26 valid admitted.
+
+  As built:
+  - `design_facts` gives one `(= <sym> <real>)` per `estimated_cost_usd`, `estimated_duration_minutes` and each int/float parameter (`param_<name>`). Bool and string parameters have no fact but are named in `design_claim`.
+  - `design_claim` is "design protocol: <protocol>; estimated_cost_usd = …, estimated_duration_minutes = …, param_<name> = …[ unit]".
+  - The trace prompt names the new claim through `conclusion_instruction`, and `llm.py` is unchanged.
+  - `make_hitl_node(policies)` re-runs the agent's `MergedPolicy` (`merged_policy(trigger, key)` over `hitl_payload`) on `approve` of a `verification` request only. When it fires, the node routes to itself with a `policy` request and keeps `hitl_payload`. `hitl` now lists itself among its destinations. `hitl_node` stays exported as the policy-free node.
+
+  Open:
+  - A trace can still formalize the protocol's own figures under unrelated symbols (`usd`, `minutes`) and verify. Linking free text to the bound symbols is left to faithfulness and the formalizer.
+  - The verification-only interrupt still shows no payload summary.
+  - Hypothesis `rationale`/`citations`/`confidence` and Analysis interpretations below rank 0 remain unbound (AUDIT-5 #2, lower stakes).
+  - Approving a Research verification escalation now costs one contradiction-check verify.
 - **SG13 Resume after a crash.**
   - `autolab run` prints the thread id before the graph runs.
   - `autolab resume <id>` continues a thread that has pending nodes and no interrupt from its last checkpoint. The recovery docstring matches what the CLI does (AUDIT-7 #1, high).
