@@ -63,7 +63,6 @@ def _autolab(argv: list[str]) -> None:
         pool.submit(cli.main, argv).result()
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-7 #1")
 def test_run_killed_by_a_transient_outage_can_be_resumed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

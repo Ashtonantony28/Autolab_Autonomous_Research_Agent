@@ -28,7 +28,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | done (PR pending) |
 | SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | done (PR pending) |
 | SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (PR pending) |
-| SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | todo |
+| SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | done (PR pending) |
 | SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
@@ -244,6 +244,19 @@ Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high f
   - `autolab resume <id>` continues a thread that has pending nodes and no interrupt from its last checkpoint. The recovery docstring matches what the CLI does (AUDIT-7 #1, high).
   - **Flip:** `test_audit_7.py::test_run_killed_by_a_transient_outage_can_be_resumed`.
   - **Verify:** `uv run pytest tests/audit/test_audit_7.py tests/integration/test_resume.py tests/unit/test_cli.py -q`
+
+  **Result (2026-10-19):** Files changed: `cli.py`, `orchestrator/recovery.py` (docstring only), `tests/unit/test_cli.py` (new), `tests/integration/test_resume.py`, the flipped marker in `tests/audit/test_audit_7.py`, and the #1 Resolution line in AUDIT-7.md. `orchestrator/checkpoints.py`, `graph.py`, `agents/` and `verification/*` are untouched.
+
+  Tests added: 6. `test_cli.py` has 5: the id is printed before a crash, `resume` with no action continues a crashed run to completion, `resume` of a completed run exits 2 (with and without an action), `resume` of an unknown run exits 2, and `resume` of a paused run without an action exits 2 and then completes with `approve`. `test_resume.py` has 1: a design crash after three transient errors leaves `next == ("design",)` with no interrupt, and `ainvoke(None)` finishes the run on a fresh fake that has no research responses. Xfail flipped: AUDIT-7 #1, assertions unchanged.
+
+  Verify: lint and mypy clean. Full suite 648 passed, 13 skipped, 22 xfailed. SG13 verify set 14 passed, 8 xfailed (AUDIT-7 #2–#7).
+
+  As built:
+  - `autolab run` writes `Run <thread_id> started.` and flushes before `asyncio.run`.
+  - The `resume` action is now an optional positional (`nargs="?"`), so the old `resume <id> approve|retry|abort` form is unchanged. `_drive` reads `aget_state` once. An interrupt with no action exits 2 ("is paused for human review; give approve|retry|abort"). Pending nodes with no interrupt run `ainvoke(None, config)`, and a given action is ignored with a note on stderr. No pending nodes exits 2 with "no paused run <id> in <file> (it is finished or unknown)", which keeps the existing `test_cli_resume.py` message checks.
+
+  Open:
+  - An exhausted transient error still ends `autolab run` with a traceback. The run is now resumable, but the error is not turned into an `error` HITL request.
 - **SG14 Bounded, load-tolerant timing tests.**
   - Add `pytest-timeout` (justified in `pyproject.toml`) with a per-test limit, so a hang fails with the test named (AUDIT-8 H1).
   - Wall-clock tests carry a `perf` marker. Each guarantee that only a timing test covers (cancel, shutdown, queueing excluded from `solver_ms`, the injected executor being used) also gets a deterministic test, using events or counters instead of sleeps.
