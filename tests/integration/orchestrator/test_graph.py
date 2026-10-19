@@ -9,7 +9,13 @@ import pytest
 from langgraph.types import Command
 
 from autolab.agents.analysis import build_analysis_prompt, build_analysis_trace_prompt
-from autolab.agents.common import measurement_facts, result_claim, with_feedback
+from autolab.agents.common import (
+    design_claim,
+    design_facts,
+    measurement_facts,
+    result_claim,
+    with_feedback,
+)
 from autolab.agents.design import build_design_prompt, build_design_trace_prompt
 from autolab.agents.execute import build_execute_trace_prompt
 from autolab.agents.research import build_hypothesis_prompt, build_trace_prompt
@@ -103,7 +109,8 @@ def _seed_design(fake: FakeLLMClient, design: ExperimentDesign, feedback: str = 
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=with_feedback(build_design_trace_prompt(HYPOTHESIS, design), feedback),
-        conclusion=design.protocol,
+        conclusion=design_claim(design),
+        facts=design_facts(design),
     )
 
 
@@ -150,7 +157,8 @@ def _fail_design_trace(fake: FakeLLMClient, feedback: str = "") -> None:
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=with_feedback(build_design_trace_prompt(HYPOTHESIS, DESIGN), feedback),
-        conclusion=DESIGN.protocol,
+        conclusion=design_claim(DESIGN),
+        facts=design_facts(DESIGN),
     )
 
 
