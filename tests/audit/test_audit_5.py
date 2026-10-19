@@ -107,7 +107,6 @@ ABSORBANCE = FormalizedStep(
 ACTIVE = "Compound K-17 is active"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_gt_hides_a_premise_that_contradicts_the_measurement() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -143,7 +142,6 @@ async def test_shadowed_gt_hides_a_premise_that_contradicts_the_measurement() ->
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_lt_in_the_ignored_final_step_defeats_the_contradiction_trigger() -> None:
     prior = Hypothesis(question="q", statement="Yield exceeds 0.5", rationale="r")
     new = Hypothesis(question="q", statement="Yield is below 0.2", rationale="r")
@@ -174,7 +172,6 @@ async def test_shadowed_lt_in_the_ignored_final_step_defeats_the_contradiction_t
     assert reason is not None
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_not_lets_a_restated_payload_premise_prove_itself() -> None:
     claim = "Compound K-17 cures disease D in humans"
     fake = FakeLLMClient()
