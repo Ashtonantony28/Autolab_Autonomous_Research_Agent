@@ -141,7 +141,8 @@ def escalate_permanent_errors(name: str, node: AgentNode) -> AgentNode:
     rejects (400, 401, 403, 404, 413, 422...). The request's payload holds
     `trigger="error"`, the error type and, for HTTP errors, the status code.
     Transient errors are retried inside the LLM client; once exhausted they
-    propagate, and the checkpoint allows a resume.
+    propagate and end the run. The last checkpoint is kept, and
+    `autolab resume <thread_id>` continues from it.
     """
 
     async def guarded(state: AutoLabState) -> dict[str, Any]:
