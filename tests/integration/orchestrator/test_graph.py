@@ -8,6 +8,7 @@ import pytest
 from langgraph.types import Command
 
 from autolab.agents.analysis import build_analysis_prompt, build_analysis_trace_prompt
+from autolab.agents.common import measurement_facts, result_claim
 from autolab.agents.design import build_design_prompt, build_design_trace_prompt
 from autolab.agents.execute import build_execute_trace_prompt
 from autolab.agents.research import build_hypothesis_prompt, build_trace_prompt
@@ -68,6 +69,7 @@ def _seed_full_run(
         agent="research",
         trace_purpose="research.trace",
         trace_prompt=build_trace_prompt(QUESTION, HYPOTHESIS),
+        conclusion=HYPOTHESIS.statement,
     )
 
     fake.register("design.experiment", build_design_prompt(HYPOTHESIS), DESIGN.model_dump_json())
@@ -76,6 +78,7 @@ def _seed_full_run(
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=build_design_trace_prompt(HYPOTHESIS, DESIGN),
+        conclusion=DESIGN.protocol,
     )
 
     # Deterministic ExperimentResult so the analysis prompts align.
@@ -90,6 +93,8 @@ def _seed_full_run(
         agent="execute",
         trace_purpose="execute.trace",
         trace_prompt=build_execute_trace_prompt(DESIGN, result),
+        conclusion=result_claim(result),
+        facts=measurement_facts(result),
     )
 
     report = AnalysisReport(
@@ -107,6 +112,8 @@ def _seed_full_run(
         agent="analysis",
         trace_purpose="analysis.trace",
         trace_prompt=build_analysis_trace_prompt(result, report),
+        conclusion=report.interpretations[0].statement,
+        facts=measurement_facts(result),
     )
     return HYPOTHESIS, DESIGN, result, report
 
@@ -140,6 +147,7 @@ async def test_run_pauses_at_hitl_when_design_verifier_fails() -> None:
         agent="research",
         trace_purpose="research.trace",
         trace_prompt=build_trace_prompt(QUESTION, HYPOTHESIS),
+        conclusion=HYPOTHESIS.statement,
     )
     # Design produces a payload but its trace verifies INVALID -> HITL.
     fake.register("design.experiment", build_design_prompt(HYPOTHESIS), DESIGN.model_dump_json())
@@ -148,6 +156,7 @@ async def test_run_pauses_at_hitl_when_design_verifier_fails() -> None:
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=build_design_trace_prompt(HYPOTHESIS, DESIGN),
+        conclusion=DESIGN.protocol,
     )
 
     graph = build_graph(llm=fake)

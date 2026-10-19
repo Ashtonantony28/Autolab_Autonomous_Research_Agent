@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
+from autolab.agents.common import (
+    conclusion_instruction,
+    measurement_facts,
+    parse_trace,
+    result_claim,
+)
 from autolab.state.models import (
     AnalysisReport,
     ExperimentResult,
-    ReasoningStep,
-    ReasoningTrace,
+    Interpretation,
+    VerificationContext,
 )
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
@@ -42,8 +47,11 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
         trace_raw = await self._llm.call(
             "analysis.trace", build_analysis_trace_prompt(latest, payload)
         )
-        trace = _parse_trace(self.name, trace_raw)
-        return AgentOutput(payload=payload, reasoning_trace=trace)
+        trace = parse_trace(self.name, trace_raw)
+        context = VerificationContext(
+            facts=measurement_facts(latest), payload_claim=top_interpretation(payload).statement
+        )
+        return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     def _merge_payload(self, payload: AnalysisReport) -> dict[str, Any]:
         return {}  # AnalysisReport is informational; not appended to state in Phase 3.
@@ -65,14 +73,19 @@ def build_analysis_trace_prompt(result: ExperimentResult, report: AnalysisReport
         "Explain the reasoning for the ranked interpretations. "
         'Reply with JSON: {"steps": [...]}.\n\n'
         f"result_id: {result.id}\n"
-        f"top_interpretation: {report.interpretations[0].statement}"
+        f"measurements: {result_claim(result)}\n"
+        f"{conclusion_instruction(top_interpretation(report).statement)}"
     )
 
 
-def _parse_trace(agent: str, raw: str) -> ReasoningTrace:
-    data = json.loads(raw)
-    steps = tuple(ReasoningStep.model_validate(s) for s in data["steps"])
-    return ReasoningTrace(agent=agent, steps=steps)
+def top_interpretation(report: AnalysisReport) -> Interpretation:
+    """The rank-0 interpretation, which the trace must conclude."""
+    return min(report.interpretations, key=lambda i: i.rank)
 
 
-__all__ = ["AnalysisAgent", "build_analysis_prompt", "build_analysis_trace_prompt"]
+__all__ = [
+    "AnalysisAgent",
+    "build_analysis_prompt",
+    "build_analysis_trace_prompt",
+    "top_interpretation",
+]

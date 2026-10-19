@@ -21,7 +21,7 @@ from typing import Any, Final, Generic, TypeVar
 from pydantic import BaseModel
 
 from autolab.config import PASS_THRESHOLD
-from autolab.state.models import HITLRequest, ReasoningTrace
+from autolab.state.models import HITLRequest, ReasoningTrace, VerificationContext
 from autolab.state.schema import AutoLabState
 from autolab.verification.vericot import Verifier
 
@@ -45,6 +45,7 @@ class AgentOutput(Generic[PayloadT]):
 
     payload: PayloadT
     reasoning_trace: ReasoningTrace
+    context: VerificationContext | None = None
 
 
 class BaseAgent(ABC, Generic[PayloadT]):
@@ -63,7 +64,7 @@ class BaseAgent(ABC, Generic[PayloadT]):
     async def __call__(self, state: AutoLabState) -> dict[str, Any]:
         """Run the agent, verify, and return an `AutoLabState` partial update."""
         output = await self._produce(state)
-        verdict = await self.verifier.verify(output.reasoning_trace)
+        verdict = await self.verifier.verify(output.reasoning_trace, context=output.context)
 
         if verdict.consistency_score < self.hitl_threshold:
             return {

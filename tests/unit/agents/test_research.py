@@ -30,7 +30,11 @@ async def test_research_agent_emits_hypothesis_when_verifier_passes() -> None:
     )
     trace_prompt = build_trace_prompt(QUESTION, HYPOTHESIS)
     register_trivial_trace(
-        fake, agent="research", trace_purpose="research.trace", trace_prompt=trace_prompt
+        fake,
+        agent="research",
+        trace_purpose="research.trace",
+        trace_prompt=trace_prompt,
+        conclusion=HYPOTHESIS.statement,
     )
 
     agent = ResearchAgent(verifier=Verifier(fake), llm=fake)
@@ -62,3 +66,50 @@ async def test_research_agent_escalates_to_hitl_when_verifier_fails() -> None:
     assert update["confidence"] < 0.7
     # Hypothesis is NOT merged into state when HITL fires.
     assert "hypotheses" not in update
+
+
+def _fake_with_hypothesis() -> FakeLLMClient:
+    fake = FakeLLMClient()
+    fake.register(
+        "research.hypothesis", build_hypothesis_prompt(QUESTION), HYPOTHESIS.model_dump_json()
+    )
+    return fake
+
+
+def test_research_trace_prompt_names_the_required_conclusion() -> None:
+    assert HYPOTHESIS.statement in build_trace_prompt(QUESTION, HYPOTHESIS).splitlines()[-1]
+
+
+async def test_research_agent_rejects_consistent_trace_with_unrelated_conclusion() -> None:
+    fake = _fake_with_hypothesis()
+    register_trivial_trace(
+        fake,
+        agent="research",
+        trace_purpose="research.trace",
+        trace_prompt=build_trace_prompt(QUESTION, HYPOTHESIS),
+        conclusion="Cooling the solution speeds up nucleation.",
+    )
+
+    update = await ResearchAgent(verifier=Verifier(fake), llm=fake)(empty_state(QUESTION))
+
+    assert update["hitl_pending"] is not None
+    assert update["confidence"] == 0.0
+    [verdict] = update["verification_history"]
+    assert {(v.verdict, v.reason) for v in verdict.step_verdicts} == {("UNGROUNDED", "no_premises")}
+    assert "hypotheses" not in update
+
+
+async def test_research_agent_accepts_conclusion_differing_in_case_and_whitespace() -> None:
+    fake = _fake_with_hypothesis()
+    register_trivial_trace(
+        fake,
+        agent="research",
+        trace_purpose="research.trace",
+        trace_prompt=build_trace_prompt(QUESTION, HYPOTHESIS),
+        conclusion="above 40C,   INCREASED solubility\noutpaces nucleation rate.",
+    )
+
+    update = await ResearchAgent(verifier=Verifier(fake), llm=fake)(empty_state(QUESTION))
+
+    assert update["hitl_pending"] is None
+    assert update["hypotheses"] == [HYPOTHESIS]
