@@ -17,6 +17,10 @@ The Z3 check runs on a worker thread (`asyncio.to_thread`), so a slow check
 never blocks the event loop and concurrent `verify` calls overlap.
 `StepVerdict.solver_ms` is the wall time of that check alone.
 
+Faithfulness (on by default for a live LLM): after a step is formalized, a
+judge back-translates its SMT and checks it states the claim; a mismatch is
+UNGROUNDED with reason `formalization_failed` (`faithfulness.py`).
+
 A formalization failure on a step yields an UNGROUNDED verdict — the
 trace remains verifiable as a whole even if one step's LLM output was
 malformed.
@@ -42,8 +46,9 @@ from autolab.state.models import (
     VerificationResult,
 )
 from autolab.verification.confidence import consistency_score, summarize
+from autolab.verification.faithfulness import unfaithful_reason
 from autolab.verification.formalizer import FormalizationError, Formalizer
-from autolab.verification.llm import LLMClient
+from autolab.verification.llm import LLMClient, is_live
 from autolab.verification.premise_grounder import premises_for
 from autolab.verification.solver import SmtFormula, Z3Solver
 
@@ -56,8 +61,13 @@ class Verifier:
         llm: LLMClient,
         *,
         solver_timeout_seconds: float = SOLVER_TIMEOUT_S,
+        check_faithfulness: bool | None = None,
     ) -> None:
+        """`check_faithfulness=None` turns the check on only for a live LLM (`is_live`)."""
         self._llm = llm
+        self._check_faithfulness = (
+            is_live(llm) if check_faithfulness is None else check_faithfulness
+        )
         self._solver = Z3Solver(timeout_seconds=solver_timeout_seconds)
 
     async def verify(
@@ -114,15 +124,11 @@ class Verifier:
         try:
             formula = await formalizer.formalize(step)
         except FormalizationError as exc:
-            return (
-                StepVerdict(
-                    step_index=step.index,
-                    verdict="UNGROUNDED",
-                    reason="formalization_failed",
-                    details=f"formalization failed: {exc}",
-                ),
-                None,
-            )
+            return _formalization_failed(step, f"formalization failed: {exc}"), None
+        if self._check_faithfulness:
+            unfaithful = await unfaithful_reason(self._llm, step, formula)
+            if unfaithful is not None:
+                return _formalization_failed(step, unfaithful), None
 
         if step.claim_type == "premise":
             return (
@@ -149,6 +155,15 @@ class Verifier:
             ),
             formula,
         )
+
+
+def _formalization_failed(step: ReasoningStep, details: str) -> StepVerdict:
+    return StepVerdict(
+        step_index=step.index,
+        verdict="UNGROUNDED",
+        reason="formalization_failed",
+        details=details,
+    )
 
 
 def _normalize(claim: str) -> str:
