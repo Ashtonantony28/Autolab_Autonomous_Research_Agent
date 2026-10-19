@@ -13,6 +13,10 @@ For each step:
   4. Record a `StepVerdict`. `premise`-typed steps are tagged VALID by
      construction since they're definitions, not inferences.
 
+The Z3 check runs on a worker thread (`asyncio.to_thread`), so a slow check
+never blocks the event loop and concurrent `verify` calls overlap.
+`StepVerdict.solver_ms` is the wall time of that check alone.
+
 A formalization failure on a step yields an UNGROUNDED verdict — the
 trace remains verifiable as a whole even if one step's LLM output was
 malformed.
@@ -20,8 +24,10 @@ malformed.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
+from autolab.config import SOLVER_TIMEOUT_S
 from autolab.state.models import (
     ReasoningStep,
     ReasoningTrace,
@@ -43,7 +49,7 @@ class Verifier:
         self,
         llm: LLMClient,
         *,
-        solver_timeout_seconds: float = 5.0,
+        solver_timeout_seconds: float = SOLVER_TIMEOUT_S,
     ) -> None:
         self._llm = llm
         self._solver = Z3Solver(timeout_seconds=solver_timeout_seconds)
@@ -121,7 +127,7 @@ class Verifier:
 
         premises = premises_for(step, formalized, extra=extra_premises)
         started = time.perf_counter()
-        outcome = self._solver.check_entailment(premises, formula)
+        outcome = await asyncio.to_thread(self._solver.check_entailment, premises, formula)
         solver_ms = (time.perf_counter() - started) * 1000
         return (
             StepVerdict(

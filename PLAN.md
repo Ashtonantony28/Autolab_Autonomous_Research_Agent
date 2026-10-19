@@ -17,7 +17,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 |---|---|---|---|---|
 | SG0 | Shared interfaces | — | `state/models.py`, `verification/llm.py`, `config.py`, `state/schema.py` | done (PR open) |
 | SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | done (PR pending) |
-| SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | todo |
+| SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | done (PR pending) |
 | SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | todo |
 | SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | todo |
 | SG5 | Live LLM path | SG1–SG4 | `verification/llm.py` (Claude adapter), `tests/live/` | todo |
@@ -71,6 +71,8 @@ Goal: the verifier never admits an invalid step as VALID (no false negatives) on
 
 **Acceptance:** the benchmark prints numbers within budget. A test proves that a pathological formula (nonlinear integer arithmetic) times out to UNGROUNDED inside `solver_timeout_s + 1 s`. A test proves that two traces verified concurrently both finish without serializing.
 **Verify:** `uv run python -m scripts.bench_verifier --runs 20` · `uv run pytest tests/unit/verification/test_latency.py -q`
+
+**Result (2026-10-19):** files changed: `verification/vericot.py` (Z3 check via `asyncio.to_thread`, timing, default timeout), `verification/solver.py` (fresh `z3.Context` per check, one shared deadline for both checks, default `SOLVER_TIMEOUT_S`), `scripts/bench_verifier.py` (new). Tests added: `tests/unit/verification/test_latency.py` (8): `solver_ms` excludes formalization, a Fermat-cubes NIA query times out to UNGROUNDED/`timeout` within `timeout + 1 s`, the event loop keeps ticking during a slow check, two concurrent traces finish in under 0.75× their summed solver time, and the bench `run`/exit code. Bench (`--runs 20`, 60 traces, 1600 checked steps): step p50 5.72 ms, p95 8.33 ms, max 20.90 ms; per-trace total p50 6.47 ms, p95 17.08 ms, max 29.39 ms. Budget stays at 50 ms (p95 is well under it; no reason to tighten). Verify: lint and mypy clean, 231 passed, `autolab.verification` coverage 98.6%. As built: `solver_ms` is the wall time of the threaded Z3 call, so it includes about 2 ms of `z3.Context` creation and the thread hop; the formalizer's SMT parse check still runs on the event loop (cheap, no solving). Open: the shared deadline is enforced by code but only the single-check timeout paths are tested.
 
 ### SG3: Bind traces to payloads
 
