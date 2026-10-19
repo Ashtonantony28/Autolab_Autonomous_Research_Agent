@@ -33,3 +33,12 @@ def test_empty_agent_metrics_avg_is_zero() -> None:
     am = AgentMetrics()
     assert am.avg_latency_ms == 0.0
     assert am.avg_consistency_score == 0.0
+
+
+def test_retries_tracked_and_counted_as_invocations() -> None:
+    m = Metrics()
+    m.observe_agent("design", latency_ms=10.0, consistency_score=0.5, escalated=False, retried=True)
+    m.observe_agent("design", latency_ms=10.0, consistency_score=0.9, escalated=False)
+    snap = m.snapshot()["design"]
+    assert snap["retries"] == 1.0
+    assert snap["invocations"] == 2.0
