@@ -22,6 +22,10 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | done (PR pending) |
 | SG5 | Live LLM path | SG1–SG4 | `verification/llm.py` (Claude adapter), `tests/live/` | built, live run pending API key |
 | SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | done (PR pending) |
+| SG7 | Soundness round 2 (AUDIT-1 #1–#4, AUDIT-3 #1) | audit round 1 | `verification/*` (except solver executor), `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/*` | todo |
+| SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | todo |
+| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | todo |
+| SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -127,6 +131,31 @@ This sub-goal starts only after SG1–SG4 are done.
 
 ---
 
+### Audit round 1 → SG7–SG10
+
+Round 1 found 1 critical and 9 high findings (AUDIT-1..4 at the repo root; repros in `tests/audit/`, strict-xfail). Each sub-goal below is done when its listed xfails are flipped to plain passing tests and `make lint typecheck test` is green.
+
+- **SG7 Soundness round 2.**
+  - A trace must not conclude its payload claim from a premise that states the same claim; a circular premise yields UNGROUNDED (AUDIT-1 #1).
+  - `declarations` may contain only `declare-const` / `declare-fun` / `declare-sort` forms; anything else is a formalization failure (#2).
+  - The payload conclusion must be VALID for the trace to pass, whatever the score (#3).
+  - Premise steps are checked for consistency with `context.facts` and with each other (#4, medium, folded in).
+  - The INVALID cap is derived from the configured pass threshold, not the import-time constant (AUDIT-3 #1).
+  - `register_trivial_trace` and other fixtures are rebuilt so that passing traces are genuinely entailed.
+- **SG8 Escalation and retries.**
+  - Refusals, empty structured output and permanent `anthropic` API errors escalate to HITL instead of crashing the graph (AUDIT-3 #2).
+  - 529 Overloaded is retried (#4).
+  - The SDK's own retries are set to 0, so `RetryingLLMClient` is the single retry layer, with jitter (#11, AUDIT-2 retry finding).
+- **SG9 Entity identity.**
+  - `id` and `created_at` are assigned in code, not by the model (AUDIT-3 #3).
+  - Store keys include `run_id`.
+  - Upserts are race-free (AUDIT-2 store findings).
+- **SG10 Bounded solver executor.**
+  - Z3 runs on a dedicated bounded executor, so it never starves `asyncio`'s default pool (AUDIT-2 #1).
+  - `solver_ms` is measured inside the worker, so queueing time is excluded.
+
+AUDIT-4 H1 (offline tests never exercise NL→SMT) is closed by SG5's live accuracy run, which waits on an `ANTHROPIC_API_KEY`. AUDIT-4 H2 is fixed by the deterministic tests it added. Medium and low findings stay in the AUDIT files for a later pass unless a sub-goal folds them in. After SG7–SG10, audit round 2 re-runs all four audits with fresh agents.
+
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -140,5 +169,6 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 
 ## Log
 
+- 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
 - 2026-10-19: plan approved by Ashton; SG0 built.
 - 2026-10-19: plan drafted. Baseline numbers (140 tests, coverage by module) are quoted from `docs/status.md` and have not yet been re-run in this environment.
