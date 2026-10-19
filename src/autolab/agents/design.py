@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
-from autolab.agents.common import conclusion_instruction, parse_trace, with_feedback
+from autolab.agents.common import (
+    DESIGN_REPLY,
+    conclusion_instruction,
+    parse_trace,
+    with_feedback,
+)
 from autolab.state.models import ExperimentDesign, Hypothesis, VerificationContext
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
@@ -27,15 +32,10 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
             raise ValueError("DesignAgent invoked without any Hypothesis in state")
         target = hypotheses[-1]
         feedback = state.get("feedback", "")
-        raw = await self._llm.call(
-            "design.experiment", with_feedback(build_design_prompt(target), feedback)
+        reply = await self._llm.call_structured(
+            "design.experiment", with_feedback(build_design_prompt(target), feedback), DESIGN_REPLY
         )
-        payload = ExperimentDesign.model_validate_json(raw)
-        if payload.hypothesis_id != target.id:
-            raise ValueError(
-                f"ExperimentDesign.hypothesis_id={payload.hypothesis_id} does not match "
-                f"target hypothesis id={target.id}"
-            )
+        payload = ExperimentDesign(**dict(reply), hypothesis_id=target.id)
 
         trace_raw = await self._llm.call(
             "design.trace", with_feedback(build_design_trace_prompt(target, payload), feedback)
@@ -50,10 +50,7 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
 
 def build_design_prompt(hypothesis: Hypothesis) -> str:
     return (
-        "Design a single experiment to test the following Hypothesis. "
-        "Reply with the JSON of an autolab.state.models.ExperimentDesign whose "
-        "hypothesis_id matches the input.\n\n"
-        f"hypothesis_id: {hypothesis.id}\n"
+        "Design a single experiment to test the following Hypothesis.\n\n"
         f"hypothesis_statement: {hypothesis.statement}"
     )
 

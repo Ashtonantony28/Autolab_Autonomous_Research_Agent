@@ -1,14 +1,46 @@
-"""Helpers shared by the producing agents: trace parsing and verification grounding."""
+"""Helpers shared by the producing agents: reply schemas, trace parsing and grounding."""
 
 from __future__ import annotations
 
 import math
 import re
 from decimal import Decimal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, create_model
 
-from autolab.state.models import ExperimentResult, FormalizedStep, ReasoningStep, ReasoningTrace
+from autolab.state.models import (
+    AnalysisReport,
+    ExperimentDesign,
+    ExperimentResult,
+    FormalizedStep,
+    Hypothesis,
+    ReasoningStep,
+    ReasoningTrace,
+)
+
+
+def content_schema(model: type[BaseModel], server_owned: frozenset[str]) -> type[BaseModel]:
+    """`model` without its `server_owned` fields: the schema the LLM is asked to fill.
+
+    Extra keys in a reply (e.g. an `id` the model or a fixture supplies) are ignored,
+    so ids, timestamps and cross-references can only come from code.
+    """
+    fields: dict[str, Any] = {
+        name: (info.annotation, info)
+        for name, info in model.model_fields.items()
+        if name not in server_owned
+    }
+    return create_model(f"{model.__name__}Reply", __config__=ConfigDict(extra="ignore"), **fields)
+
+
+HYPOTHESIS_REPLY: type[BaseModel] = content_schema(
+    Hypothesis, frozenset({"id", "created_at", "question"})
+)
+DESIGN_REPLY: type[BaseModel] = content_schema(ExperimentDesign, frozenset({"id", "hypothesis_id"}))
+REPORT_REPLY: type[BaseModel] = content_schema(
+    AnalysisReport, frozenset({"id", "created_at", "result_id"})
+)
 
 
 class _TraceSteps(BaseModel):
@@ -77,7 +109,11 @@ def _real(value: float) -> str:
 
 
 __all__ = [
+    "DESIGN_REPLY",
+    "HYPOTHESIS_REPLY",
+    "REPORT_REPLY",
     "conclusion_instruction",
+    "content_schema",
     "measurement_facts",
     "parse_trace",
     "result_claim",

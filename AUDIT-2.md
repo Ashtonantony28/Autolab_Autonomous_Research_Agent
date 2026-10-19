@@ -62,6 +62,8 @@ No critical findings.
 
 **Suggested fix.** Use a real upsert: `sqlalchemy.dialects.sqlite.insert(...).on_conflict_do_update(index_elements=[...])`, with the `postgresql.insert` equivalent chosen by dialect. Use `on_conflict_do_nothing` for `ensure_run`. Alternatively, catch `IntegrityError` and re-read. Add one test per dialect.
 
+**Resolution (SG9):** every write is one statement from `store.upsert_statement`. It uses the dialect's `insert` (`sqlite` or `postgresql`; any other dialect raises `ValueError`): entities use `ON CONFLICT (run_id, id) DO UPDATE` and `ensure_run` uses `ON CONFLICT (id) DO NOTHING`, so it never overwrites an existing run's question. Both repros are flipped. New tests cover 50 concurrent appends of one key, 50 `ensure_run` calls plus 50 appends across 5 runs, 30 concurrent traced graph runs sharing one store, and the compiled SQL for both dialects. Postgres is checked only at the SQL-compile level, since no server is available in tests.
+
 ---
 
 ## 3. Medium: store primary keys ignore `run_id`; a repeated entity id silently moves rows between runs
@@ -73,6 +75,8 @@ No critical findings.
 **Root cause.** `src/autolab/state/store.py:59` (`id` is the sole primary key of `_EntityRow`) together with the `merge` at `store.py:204`.
 
 **Suggested fix.** Make the primary key `(run_id, id)`, or add a surrogate key with a unique constraint on `(run_id, id)`, and upsert on that pair. Separately, consider stripping or regenerating LLM-supplied ids at the agent boundary.
+
+**Resolution (SG9):** the primary key of every entity table is now `(run_id, id)`, so the same id under two runs is stored as two rows, and rewriting it in one run leaves the other run untouched. Agents also assign ids in code (AUDIT-3 #3). The repro is flipped. The schema is still created with `create_all` and there is no Alembic history, so an existing database file keeps its old single-column key until it is recreated.
 
 ---
 

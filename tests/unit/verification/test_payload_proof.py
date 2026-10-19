@@ -21,7 +21,7 @@ from autolab.state.schema import empty_state
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, SolverOutcome, Z3Solver
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_trace
+from tests.fixtures.agent_helpers import content, register_trace
 from tests.fixtures.golden_traces import GoldenStep
 
 CLAIM = "C holds"
@@ -247,4 +247,4 @@ async def test_agent_gate_withholds_a_high_scoring_trace_with_an_unproven_conclu
     assert update["hitl_pending"] is not None
     assert update["hitl_pending"].reason == "final step 4 is UNGROUNDED (formalization_failed)"
     assert "hypotheses" not in update
-    assert update["hitl_payload"] == {"hypotheses": [HYPOTHESIS]}
+    assert content(*update["hitl_payload"]["hypotheses"]) == content(HYPOTHESIS)

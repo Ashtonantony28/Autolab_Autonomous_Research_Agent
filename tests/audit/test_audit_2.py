@@ -76,7 +76,6 @@ async def test_timeout_bounds_each_check_under_concurrency() -> None:
 # --- #2 (medium): StateStore upserts race --------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #2")
 async def test_concurrent_upserts_of_one_entity_are_idempotent(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
@@ -90,7 +89,6 @@ async def test_concurrent_upserts_of_one_entity_are_idempotent(tmp_path: Path) -
         await store.dispose()
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #2")
 async def test_concurrent_ensure_run_is_idempotent(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
@@ -107,7 +105,6 @@ async def test_concurrent_ensure_run_is_idempotent(tmp_path: Path) -> None:
 # --- #3 (medium): entity primary key ignores run_id ---------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #3")
 async def test_same_entity_id_in_two_runs_stays_in_both(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
