@@ -26,6 +26,10 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | done (PR pending) |
 | SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | done (PR pending) |
 | SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | done (PR pending) |
+| SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | todo |
+| SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | todo |
+| SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | todo |
+| SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -201,6 +205,33 @@ Round 1 found 1 critical and 9 high findings (AUDIT-1..4 at the repo root; repro
 
 AUDIT-4 H1 (offline tests never exercise NL→SMT) is closed by SG5's live accuracy run, which waits on an `ANTHROPIC_API_KEY`. AUDIT-4 H2 is fixed by the deterministic tests it added. Medium and low findings stay in the AUDIT files for a later pass unless a sub-goal folds them in. After SG7–SG10, audit round 2 re-runs all four audits with fresh agents.
 
+### Audit round 2 → SG11–SG14
+
+Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high findings. Repros are strict xfails in `tests/audit/test_audit_{5..8}.py`. Each sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG11 and SG12 run in parallel (no shared files); SG13 and SG14 follow.
+
+- **SG11 Formalizer symbol safety.**
+  - A declaration may not name an SMT-LIB builtin or reserved word (`>`, `<`, `=`, `not`, `and`, `or`, `=>`, `ite`, `+`, `-`, `*`, `true`, `false`, …). That gives a formalization failure (AUDIT-5 #1, critical).
+  - Every Z3 parse in `src/` and in the fixtures takes an explicit fresh `ctx=z3.Context()`, so verifies on several threads cannot crash the interpreter (AUDIT-6 #1, critical).
+  - **Flip:** `test_audit_5.py` #1 ×3, `test_audit_6.py::test_verifies_on_several_threads_do_not_crash_the_interpreter`.
+  - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/audit/test_audit_6.py tests/unit/verification -q` · `uv run python -m scripts.error_injection` (still 100% catch, 100% precision) · `uv run python -m scripts.bench_verifier --runs 20` (p95 ≤ 50 ms).
+- **SG12 Bind structured payload fields.**
+  - Design cost, duration and numeric parameters are injected as code-built `context.facts`, and the bound claim is a code-built sentence naming them, so a trace that states other values cannot pass (AUDIT-5 #2, high).
+  - `approve` on a verification escalation still runs the policy triggers (cost, duration, contradiction) before the payload is merged (AUDIT-5 #3, medium, folded in).
+  - **Flip:** `test_audit_5.py` #2 and #3.
+  - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/unit/agents tests/integration/orchestrator -q` · `uv run python -m scripts.run_benchmark` (each scenario still pauses on its policy trigger).
+- **SG13 Resume after a crash.**
+  - `autolab run` prints the thread id before the graph runs.
+  - `autolab resume <id>` continues a thread that has pending nodes and no interrupt from its last checkpoint. The recovery docstring matches what the CLI does (AUDIT-7 #1, high).
+  - **Flip:** `test_audit_7.py::test_run_killed_by_a_transient_outage_can_be_resumed`.
+  - **Verify:** `uv run pytest tests/audit/test_audit_7.py tests/integration/test_resume.py tests/unit/test_cli.py -q`
+- **SG14 Bounded, load-tolerant timing tests.**
+  - Add `pytest-timeout` (justified in `pyproject.toml`) with a per-test limit, so a hang fails with the test named (AUDIT-8 H1).
+  - Wall-clock tests carry a `perf` marker. Each guarantee that only a timing test covers (cancel, shutdown, queueing excluded from `solver_ms`, the injected executor being used) also gets a deterministic test, using events or counters instead of sleeps.
+  - `test_audit_2.py::test_slow_checks_do_not_starve_the_default_executor` stops flaking under full-suite load, and its assertion still kills mutant S07.
+  - **Verify:** `make test` passes 3 times in a row while a second `make test` runs at the same time · `uv run pytest -m "not perf" -q`.
+
+Medium and low round-2 findings stay in the AUDIT files for a later pass. After SG11–SG14, audit round 3 re-runs all four audits with fresh agents. SG5 live acceptance still waits on an `ANTHROPIC_API_KEY`.
+
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -211,9 +242,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-2 | Performance under load: concurrent runs, 50-step traces, solver timeouts, event-loop blocking |
 | AUDIT-3 | API/SDK consistency: `LLMClient`, models, agents, CLI and docs agree; no dead interfaces |
 | AUDIT-4 | Test coverage: untested branches, weak assertions, fakes that test nothing |
+| AUDIT-5..8 | Round 2 of the same four focuses, on SG7–SG10 |
 
 ## Log
 
+- 2026-10-19: audit round 2 done (2 critical, 3 high); SG11–SG14 added.
 - 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
 - 2026-10-19: plan approved by Ashton; SG0 built.
 - 2026-10-19: plan drafted. Baseline numbers (140 tests, coverage by module) are quoted from `docs/status.md` and have not yet been re-run in this environment.
