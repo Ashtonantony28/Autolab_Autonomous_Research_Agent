@@ -39,12 +39,12 @@ def test_mixed_score_without_invalid() -> None:
     assert consistency_score(verdicts) == pytest.approx(0.875)
 
 
-def test_any_invalid_caps_score_below_retry_threshold() -> None:
+def test_any_invalid_caps_score_in_retry_band() -> None:
     # 9 VALID + 1 INVALID would be 0.9 under the plain formula.
     verdicts = [_v(i, "VALID") for i in range(9)] + [_v(9, "INVALID")]
     score = consistency_score(verdicts)
     assert score == INVALID_SCORE_CAP
-    assert score < RETRY_THRESHOLD < PASS_THRESHOLD
+    assert RETRY_THRESHOLD <= score < PASS_THRESHOLD
 
 
 def test_cap_never_raises_a_low_score() -> None:

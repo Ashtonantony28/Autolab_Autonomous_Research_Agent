@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
-from autolab.agents.common import conclusion_instruction, parse_trace
+from autolab.agents.common import conclusion_instruction, parse_trace, with_feedback
 from autolab.state.models import ExperimentDesign, Hypothesis, VerificationContext
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
@@ -26,7 +26,10 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
         if not hypotheses:
             raise ValueError("DesignAgent invoked without any Hypothesis in state")
         target = hypotheses[-1]
-        raw = await self._llm.call("design.experiment", build_design_prompt(target))
+        feedback = state.get("feedback", "")
+        raw = await self._llm.call(
+            "design.experiment", with_feedback(build_design_prompt(target), feedback)
+        )
         payload = ExperimentDesign.model_validate_json(raw)
         if payload.hypothesis_id != target.id:
             raise ValueError(
@@ -34,7 +37,9 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
                 f"target hypothesis id={target.id}"
             )
 
-        trace_raw = await self._llm.call("design.trace", build_design_trace_prompt(target, payload))
+        trace_raw = await self._llm.call(
+            "design.trace", with_feedback(build_design_trace_prompt(target, payload), feedback)
+        )
         trace = parse_trace(self.name, trace_raw)
         context = VerificationContext(payload_claim=payload.protocol)
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)

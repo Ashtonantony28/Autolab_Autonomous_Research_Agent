@@ -34,7 +34,7 @@ if any step is INVALID: score = min(score, INVALID_SCORE_CAP)
 INVALID_SCORE_CAP = RETRY_THRESHOLD - 0.01
 ```
 
-Only non-premise steps can be INVALID, because premises are assumed. So this is exactly the rule "any refuted inference sinks the trace". The cap sits below `RETRY_THRESHOLD`, not just below `PASS_THRESHOLD`, so a trace with a refuted step routes to escalation rather than another retry. It is a `min`, so a trace that already scores lower keeps its lower score.
+Only non-premise steps can be INVALID, because premises are assumed. So this is exactly the rule "any refuted inference sinks the trace". The cap sits below `RETRY_THRESHOLD`, not just below `PASS_THRESHOLD`, so a trace with a refuted step routes to escalation rather than another retry (superseded by the SG4 amendment below). It is a `min`, so a trace that already scores lower keeps its lower score.
 
 ## Consequences
 
@@ -43,3 +43,7 @@ Only non-premise steps can be INVALID, because premises are assumed. So this is 
 - A step that cites only a consistent subset of an otherwise contradictory premise set is checked against that subset alone.
 - The cap is computed from the module constant `RETRY_THRESHOLD`, not from `Settings.retry_threshold`. If an operator lowers the retry threshold below 0.39, capped traces would land in the retry band. Callers that override thresholds should check that the cap is still below them.
 - Each non-premise step now costs two `check()` calls. On propositional and small arithmetic formulas the cost is negligible. SG2 measures it.
+
+## Amendment (SG4, 2026-10-19): retry first
+
+The owner's default is that a refuted trace is retried with the verifier's feedback before a human sees it. `INVALID_SCORE_CAP` is now `PASS_THRESHOLD - 0.01`: a refuted step still never passes, but a diluted trace lands in the retry band. `VerificationMonitor` (`retry_rework=True`) also routes any trace with an INVALID step or a `no_premises` step (an unbound conclusion, score 0.0) to RETRY whatever its score. It escalates after `max_retries`. To go back to escalate-first, set `retry_rework=False` and the cap back to `RETRY_THRESHOLD - 0.01`.

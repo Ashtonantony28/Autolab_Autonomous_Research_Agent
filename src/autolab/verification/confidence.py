@@ -7,9 +7,10 @@ INVALID contributes 0. UNGROUNDED contributes 0.5 because "we couldn't
 prove it either way" is weaker than "we proved it valid" but stronger than
 "we proved it invalid." Empty traces score 0.0.
 
-Any INVALID step caps the score at `INVALID_SCORE_CAP`, strictly below
-`RETRY_THRESHOLD`, so a refuted step can never be diluted into a pass by
-surrounding VALID steps.
+Any INVALID step caps the score at `INVALID_SCORE_CAP`, just below
+`PASS_THRESHOLD`, so a refuted step can never be diluted into a pass by
+surrounding VALID steps, but lands in the retry band (SG4 retry-first
+default; set the cap below `RETRY_THRESHOLD` to escalate instead).
 """
 
 from __future__ import annotations
@@ -17,14 +18,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
-from autolab.config import RETRY_THRESHOLD
+from autolab.config import PASS_THRESHOLD
 from autolab.state.models import StepVerdict
 
 _VALID_WEIGHT: Final[float] = 1.0
 _UNGROUNDED_WEIGHT: Final[float] = 0.5
 _INVALID_WEIGHT: Final[float] = 0.0
 _INVALID_CAP_MARGIN: Final[float] = 0.01
-INVALID_SCORE_CAP: Final[float] = RETRY_THRESHOLD - _INVALID_CAP_MARGIN
+INVALID_SCORE_CAP: Final[float] = PASS_THRESHOLD - _INVALID_CAP_MARGIN
 
 
 def consistency_score(verdicts: Sequence[StepVerdict]) -> float:
