@@ -391,7 +391,7 @@ async def test_malformed_llm_response_escalates_instead_of_crashing() -> None:
 
     pause = _interrupt(paused)
     assert pause["agent"] == "research"
-    assert pause["payload"] == {"trigger": "error"}
+    assert pause["payload"] == {"trigger": "error", "error": "ValidationError"}
     assert pause["reason"].startswith("ValidationError:")
     assert paused["reasoning_traces"] == []
     assert paused["hitl_payload"] is None

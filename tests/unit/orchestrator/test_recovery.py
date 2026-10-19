@@ -115,7 +115,7 @@ async def test_escalate_permanent_errors_turns_value_error_into_hitl_request() -
     pending = update["hitl_pending"]
     assert pending.agent == "design"
     assert pending.reason == "ValueError: bad payload"
-    assert pending.payload == {"trigger": "error"}
+    assert pending.payload == {"trigger": "error", "error": "ValueError"}
 
 
 async def test_escalate_permanent_errors_lets_other_errors_propagate() -> None:

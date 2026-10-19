@@ -87,6 +87,8 @@ No critical findings.
 
 **Suggested fix.** Keep one retry layer. Either build `AsyncAnthropic(max_retries=0)` and let `RetryingLLMClient` own retries, or drop the outer layer for live clients. Use full jitter (`sleep(random.uniform(0, delay))`). For `anthropic.APIStatusError`, honour `retry-after` / `retry-after-ms`, capped at a configured maximum. Make the attempt count and cap settings.
 
+**Resolution (SG8):** `AsyncAnthropic(max_retries=0)`, so `RetryingLLMClient` is the only layer (3 HTTP requests at most per logical call). `with_retries` sleeps `uniform(0, backoff)` and never less than the server's `retry-after-ms` / `retry-after` (seconds form; capped at `MAX_RETRY_AFTER_S` = 60 s). The three repros are flipped. Not done: the attempt count and the cap are module constants, not `Settings` fields (an SG0 interface change); an HTTP-date `retry-after` falls back to our own backoff.
+
 ---
 
 ## 5. Medium: the verifier's LLM calls are fully sequential; the 10-step < 30 s budget holds only at ≤ 1.5 s per call

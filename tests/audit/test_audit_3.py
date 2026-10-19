@@ -102,7 +102,6 @@ async def test_formalizer_turns_a_refusal_into_formalization_error() -> None:
         await formalizer.formalize(step)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #2")
 async def test_llm_refusal_pauses_at_hitl_instead_of_crashing_the_graph() -> None:
     graph = build_graph(llm=_RefusingLLM(), retry_backoff_seconds=0.0)
     config = {"configurable": {"thread_id": str(uuid4())}}
@@ -155,7 +154,6 @@ class _OverloadedOnce:
         raise NotImplementedError
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #4")
 async def test_overloaded_error_is_retried() -> None:
     inner = _OverloadedOnce()
     client = RetryingLLMClient(inner, initial_backoff_seconds=0.0)
@@ -196,7 +194,6 @@ class _PassThrough:
         return await self._inner.call_structured(purpose, prompt, schema)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #8")
 def test_faithfulness_stays_on_for_a_wrapped_live_client() -> None:
     verifier = Verifier(_PassThrough(_refusing_claude()))
     assert verifier._check_faithfulness is True

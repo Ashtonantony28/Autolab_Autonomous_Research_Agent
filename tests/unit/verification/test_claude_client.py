@@ -23,9 +23,12 @@ from autolab.state.models import (
 )
 from autolab.verification.faithfulness import FaithfulnessVerdict
 from autolab.verification.llm import (
+    DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
     ClaudeLLMClient,
+    FakeLLMClient,
+    StructuredOutputError,
     is_live,
     reply_schema,
     system_prompt,
@@ -137,10 +140,10 @@ async def test_one_async_anthropic_client_is_reused(monkeypatch: pytest.MonkeyPa
         summary="s",
     )
     messages = _StubMessages(report, text="t")
-    built: list[str] = []
+    built: list[tuple[str, int]] = []
 
-    def fake_ctor(*, api_key: str) -> SimpleNamespace:
-        built.append(api_key)
+    def fake_ctor(*, api_key: str, max_retries: int) -> SimpleNamespace:
+        built.append((api_key, max_retries))
         return SimpleNamespace(messages=messages)
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", fake_ctor)
@@ -149,5 +152,34 @@ async def test_one_async_anthropic_client_is_reused(monkeypatch: pytest.MonkeyPa
     await client.call("commonsense", "a")
     await client.call("analysis.report", "b")
     await client.call_structured("formalize", "c", AnalysisReport)
-    assert built == ["key"]
+    assert built == [("key", 0)]  # one client, and the SDK never retries
     assert [kind for kind, _ in messages.calls] == ["create", "parse", "parse"]
+
+
+async def test_missing_structured_output_names_the_stop_reason() -> None:
+    class Refusing:
+        async def parse(self, **_: Any) -> SimpleNamespace:
+            return SimpleNamespace(parsed_output=None, stop_reason="refusal")
+
+    client = ClaudeLLMClient("k", client=SimpleNamespace(messages=Refusing()))  # type: ignore[arg-type]
+    with pytest.raises(StructuredOutputError, match="stop_reason='refusal'"):
+        await client.call_structured("formalize", "p", FormalizedStep)
+    assert issubclass(StructuredOutputError, RuntimeError)  # faithfulness still fails closed
+
+
+def test_model_id_comes_from_one_constant() -> None:
+    assert ClaudeLLMClient("k")._model == DEFAULT_MODEL
+
+
+class _Wrapper:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+
+def test_is_live_follows_the_wrapper_contract() -> None:
+    live = ClaudeLLMClient("k")
+    assert is_live(_Wrapper(_Wrapper(live)))
+    assert not is_live(_Wrapper(FakeLLMClient())) and not is_live(_Wrapper(None))
+    opted_out = _Wrapper(live)
+    opted_out.live = False  # type: ignore[attr-defined]  # a wrapper's own `live` wins
+    assert not is_live(opted_out)
