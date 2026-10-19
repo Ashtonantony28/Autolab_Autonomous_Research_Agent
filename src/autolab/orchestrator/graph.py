@@ -74,7 +74,12 @@ def build_graph(
     """
     cfg = settings or get_settings()
     llm = RetryingLLMClient(llm, initial_backoff_seconds=retry_backoff_seconds)
-    verifier = Verifier(llm, solver_timeout_seconds=cfg.solver_timeout_s)
+    verifier = Verifier(
+        llm,
+        solver_timeout_seconds=cfg.solver_timeout_s,
+        pass_threshold=cfg.pass_threshold,
+        retry_threshold=cfg.retry_threshold,
+    )
     common: dict[str, Any] = {
         "verifier": verifier,
         "llm": llm,

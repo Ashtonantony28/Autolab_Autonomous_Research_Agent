@@ -4,7 +4,9 @@ Every concrete agent implements `_produce(state)` returning an
 `AgentOutput[PayloadT]`. The `__call__` template runs the VeriCoT verifier
 on the produced reasoning trace and decides:
 
-  - consistency_score >= HITL_THRESHOLD and no `hitl_trigger` fires → emit
+  - the verdict passes `VerificationMonitor(pass_threshold=hitl_threshold)`
+    (score at or above the threshold and not blocked: no INVALID or
+    `no_premises` step, final step VALID) and no `hitl_trigger` fires → emit
     the state update.
   - otherwise → emit a `HITLRequest` and withhold the payload's state update
     in `hitl_payload`. The orchestrator's monitor node then retries the agent
@@ -28,7 +30,11 @@ from typing import Any, Final, Generic, TypeVar
 
 from pydantic import BaseModel
 
-from autolab.agents.verification_monitor import AgentDecision
+from autolab.agents.verification_monitor import (
+    AgentDecision,
+    VerificationMonitor,
+    blocking_reason,
+)
 from autolab.config import PASS_THRESHOLD
 from autolab.state.models import HITLRequest, ReasoningTrace, VerificationContext
 from autolab.state.schema import AutoLabState
@@ -82,8 +88,9 @@ class BaseAgent(ABC, Generic[PayloadT]):
             "confidence": verdict.consistency_score,
         }
         merged = self._merge_payload(output.payload)
-        if verdict.consistency_score < self.hitl_threshold:
-            reason = (
+        monitor = VerificationMonitor(pass_threshold=self.hitl_threshold)
+        if monitor.decide(verdict) is not AgentDecision.PASS:
+            reason = blocking_reason(verdict) or (
                 f"verifier consistency_score={verdict.consistency_score:.2f}"
                 f" < threshold={self.hitl_threshold}"
             )
