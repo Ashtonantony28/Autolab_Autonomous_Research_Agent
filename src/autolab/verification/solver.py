@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import z3
 
-from autolab.state.models import Verdict
+from autolab.state.models import StepReason, Verdict
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,7 @@ class SolverOutcome:
     """Result of an entailment check."""
 
     verdict: Verdict
+    reason: StepReason
     details: str = ""
     counter_model: str = ""
 
@@ -61,7 +62,9 @@ class Z3Solver:
           - Any solver error / unknown / timeout → UNGROUNDED.
         """
         if not premises:
-            return SolverOutcome(verdict="UNGROUNDED", details="no premises to entail from")
+            return SolverOutcome(
+                verdict="UNGROUNDED", reason="no_premises", details="no premises to entail from"
+            )
 
         smt = _build_smt2(premises, claim)
         try:
@@ -69,6 +72,7 @@ class Z3Solver:
         except z3.Z3Exception as exc:
             return SolverOutcome(
                 verdict="UNGROUNDED",
+                reason="formalization_failed",
                 details=f"SMT parse error: {exc}",
             )
 
@@ -77,16 +81,20 @@ class Z3Solver:
         solver.add(assertions)
         result = solver.check()
         if result == z3.unsat:
-            return SolverOutcome(verdict="VALID", details="premises entail claim")
+            return SolverOutcome(
+                verdict="VALID", reason="entailed", details="premises entail claim"
+            )
         if result == z3.sat:
             model = solver.model()
             return SolverOutcome(
                 verdict="INVALID",
+                reason="not_entailed",
                 details="premises do not entail claim",
                 counter_model=str(model),
             )
         return SolverOutcome(
             verdict="UNGROUNDED",
+            reason="timeout",
             details=f"solver returned {result}",
         )
 

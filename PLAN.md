@@ -15,7 +15,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 
 | ID | Title | Depends on | Owns (files) | Status |
 |---|---|---|---|---|
-| SG0 | Shared interfaces | — | `state/models.py`, `verification/llm.py`, `config.py`, `state/schema.py` | todo |
+| SG0 | Shared interfaces | — | `state/models.py`, `verification/llm.py`, `config.py`, `state/schema.py` | done (PR open) |
 | SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | todo |
 | SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | todo |
 | SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | todo |
@@ -42,6 +42,8 @@ These are the contracts that later sub-goals build against. Only signatures, mod
 **Acceptance:** all new types are importable and round-trip through JSON; the existing 140 tests still pass unchanged; mypy strict is clean.
 **Verify:** `make lint && make typecheck && make test`
 
+**Result (2026-10-19):** files changed: `state/models.py`, `state/schema.py`, `state/checkpointer.py`, `config.py`, `verification/llm.py`, `verification/solver.py`, `verification/vericot.py`, `agents/base.py`, `agents/verification_monitor.py`, `orchestrator/routing.py`. Tests added: `tests/unit/test_interfaces.py` (16). Verify: lint and mypy clean, 156 passed (140 existing unchanged), `autolab.verification` coverage 96%. As built: `Verifier.verify` replaces `extra_premises` with `context`; solver and verifier now fill `reason` and `solver_ms`; `AutoLabState` gains `analysis_reports`, `hitl_payload`, `retry_count`, `feedback`. Open: `Formalizer` still parses raw JSON; SG1 switches it to `call_structured(..., FormalizedStep)`.
+
 ### SG1: Verifier soundness
 
 Goal: the verifier never admits an invalid step as VALID (no false negatives) on the fixture corpus.
@@ -50,6 +52,7 @@ Goal: the verifier never admits an invalid step as VALID (no false negatives) on
 - INVALID and UNGROUNDED steps are excluded from the premise pool.
 - If a step has `referenced_step_indices`, its premises are those steps plus `context.facts`. With no references, keep the current behavior (all earlier steps).
 - Score: any INVALID non-premise step caps the trace at `retry_threshold - ε`, so it can never pass. The `(V + 0.5U)/N` formula stays for the remaining cases. Record this in ADR-0007.
+- `Formalizer` uses `llm.call_structured("formalize", prompt, FormalizedStep)`; a `ValidationError` becomes `FormalizationError`.
 - `Vocabulary.merge` becomes atomic (build a copy, validate, then swap), and runs after the Z3 parse check.
 - Expand the corpus to at least 50 golden traces: the existing 20, plus explosion, dilution (many premises with one bad conclusion), poisoned chains, wrong citations, quantifier and arithmetic edge cases, and vocabulary conflicts.
 - Property test (`hypothesis`): generate random propositional traces over 3–5 atoms. A brute-force truth-table oracle decides entailment, and the verifier's verdict must match the oracle on every generated trace.
@@ -125,4 +128,5 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 
 ## Log
 
+- 2026-10-19: plan approved by Ashton; SG0 built.
 - 2026-10-19: plan drafted. Baseline numbers (140 tests, coverage by module) are quoted from `docs/status.md` and have not yet been re-run in this environment.

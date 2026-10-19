@@ -150,6 +150,16 @@ class ReasoningTrace(_Frozen):
 
 Verdict = Literal["VALID", "INVALID", "UNGROUNDED"]
 
+StepReason = Literal[
+    "assumed",
+    "entailed",
+    "not_entailed",
+    "premises_inconsistent",
+    "formalization_failed",
+    "no_premises",
+    "timeout",
+]
+
 
 class StepVerdict(_Frozen):
     """The verifier's verdict on a single reasoning step."""
@@ -157,6 +167,26 @@ class StepVerdict(_Frozen):
     step_index: int = Field(ge=0)
     verdict: Verdict
     details: str = ""
+    reason: StepReason | None = None
+    solver_ms: float = Field(default=0.0, ge=0.0)
+
+
+class FormalizedStep(_Frozen):
+    """An SMT-LIB 2 formalization of one claim: its declarations plus one assertion."""
+
+    declarations: str = ""
+    assertion: str = Field(min_length=1)
+
+
+class VerificationContext(_Frozen):
+    """Grounded inputs to verification beyond the trace itself.
+
+    `facts` are trusted premises (measurements, citations) available to every
+    step. `payload_claim` is the claim the trace must conclude.
+    """
+
+    facts: tuple[FormalizedStep, ...] = ()
+    payload_claim: str | None = None
 
 
 class VerificationResult(_Frozen):
@@ -192,6 +222,16 @@ class HITLRequest(_Mutable):
     reason: str
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_utc_now)
+
+
+HITLAction = Literal["approve", "retry", "abort"]
+
+
+class HITLResolution(_Frozen):
+    """A human's answer to a `HITLRequest`, passed via `Command(resume=...)`."""
+
+    action: HITLAction
+    note: str = ""
 
 
 class Interpretation(_Frozen):
@@ -233,14 +273,19 @@ __all__ = [
     "ExperimentParameter",
     "ExperimentResult",
     "ExperimentStatus",
+    "FormalizedStep",
+    "HITLAction",
     "HITLRequest",
+    "HITLResolution",
     "Hypothesis",
     "Interpretation",
     "Measurement",
     "ParameterValue",
     "ReasoningStep",
     "ReasoningTrace",
+    "StepReason",
     "StepVerdict",
     "Verdict",
+    "VerificationContext",
     "VerificationResult",
 ]

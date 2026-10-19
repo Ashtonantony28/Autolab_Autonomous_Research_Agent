@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Literal
 
+from autolab.config import PASS_THRESHOLD
 from autolab.state.schema import AutoLabState
 
 RouteOutcome = Literal["next", "hitl", "end"]
-
-PASS_THRESHOLD: Final[float] = 0.7
 
 
 def route_after_agent(state: AutoLabState, *, terminal: bool = False) -> RouteOutcome:

@@ -8,9 +8,10 @@ merge cleanly; scalars are last-writer-wins by default.
 from __future__ import annotations
 
 from operator import add
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from autolab.state.models import (
+    AnalysisReport,
     ExperimentDesign,
     ExperimentResult,
     HITLRequest,
@@ -29,9 +30,13 @@ class AutoLabState(TypedDict, total=False):
     results: Annotated[list[ExperimentResult], add]
     reasoning_traces: Annotated[list[ReasoningTrace], add]
     verification_history: Annotated[list[VerificationResult], add]
+    analysis_reports: Annotated[list[AnalysisReport], add]
     hitl_pending: HITLRequest | None
+    hitl_payload: dict[str, Any] | None
     current_agent: str
     confidence: float
+    retry_count: int
+    feedback: str
 
 
 def empty_state(research_question: str) -> AutoLabState:
@@ -43,9 +48,13 @@ def empty_state(research_question: str) -> AutoLabState:
         results=[],
         reasoning_traces=[],
         verification_history=[],
+        analysis_reports=[],
         hitl_pending=None,
+        hitl_payload=None,
         current_agent="",
         confidence=0.0,
+        retry_count=0,
+        feedback="",
     )
 
 

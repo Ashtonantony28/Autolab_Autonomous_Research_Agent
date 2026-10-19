@@ -19,10 +19,13 @@ malformed.
 
 from __future__ import annotations
 
+import time
+
 from autolab.state.models import (
     ReasoningStep,
     ReasoningTrace,
     StepVerdict,
+    VerificationContext,
     VerificationResult,
 )
 from autolab.verification.confidence import consistency_score, summarize
@@ -48,10 +51,18 @@ class Verifier:
         self,
         trace: ReasoningTrace,
         *,
-        extra_premises: list[SmtFormula] | None = None,
+        context: VerificationContext | None = None,
     ) -> VerificationResult:
-        """Run the pipeline and return a VerificationResult."""
+        """Run the pipeline and return a VerificationResult.
+
+        `context.facts` are added to every step's premises and their
+        declarations seed the formalizer's vocabulary.
+        """
         formalizer = Formalizer(self._llm)
+        facts = context.facts if context else ()
+        for fact in facts:
+            formalizer.vocabulary.merge(fact.declarations)
+        extra_premises = [SmtFormula(f.declarations, f.assertion) for f in facts]
         formalized: dict[int, SmtFormula] = {}
         verdicts: list[StepVerdict] = []
 
@@ -60,7 +71,7 @@ class Verifier:
                 step,
                 formalizer=formalizer,
                 formalized=formalized,
-                extra_premises=extra_premises or [],
+                extra_premises=extra_premises,
             )
             verdicts.append(verdict)
             if formula is not None:
@@ -89,6 +100,7 @@ class Verifier:
                 StepVerdict(
                     step_index=step.index,
                     verdict="UNGROUNDED",
+                    reason="formalization_failed",
                     details=f"formalization failed: {exc}",
                 ),
                 None,
@@ -99,18 +111,23 @@ class Verifier:
                 StepVerdict(
                     step_index=step.index,
                     verdict="VALID",
+                    reason="assumed",
                     details="premise; assumed",
                 ),
                 formula,
             )
 
         premises = premises_for(step, formalized, extra=extra_premises)
+        started = time.perf_counter()
         outcome = self._solver.check_entailment(premises, formula)
+        solver_ms = (time.perf_counter() - started) * 1000
         return (
             StepVerdict(
                 step_index=step.index,
                 verdict=outcome.verdict,
+                reason=outcome.reason,
                 details=outcome.details,
+                solver_ms=solver_ms,
             ),
             formula,
         )
