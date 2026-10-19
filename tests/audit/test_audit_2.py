@@ -44,7 +44,6 @@ _FAST_TIMEOUT_S: Final = 0.5
 # --- #1 (high): Z3 checks saturate asyncio's default executor -----------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #1")
 async def test_slow_checks_do_not_starve_the_default_executor() -> None:
     # 2 x workers + 1 slow checks queue three rounds deep on the shared pool.
     n = 2 * default_executor_workers() + 1
@@ -61,7 +60,6 @@ async def test_slow_checks_do_not_starve_the_default_executor() -> None:
     assert waited < 0.25
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #1")
 async def test_timeout_bounds_each_check_under_concurrency() -> None:
     n = 2 * default_executor_workers() + 1
     built = [pathological() for _ in range(n)]
@@ -180,7 +178,6 @@ async def test_rate_limit_retry_after_is_honoured() -> None:
 # --- #5 (medium): the verifier's LLM calls are strictly sequential -------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #5")
 async def test_ten_step_trace_overlaps_its_llm_calls() -> None:
     delay_s = 0.15
     trace, fake = build(chain(10, cite=True))
@@ -198,7 +195,6 @@ async def test_ten_step_trace_overlaps_its_llm_calls() -> None:
 # --- #6 (low): cancelling verify() leaves Z3 running ---------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #6")
 async def test_cancelled_verify_releases_its_worker_thread() -> None:
     tasks = []
     for _ in range(default_executor_workers()):
@@ -216,7 +212,6 @@ async def test_cancelled_verify_releases_its_worker_thread() -> None:
 # --- #7 (low): uncited premise pool re-scans the whole vocabulary per premise --
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #7")
 async def test_solver_document_work_is_linear_in_vocabulary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

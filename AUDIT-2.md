@@ -43,6 +43,8 @@ No critical findings.
 
 **Suggested fix.** Give Z3 its own bounded `ThreadPoolExecutor` (sized from a new `Settings.solver_workers`) and call it with `loop.run_in_executor(pool, ...)`. Add an `asyncio.Semaphore` so queued checks wait as coroutines and do not pile up in the pool. Measure `solver_ms` inside the worker, for example by having `check_entailment` return its own elapsed time. Report queue wait separately. Optionally count the deadline from submission time, so the end-to-end bound holds.
 
+**Resolution (SG10):** Z3 checks run on `solver.SolverExecutor`, a dedicated `ThreadPoolExecutor` (module default `SOLVER_WORKERS` = `min(32, cpu + 4)`, lazily created by `default_executor()`; `Verifier(solver_executor=...)` overrides it). A per-loop `asyncio.Semaphore` admits at most `workers` checks to the pool, so further callers wait as coroutines. `solver_ms` is timed on the worker. `audit_load pool --default-timeout`: `getaddrinfo` during 50 slow verifies 3.08 s → 0.01 s; `solver_ms` max at 50 × 1 s 7012 → 1011 ms, at 50 × 5 s 35014 → 5011 ms. Both repros are flipped. Not done: the deadline still starts on the worker, so end-to-end wall time under load still includes queueing (50 × 5 s checks on 8 workers take 35 s); a submission-time deadline would make verdicts depend on load. The pool size is a constant, not a `Settings` field (SG0 interface).
+
 ---
 
 ## 2. Medium: `StateStore` upserts race; concurrent writes of one id raise `IntegrityError`
@@ -113,6 +115,8 @@ Wall time is exactly 20 × per-call latency, so the 30 s requirement holds only 
 
 **Suggested fix.** Pipeline the work. Formalize steps sequentially, since the vocabulary requires it, but start each step's faithfulness judge as a task and await it only when a later step needs that formula as a premise. Run independent solver checks concurrently. Formalization must stay sequential, so this gives about N + 1 latency rounds instead of 2N, which allows about 2.7 s per call at 10 steps. Add a latency regression test that uses a delayed fake.
 
+**Resolution (SG10):** steps are still formalized one at a time, each with the vocabulary of every earlier step (Pattern C), but each step's faithfulness judge now runs as a task while later steps are formalized; the judge only decides whether the formula is used, as before. On an error or cancellation the pending judges are cancelled and the original exception propagates. `audit_load latency`: 10 steps at 100/200/400 ms per call 2.07/4.15/8.08 s → 1.17/2.27/4.47 s (0.57× the sum of call latencies, about N + 1 rounds). Repro flipped. Solver checks are still sequential per trace; at zero LLM latency they are not the bottleneck.
+
 ---
 
 ## 6. Low: cancelling `verify()` does not stop the Z3 check it started
@@ -124,6 +128,8 @@ Wall time is exactly 20 × per-call latency, so the 30 s requirement holds only 
 **Root cause.** `src/autolab/verification/vericot.py:314`: cancelling the awaiting task does not reach the thread. `solver.py:81-113` keeps the `z3.Context` local, so nothing can call `ctx.interrupt()`.
 
 **Suggested fix.** Have `check_entailment` register its `z3.Context` in a handle the caller holds. On `CancelledError` in `_verify_step`, call `ctx.interrupt()` (Z3 supports this from another thread), then re-raise.
+
+**Resolution (SG10):** `SolverExecutor.run` registers each check's `z3.Context` in an interrupt handle; on `CancelledError` it calls `ctx.interrupt()` (or, if the check has not started, makes it return at once), and `shutdown()` interrupts every running check. Z3 checks no longer use the default pool at all. `audit_load cancel`: 2.83 s → 0.00 s; a new test shows a one-worker solver pool is free again within 0.5 s of cancelling a 3 s check. Repro flipped.
 
 ---
 
@@ -147,6 +153,8 @@ At the sizes in the brief (50 and 100 steps) this is harmless: 0.17 s and 0.36 s
 **Root cause.** `src/autolab/verification/formalizer.py:98,105` (each formula stores `candidate.smt()`, the full vocabulary), `solver.py:146-152` (`_build_smt2` rescans every chunk's declarations) and `premise_grounder.py:46-51` (dedup keys hash those large strings).
 
 **Suggested fix.** Store only the step's *own* new declarations on `SmtFormula`, and pass the trace's vocabulary once to `check_entailment` (or emit only the symbols the premises and the claim actually use). For long traces, send the formalizer only the symbols relevant to the step, or a compact symbol table.
+
+**Resolution (SG10):** `Verifier._check` passes premises without declarations and declares the trace's final vocabulary once per check (every formula's declarations are a subset of it), so declaration work per check is linear. `audit_load long`, declaration lines scanned for 100/800 uncited steps: 89 625 / 43 067 000 → 5 100 / 320 800; 800-step total 24.2 s → 18.3 s, max step 96.6 → 52.1 ms. Repro flipped. Not done (outside SG10's files): `SmtFormula.declarations` still stores the cumulative vocabulary, the formalize prompt still resends the whole vocabulary (prompt size unchanged, quadratic), and an uncited step still parses every prior premise, so very long uncited traces stay superlinear.
 
 ---
 
