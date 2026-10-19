@@ -4,8 +4,9 @@
           → analysis → monitor → END
 
 `monitor` (the VerificationMonitor) can also send control back to the same
-agent (RETRY) or to `hitl`; `hitl` resumes to the next agent, the same agent
-or END. See `routing.py` and `checkpoints.py`.
+agent (RETRY) or to `hitl`; `hitl` resumes to the next agent, the same agent,
+END, or itself (an approved verification escalation whose policy trigger
+fires). See `routing.py` and `checkpoints.py`.
 
 Every agent node is wrapped by `_observed`, which feeds an optional
 `Metrics` and `RunTracer` one `TraceEvent` per execution.
@@ -35,7 +36,8 @@ from autolab.monitoring.tracer import RunTracer
 from autolab.orchestrator.checkpoints import (
     contradiction_trigger,
     cost_trigger,
-    hitl_node,
+    make_hitl_node,
+    merged_policy,
     new_in_process_saver,
 )
 from autolab.orchestrator.recovery import (
@@ -85,11 +87,11 @@ def build_graph(
         "llm": llm,
         "hitl_threshold": cfg.pass_threshold,
     }
+    contradiction = contradiction_trigger(verifier)
+    cost = cost_trigger(cfg.hitl_cost_usd, cfg.hitl_duration_min)
     agents: dict[str, BaseAgent[Any]] = {
-        "research": ResearchAgent(**common, hitl_trigger=contradiction_trigger(verifier)),
-        "design": DesignAgent(
-            **common, hitl_trigger=cost_trigger(cfg.hitl_cost_usd, cfg.hitl_duration_min)
-        ),
+        "research": ResearchAgent(**common, hitl_trigger=contradiction),
+        "design": DesignAgent(**common, hitl_trigger=cost),
         "execute": ExecuteAgent(**common, simulator=simulator or LabSimulator()),
         "analysis": AnalysisAgent(**common),
     }
@@ -105,7 +107,13 @@ def build_graph(
         graph.add_node(name, _observed(name, node, route, tracer, metrics))
         graph.add_edge(name, "monitor")
     graph.add_node("monitor", route, destinations=(*AGENTS, "hitl", END))
-    graph.add_node("hitl", hitl_node, destinations=(*AGENTS, END))
+    hitl = make_hitl_node(
+        {
+            "research": merged_policy(contradiction, "hypotheses"),
+            "design": merged_policy(cost, "current_experiment"),
+        }
+    )
+    graph.add_node("hitl", hitl, destinations=(*AGENTS, "hitl", END))
     graph.add_edge(START, "research")
 
     return graph.compile(checkpointer=checkpointer or new_in_process_saver())

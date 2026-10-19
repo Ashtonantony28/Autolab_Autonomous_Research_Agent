@@ -8,6 +8,8 @@ from autolab.agents.base import AgentOutput, BaseAgent
 from autolab.agents.common import (
     DESIGN_REPLY,
     conclusion_instruction,
+    design_claim,
+    design_facts,
     parse_trace,
     with_feedback,
 )
@@ -18,7 +20,12 @@ from autolab.verification.vericot import Verifier
 
 
 class DesignAgent(BaseAgent[ExperimentDesign]):
-    """Pick a single experiment that would test the most recent Hypothesis."""
+    """Pick a single experiment that would test the most recent Hypothesis.
+
+    Cost, duration and numeric parameters become code-built `context.facts`, and
+    the trace must conclude `design_claim(design)`, so the fields that drive the
+    cost/duration pause and the simulator are verified, not trusted.
+    """
 
     name = "design"
 
@@ -41,7 +48,9 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
             "design.trace", with_feedback(build_design_trace_prompt(target, payload), feedback)
         )
         trace = parse_trace(self.name, trace_raw)
-        context = VerificationContext(payload_claim=payload.protocol)
+        context = VerificationContext(
+            facts=design_facts(payload), payload_claim=design_claim(payload)
+        )
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     def _merge_payload(self, payload: ExperimentDesign) -> dict[str, Any]:
@@ -61,7 +70,7 @@ def build_design_trace_prompt(hypothesis: Hypothesis, design: ExperimentDesign) 
         'Reply with JSON: {"steps": [{index, claim, claim_type, referenced_step_indices}]}.\n\n'
         f"hypothesis: {hypothesis.statement}\n"
         f"protocol: {design.protocol}\n"
-        f"{conclusion_instruction(design.protocol)}"
+        f"{conclusion_instruction(design_claim(design))}"
     )
 
 

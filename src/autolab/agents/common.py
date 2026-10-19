@@ -15,6 +15,7 @@ from autolab.state.models import (
     ExperimentResult,
     FormalizedStep,
     Hypothesis,
+    ParameterValue,
     ReasoningStep,
     ReasoningTrace,
 )
@@ -80,15 +81,50 @@ def measurement_facts(result: ExperimentResult) -> tuple[FormalizedStep, ...]:
     Raises:
         ValueError: if a measurement value is not finite.
     """
-    facts = []
-    for m in result.measurements:
-        sym = _symbol(m.name)
-        facts.append(
-            FormalizedStep(
-                declarations=f"(declare-const {sym} Real)", assertion=f"(= {sym} {_real(m.value)})"
-            )
-        )
-    return tuple(facts)
+    return tuple(_real_fact(_symbol(m.name), m.value) for m in result.measurements)
+
+
+def design_claim(design: ExperimentDesign) -> str:
+    """The claim a Design trace must conclude: the protocol and every structured field."""
+    values = [
+        f"estimated_cost_usd = {_decimal(design.estimated_cost_usd)}",
+        f"estimated_duration_minutes = {_decimal(design.estimated_duration_minutes)}",
+    ]
+    for p in design.parameters:
+        text = _decimal(float(p.value)) if _numeric(p.value) else str(p.value)
+        values.append(f"{_param_symbol(p.name)} = {text}" + (f" {p.unit}" if p.unit else ""))
+    return f"design protocol: {design.protocol}; {', '.join(values)}"
+
+
+def design_facts(design: ExperimentDesign) -> tuple[FormalizedStep, ...]:
+    """Code-built Real facts for the Design's cost, duration and numeric parameters.
+
+    Raises:
+        ValueError: if a value is not finite.
+    """
+    return (
+        _real_fact("estimated_cost_usd", design.estimated_cost_usd),
+        _real_fact("estimated_duration_minutes", design.estimated_duration_minutes),
+        *(
+            _real_fact(_param_symbol(p.name), float(p.value))
+            for p in design.parameters
+            if _numeric(p.value)
+        ),
+    )
+
+
+def _numeric(value: ParameterValue) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _param_symbol(name: str) -> str:
+    return "param_" + re.sub(r"\W", "_", name)
+
+
+def _real_fact(sym: str, value: float) -> FormalizedStep:
+    return FormalizedStep(
+        declarations=f"(declare-const {sym} Real)", assertion=f"(= {sym} {_real(value)})"
+    )
 
 
 def _symbol(name: str) -> str:
@@ -114,6 +150,8 @@ __all__ = [
     "REPORT_REPLY",
     "conclusion_instruction",
     "content_schema",
+    "design_claim",
+    "design_facts",
     "measurement_facts",
     "parse_trace",
     "result_claim",
