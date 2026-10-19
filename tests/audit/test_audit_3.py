@@ -74,7 +74,6 @@ class _RefusingLLM:
 # --- #1 (high): the INVALID cap ignores Settings.pass_threshold ---------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #1")
 def test_refuted_trace_never_passes_under_configured_pass_threshold() -> None:
     cfg = Settings(pass_threshold=0.5)
     verdicts = [StepVerdict(step_index=i, verdict="VALID", reason="entailed") for i in range(9)]
@@ -96,7 +95,6 @@ def test_refuted_trace_never_passes_under_configured_pass_threshold() -> None:
 # --- #2 (high): non-ValueError LLM failures crash the graph -------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #2")
 async def test_formalizer_turns_a_refusal_into_formalization_error() -> None:
     formalizer = Formalizer(_refusing_claude())
     step = ReasoningStep(index=0, claim="P holds", claim_type="premise")

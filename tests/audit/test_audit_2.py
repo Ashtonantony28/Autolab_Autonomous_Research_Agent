@@ -52,7 +52,8 @@ async def test_slow_checks_do_not_starve_the_default_executor() -> None:
     load = asyncio.gather(
         *(Verifier(f, solver_timeout_seconds=_FAST_TIMEOUT_S).verify(t) for t, f in built)
     )
-    await asyncio.sleep(0.05)
+    # Let every fast premise check (SG7) finish so the slow checks hold the pool.
+    await asyncio.sleep(0.2)
     started = time.perf_counter()
     await asyncio.to_thread(lambda: None)  # stands in for getaddrinfo, aiofiles, ...
     waited = time.perf_counter() - started

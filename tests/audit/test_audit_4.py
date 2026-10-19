@@ -112,21 +112,28 @@ async def test_agent_score_equal_to_threshold_passes() -> None:
 async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
     """Score == PASS_THRESHOLD: the monitor says PASS, so the agent must not pause (kills M07).
 
-    2 VALID + 3 UNGROUNDED (unparseable SMT) steps: (2 + 1.5) / 5 == 0.7.
+    4 VALID + 6 UNGROUNDED (unparseable SMT) steps: (4 + 3) / 10 == 0.7. The conclusion
+    is entailed by two premises jointly, so it is not circular (AUDIT-1 #1).
     """
     fake = FakeLLMClient()
     _seed_hypothesis(fake)
+    noise = [GoldenStep(f"noise {i}", "inference", "", f"undeclared_{i}") for i in range(6)]
     register_trace(
         fake,
         agent="research",
         trace_purpose="research.trace",
         trace_prompt=build_trace_prompt(QUESTION, HYPOTHESIS),
         steps=(
-            GoldenStep("Y is present", "premise", "(declare-const audit_P Bool)", "audit_P"),
-            GoldenStep("noise 1", "premise", "", "undeclared_a"),
-            GoldenStep("noise 2", "inference", "", "undeclared_b"),
-            GoldenStep("noise 3", "inference", "", "undeclared_c"),
-            GoldenStep(HYPOTHESIS.statement, "conclusion", "", "audit_P", (0,)),
+            GoldenStep(
+                "Y is present",
+                "premise",
+                "(declare-const audit_P Bool)\n(declare-const audit_Q Bool)",
+                "audit_P",
+            ),
+            GoldenStep("Y implies the hypothesis", "premise", "", "(=> audit_P audit_Q)"),
+            GoldenStep("Z is present", "premise", "(declare-const audit_R Bool)", "audit_R"),
+            *noise,
+            GoldenStep(HYPOTHESIS.statement, "conclusion", "", "audit_Q", (0, 1)),
         ),
     )
 
@@ -135,9 +142,9 @@ async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
     [verdict] = update["verification_history"]
     assert [v.verdict for v in verdict.step_verdicts] == [
         "VALID",
-        "UNGROUNDED",
-        "UNGROUNDED",
-        "UNGROUNDED",
+        "VALID",
+        "VALID",
+        *["UNGROUNDED"] * 6,
         "VALID",
     ]
     assert verdict.consistency_score == PASS_THRESHOLD

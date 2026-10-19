@@ -74,22 +74,55 @@ def register_trivial_trace(
     conclusion: str | None = None,
     facts: Sequence[FormalizedStep] = (),
 ) -> ReasoningTrace:
-    """Register a 2-step trace (premise P, conclusion P) that verifies VALID/VALID.
+    """Register a 3-step trace (premise P, premise P => C, conclusion C) that verifies VALID.
 
-    Both steps state `conclusion` (default: a placeholder). Symbol names are
-    namespaced by `agent` so multiple agents' fakes can coexist on the same
-    `FakeLLMClient` without colliding.
+    The conclusion states `conclusion` (default: a placeholder) and is genuinely
+    entailed: neither premise proves it alone. Symbol names are namespaced by
+    `agent` so multiple agents' fakes can coexist on the same `FakeLLMClient`.
     """
-    sym = _sym(agent, "P")
-    claim = conclusion or f"premise of {agent}"
+    sym_p = _sym(agent, "P")
+    sym_c = _sym(agent, "C")
+    claim = conclusion or f"conclusion of {agent}"
     return register_trace(
         fake,
         agent=agent,
         trace_purpose=trace_purpose,
         trace_prompt=trace_prompt,
         steps=(
-            GoldenStep(claim, "premise", f"(declare-const {sym} Bool)", sym),
-            GoldenStep(claim, "conclusion", "", sym, (0,)),
+            GoldenStep(
+                f"premise of {agent}",
+                "premise",
+                f"(declare-const {sym_p} Bool)\n(declare-const {sym_c} Bool)",
+                sym_p,
+            ),
+            GoldenStep(
+                f"premise of {agent} implies {claim}", "premise", "", f"(=> {sym_p} {sym_c})"
+            ),
+            GoldenStep(claim, "conclusion", "", sym_c, (0, 1)),
+        ),
+        facts=facts,
+    )
+
+
+def register_circular_trace(
+    fake: FakeLLMClient,
+    *,
+    agent: str,
+    trace_purpose: str,
+    trace_prompt: str,
+    conclusion: str,
+    facts: Sequence[FormalizedStep] = (),
+) -> ReasoningTrace:
+    """Register a circular 2-step trace: premise C, then conclusion C citing it (AUDIT-1 #1)."""
+    sym = _sym(agent, "P")
+    return register_trace(
+        fake,
+        agent=agent,
+        trace_purpose=trace_purpose,
+        trace_prompt=trace_prompt,
+        steps=(
+            GoldenStep(conclusion, "premise", f"(declare-const {sym} Bool)", sym),
+            GoldenStep(conclusion, "conclusion", "", sym, (0,)),
         ),
         facts=facts,
     )
@@ -114,7 +147,7 @@ def register_failing_trace(
         trace_prompt=trace_prompt,
         steps=(
             GoldenStep(
-                f"premise of {agent}",
+                f"observation of {agent}",
                 "premise",
                 f"(declare-const {sym_p} Bool)\n(declare-const {sym_q} Bool)",
                 sym_p,
