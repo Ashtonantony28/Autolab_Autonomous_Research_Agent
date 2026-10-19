@@ -52,7 +52,6 @@ _LOCK_HOLD_S: Final = 5.5
 # --- #1 (critical): verifies on two threads crash the interpreter -------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #1")
 def test_verifies_on_several_threads_do_not_crash_the_interpreter() -> None:
     # 4 threads, each with its own event loop, verify 5 traces of 20 steps.
     # Today the formalizer's parse check shares Z3's global context across

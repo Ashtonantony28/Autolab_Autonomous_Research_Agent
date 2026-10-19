@@ -90,6 +90,16 @@ round-1 resolutions fall to this:
 - In `contradiction_trace`, do not formalize the redundant final step, or fail closed on
   it too.
 
+**Resolution (SG11).** `Vocabulary.merged` rejects any declaration whose name is in
+`formalizer.RESERVED_SYMBOLS` (90 names: SMT-LIB core, Ints/Reals/Arrays symbols, sorts,
+syntax keywords, commands, and common Z3 extensions such as `rem`, `^`, `implies`,
+`lambda`). The step raises `FormalizationError` and becomes UNGROUNDED/`formalization_failed`,
+and its declarations never enter the vocabulary, so no later check can shadow a builtin.
+The same rule covers `context.facts`, which seed the vocabulary through `merge`. All three
+repros now pass. Not done: the defence-in-depth items (per-check declarations, dropping a
+judge-rejected step's declarations, showing the judge the check's declaration block, and
+not formalizing the trigger's redundant final step).
+
 ## High
 
 ### #2 Payload binding covers one text field; the Design fields that drive the cost/duration pause and the simulator are never verified
