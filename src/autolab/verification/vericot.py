@@ -14,13 +14,20 @@ checked in order:
     (only the cited ones when it has `referenced_step_indices`) plus
     `context.facts` (ADR-0007).
 
-The Z3 check runs on a worker thread (`asyncio.to_thread`), so a slow check
-never blocks the event loop and concurrent `verify` calls overlap.
-`StepVerdict.solver_ms` is the wall time of that check alone.
+Z3 checks run on a bounded `SolverExecutor` (not asyncio's default pool), so a
+slow check never blocks the event loop or starves other `to_thread` users, and
+concurrent `verify` calls overlap. `StepVerdict.solver_ms` is the check's own
+run time, measured on the worker, so queueing is excluded. Each check is given
+the trace's vocabulary once rather than every premise's cumulative
+declarations (AUDIT-2 #7).
 
 Faithfulness (on by default for a live LLM): after a step is formalized, a
 judge back-translates its SMT and checks it states the claim; a mismatch is
-UNGROUNDED with reason `formalization_failed` (`faithfulness.py`).
+UNGROUNDED with reason `formalization_failed` (`faithfulness.py`). Steps are
+formalized strictly in order (each sees the vocabulary of every earlier step),
+but a step's judge runs concurrently with the formalization of later steps:
+the formalizer commits a step's vocabulary before the judge runs, and the
+judge decides only whether that formula may be used (AUDIT-2 #5).
 
 A formalization failure on a step yields an UNGROUNDED verdict — the
 trace remains verifiable as a whole even if one step's LLM output was
@@ -40,7 +47,7 @@ not VALID is capped below both thresholds (`confidence.score_cap`).
 from __future__ import annotations
 
 import asyncio
-import time
+from functools import partial
 
 from autolab.config import PASS_THRESHOLD, RETRY_THRESHOLD, SOLVER_TIMEOUT_S
 from autolab.state.models import (
@@ -56,7 +63,7 @@ from autolab.verification.faithfulness import unfaithful_reason
 from autolab.verification.formalizer import FormalizationError, Formalizer
 from autolab.verification.llm import LLMClient, is_live
 from autolab.verification.premise_grounder import premises_for
-from autolab.verification.solver import SmtFormula, Z3Solver
+from autolab.verification.solver import SmtFormula, SolverExecutor, Z3Solver, default_executor
 
 _TRUE = SmtFormula("", "true")
 
@@ -75,8 +82,11 @@ class Verifier:
         check_faithfulness: bool | None = None,
         pass_threshold: float = PASS_THRESHOLD,
         retry_threshold: float = RETRY_THRESHOLD,
+        solver_executor: SolverExecutor | None = None,
     ) -> None:
         """`check_faithfulness=None` turns the check on only for a live LLM (`is_live`).
+
+        `solver_executor` defaults to the process-wide `default_executor()`.
 
         The thresholds are the configured ones; a blocked trace's score is capped below
         both (`confidence.score_cap`).
@@ -88,6 +98,7 @@ class Verifier:
         self._solver = Z3Solver(timeout_seconds=solver_timeout_seconds)
         self._pass_threshold = pass_threshold
         self._retry_threshold = retry_threshold
+        self._executor = solver_executor
 
     async def verify(
         self,
@@ -110,13 +121,18 @@ class Verifier:
         for fact in facts:
             formalizer.vocabulary.merge(fact.declarations)
         extra_premises = [SmtFormula(f.declarations, f.assertion) for f in facts]
-        formulas = [await self._formalize(step, formalizer) for step in trace.steps]
+        formulas = await self._formalize_all(trace, formalizer)
+        vocab = formalizer.vocabulary.smt()
 
-        verdicts = await self._check_steps(trace, formulas, extra_premises, {})
+        verdicts = await self._check_steps(trace, formulas, extra_premises, {}, vocab)
         if payload_claim is not None and verdicts[-1].verdict == "VALID":
-            overrides = await self._payload_overrides(trace, formulas, verdicts, payload_claim)
+            overrides = await self._payload_overrides(
+                trace, formulas, verdicts, payload_claim, vocab
+            )
             if overrides:
-                verdicts = await self._check_steps(trace, formulas, extra_premises, overrides)
+                verdicts = await self._check_steps(
+                    trace, formulas, extra_premises, overrides, vocab
+                )
 
         score = consistency_score(
             verdicts,
@@ -131,12 +147,27 @@ class Verifier:
             summary=summarize(verdicts),
         )
 
-    async def _formalize(self, step: ReasoningStep, formalizer: Formalizer) -> StepFormula:
+    async def _formalize_all(
+        self, trace: ReasoningTrace, formalizer: Formalizer
+    ) -> list[StepFormula]:
+        """Formalize steps in order; each step's faithfulness judge runs in the background."""
+        judged: list[asyncio.Task[StepFormula]] = []
         try:
-            formula = await formalizer.formalize(step)
-        except FormalizationError as exc:
-            return _formalization_failed(step, f"formalization failed: {exc}")
-        if self._check_faithfulness:
+            for step in trace.steps:
+                try:
+                    formula: StepFormula = await formalizer.formalize(step)
+                except FormalizationError as exc:
+                    formula = _formalization_failed(step, f"formalization failed: {exc}")
+                judged.append(asyncio.create_task(self._judge(step, formula)))
+            return list(await asyncio.gather(*judged))
+        finally:
+            # On an error or cancellation, stop the remaining judges (no-op on success).
+            for task in judged:
+                task.cancel()
+            await asyncio.gather(*judged, return_exceptions=True)
+
+    async def _judge(self, step: ReasoningStep, formula: StepFormula) -> StepFormula:
+        if self._check_faithfulness and isinstance(formula, SmtFormula):
             unfaithful = await unfaithful_reason(self._llm, step, formula)
             if unfaithful is not None:
                 return _formalization_failed(step, unfaithful)
@@ -148,6 +179,7 @@ class Verifier:
         formulas: list[StepFormula],
         extra_premises: list[SmtFormula],
         overrides: dict[int, StepVerdict],
+        vocab: str,
     ) -> list[StepVerdict]:
         """Check every step in order; `overrides` fixes some steps' verdicts up front."""
         formalized: dict[int, SmtFormula] = {}
@@ -160,14 +192,14 @@ class Verifier:
             elif step.claim_type == "premise":
                 # Assumed, but only if consistent with the facts and every prior VALID step.
                 pool = [*formalized.values(), *extra_premises, formula]
-                verdict = await self._check(step, pool, _TRUE)
+                verdict = await self._check(step, pool, _TRUE, vocab)
                 if verdict.verdict == "VALID":
                     verdict = verdict.model_copy(
                         update={"reason": "assumed", "details": "premise; assumed"}
                     )
             else:
                 pool = premises_for(step, formalized, extra=extra_premises)
-                verdict = await self._check(step, pool, formula)
+                verdict = await self._check(step, pool, formula, vocab)
             verdicts.append(verdict)
             # Only VALID steps (assumed premises, entailed inferences) may support later steps.
             if isinstance(formula, SmtFormula) and verdict.verdict == "VALID":
@@ -175,16 +207,18 @@ class Verifier:
         return verdicts
 
     async def _check(
-        self, step: ReasoningStep, premises: list[SmtFormula], claim: SmtFormula
+        self, step: ReasoningStep, premises: list[SmtFormula], claim: SmtFormula, vocab: str
     ) -> StepVerdict:
-        started = time.perf_counter()
-        outcome = await asyncio.to_thread(self._solver.check_entailment, premises, claim)
+        """Check on the solver executor, declaring `vocab` (the trace's symbols) once."""
+        bare = [SmtFormula("", p.assertion) for p in premises]
+        check = partial(self._solver.check_entailment, bare, SmtFormula(vocab, claim.assertion))
+        outcome, solver_ms = await (self._executor or default_executor()).run(check)
         return StepVerdict(
             step_index=step.index,
             verdict=outcome.verdict,
             reason=outcome.reason,
             details=outcome.details,
-            solver_ms=(time.perf_counter() - started) * 1000,
+            solver_ms=solver_ms,
         )
 
     async def _payload_overrides(
@@ -193,6 +227,7 @@ class Verifier:
         formulas: list[StepFormula],
         verdicts: list[StepVerdict],
         payload_claim: str,
+        vocab: str,
     ) -> dict[int, StepVerdict]:
         """Verdicts that stop a VALID payload conclusion from proving itself.
 
@@ -205,7 +240,7 @@ class Verifier:
         last, conclusion = trace.steps[-1], formulas[-1]
         if not isinstance(conclusion, SmtFormula):
             return {}
-        trivial = await self._check(last, [_TRUE], conclusion)
+        trivial = await self._check(last, [_TRUE], conclusion, vocab)
         if trivial.verdict != "INVALID":
             reason: StepReason = trivial.reason or "timeout"
             details = f"could not rule out a tautology: {trivial.details}"
@@ -224,7 +259,7 @@ class Verifier:
             if _normalize(step.claim) == _normalize(payload_claim):
                 details = "premise restates the payload claim (circular)"
             else:
-                alone = await self._check(step, [formula], conclusion)
+                alone = await self._check(step, [formula], conclusion, vocab)
                 if alone.verdict == "INVALID":
                     continue
                 details = "premise alone entails the payload conclusion (circular)"
