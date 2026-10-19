@@ -95,6 +95,7 @@ async def test_store_append_waits_out_a_concurrent_writer(tmp_path: Path) -> Non
 # --- #3 (medium): retry-after waits are not jittered ---------------------------
 
 
+@pytest.mark.perf
 @pytest.mark.xfail(strict=True, reason="AUDIT-6 #3")
 async def test_retry_after_waits_are_jittered() -> None:
     retry_after_s = 0.2
