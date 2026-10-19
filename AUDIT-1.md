@@ -46,6 +46,8 @@ the conclusion to be entailed by premises that include at least one grounded
 `context.facts` entry or entailed inference, and score assumed premises as UNGROUNDED
 rather than VALID. Fixing this needs the `register_trivial_trace` fixtures to change too.
 
+**Resolution (SG7).** The rule applies when a trace is bound to a payload claim and its conclusion is VALID. Every VALID `premise` step whose normalized claim equals the payload claim, or whose formula alone entails the conclusion, is marked UNGROUNDED/`no_premises` (circular). That covers the same formula, an equivalent formula, and a conjunction that contains the conclusion. The trace is then re-checked without those premises, so any inference that rests on them also loses support. The conclusion passes only if the remaining premises and `context.facts` still entail it. An inconclusive circularity check fails closed. A premise that restates a measurement does not hurt a conclusion that the facts already prove. Limitation: an assumption split over two premises (`P`, `P => C`) is accepted. Premises remain assumptions, which faithfulness and human review cover. The retry repro now escalates after `max_retries` instead of admitting the circular retry. `register_trivial_trace` is now premise P, premise P => C, conclusion C. The audit repros use the new `register_circular_trace`, which keeps the circular shape.
+
 ---
 
 ## High
@@ -77,6 +79,8 @@ extra commands, and they enter the solver as premises (`solver.py:91-96`).
 `declare-const`, `declare-fun` or `declare-sort` S-expression. One check is to parse it
 alone in a fresh context and require zero assertions and nothing after the closing
 paren. Reject anything else as `FormalizationError`.
+
+**Resolution (SG7).** Each `declarations` line must be exactly one `declare-const`, `declare-fun` or `declare-sort` form. That means balanced parens, nothing after the closing paren, and no `|`, `"` or `;` (`formalizer._decl_name`). Anything else raises `FormalizationError`, so the step becomes UNGROUNDED/`formalization_failed` and its declarations never enter the vocabulary. Both repros now pass.
 
 ### #3 An UNGROUNDED payload conclusion is admitted: formalization failure, faithfulness rejection, timeout, or no premises
 
@@ -111,6 +115,8 @@ trace to pass. Otherwise cap the score below `PASS_THRESHOLD`, as already done f
 INVALID, and route it to RETRY. Also check `_needs_rework` before the score shortcut in
 `VerificationMonitor.decide`.
 
+**Resolution (SG7).** A bound trace whose final step is not VALID is capped below both thresholds (`consistency_score(require_final_valid=True)`). `VerificationMonitor.decide` now checks `blocking_reason` before the score: any INVALID or `no_premises` step, or a final step that is not VALID. Such a trace never passes. Under the retry-first default it goes to RETRY first, then ESCALATE after `max_retries`. `BaseAgent` gates with the same monitor, so the agent and the monitor never disagree. All four repros now pass.
+
 ---
 
 ## Medium
@@ -138,6 +144,8 @@ the cited steps.
 when that is unsat. Also run one final joint-consistency check over every VALID formula
 in the trace.
 
+**Resolution (SG7).** A `premise` step is assumed only if it is satisfiable together with `context.facts` and every earlier VALID step. The premise that makes the set unsat becomes INVALID/`premises_inconsistent` and leaves the pool. Every VALID inference is entailed by a subset of a consistent pool, so the VALID formulas of a trace are jointly consistent and no separate final check is needed. Both repros now pass. The explosion golden traces now flag their second premise.
+
 ### #5 A tautological conclusion is VALID whenever faithfulness is off
 
 **Impact.** The conclusion text equals the payload claim, so binding passes, but it is
@@ -161,6 +169,8 @@ unsat, it is a tautology, so mark it UNGROUNDED (a new reason such as `trivial`)
 Consider requiring an explicit `check_faithfulness` choice rather than inferring it from
 `live`.
 
+**Resolution (SG7).** For a bound trace with a VALID conclusion, the verifier also checks the conclusion against `true` alone. A tautology becomes UNGROUNDED/`formalization_failed` ("formalization is a tautology"). An inconclusive check fails closed (UNGROUNDED/`timeout`). Both repros now pass. Faithfulness is still off by default for clients that are not live.
+
 ### #6 The contradiction trigger (principle 7c) fails open
 
 **Impact.** The prior hypothesis "K-17 is toxic to human cells" formalizes to `toxic`,
@@ -183,6 +193,8 @@ formalizing (`vericot.py:124-127`).
 **Suggested fix.** Check joint satisfiability of the formalized statements directly, with
 no re-formalized final step. Fail closed (pause) when any statement fails to formalize or
 the check times out.
+
+**Resolution (SG7).** `contradiction_trigger` (minimal edit in `orchestrator/checkpoints.py`) now fires on any `premises_inconsistent` step, since premises are checked against each other (#4). It fails closed, with "could not rule out a contradiction", when any statement (a premise step) is not VALID. The redundant final inference's own verdict no longer matters. Both repros now pass.
 
 ---
 

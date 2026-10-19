@@ -138,7 +138,8 @@ async def test_contradictory_premises_do_not_entail_anything() -> None:
     out = await _reasons(
         [("premise", _PQ, "P", ()), ("premise", "", "(not P)", ()), ("conclusion", "", "Q", ())]
     )
-    assert out[2] == "INVALID:premises_inconsistent"
+    # The premise that breaks consistency is INVALID itself and leaves the pool.
+    assert out[1:] == ["INVALID:premises_inconsistent", "INVALID:not_entailed"]
 
 
 async def test_invalid_step_is_excluded_from_later_pools() -> None:

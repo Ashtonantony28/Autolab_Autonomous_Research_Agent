@@ -6,7 +6,7 @@ import pytest
 
 from autolab.config import PASS_THRESHOLD, RETRY_THRESHOLD
 from autolab.state.models import StepVerdict, Verdict
-from autolab.verification.confidence import INVALID_SCORE_CAP, consistency_score, summarize
+from autolab.verification.confidence import consistency_score, score_cap, summarize
 
 
 def _v(idx: int, kind: Verdict) -> StepVerdict:
@@ -39,12 +39,42 @@ def test_mixed_score_without_invalid() -> None:
     assert consistency_score(verdicts) == pytest.approx(0.875)
 
 
-def test_any_invalid_caps_score_in_retry_band() -> None:
+def test_any_invalid_caps_score_below_both_thresholds() -> None:
     # 9 VALID + 1 INVALID would be 0.9 under the plain formula.
     verdicts = [_v(i, "VALID") for i in range(9)] + [_v(9, "INVALID")]
     score = consistency_score(verdicts)
-    assert score == INVALID_SCORE_CAP
-    assert RETRY_THRESHOLD <= score < PASS_THRESHOLD
+    assert score == score_cap() == pytest.approx(RETRY_THRESHOLD - 0.01)
+    assert score < RETRY_THRESHOLD < PASS_THRESHOLD
+
+
+@pytest.mark.parametrize(
+    ("pass_threshold", "retry_threshold"), [(0.5, 0.4), (0.3, 0.2), (0.3, 0.6), (0.95, 0.9)]
+)
+def test_cap_follows_the_configured_thresholds(
+    pass_threshold: float, retry_threshold: float
+) -> None:
+    verdicts = [_v(i, "VALID") for i in range(9)] + [_v(9, "INVALID")]
+    score = consistency_score(
+        verdicts, pass_threshold=pass_threshold, retry_threshold=retry_threshold
+    )
+    assert score == score_cap(pass_threshold, retry_threshold)
+    assert score < min(pass_threshold, retry_threshold)
+
+
+def test_cap_is_never_negative() -> None:
+    assert score_cap(0.0, 0.0) == 0.0
+    assert consistency_score([_v(0, "INVALID")], pass_threshold=0.0) == 0.0
+
+
+def test_require_final_valid_caps_an_unproven_conclusion() -> None:
+    verdicts = [_v(i, "VALID") for i in range(9)] + [_v(9, "UNGROUNDED")]
+    assert consistency_score(verdicts) == pytest.approx(0.95)
+    assert consistency_score(verdicts, require_final_valid=True) == score_cap()
+
+
+def test_require_final_valid_keeps_a_proven_conclusion() -> None:
+    verdicts = [_v(0, "UNGROUNDED"), _v(1, "VALID"), _v(2, "VALID")]
+    assert consistency_score(verdicts, require_final_valid=True) == pytest.approx(2.5 / 3)
 
 
 def test_cap_never_raises_a_low_score() -> None:

@@ -149,8 +149,9 @@ async def test_execute_agent_marks_premise_contradicting_measurement_inconsisten
     )
 
     [verdict] = update["verification_history"]
-    assert verdict.step_verdicts[1].verdict == "INVALID"
-    assert verdict.step_verdicts[1].reason == "premises_inconsistent"
+    # The premise itself contradicts the measurement fact (AUDIT-1 #4).
+    assert verdict.step_verdicts[0].verdict == "INVALID"
+    assert verdict.step_verdicts[0].reason == "premises_inconsistent"
     assert update["hitl_pending"] is not None
 
 

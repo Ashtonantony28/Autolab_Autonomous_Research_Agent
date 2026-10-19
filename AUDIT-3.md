@@ -45,6 +45,8 @@
 
 Also validate in `Settings` that `retry_threshold <= pass_threshold`.
 
+**Resolution (SG7).** `consistency_score` and `score_cap` take the configured `pass_threshold` and `retry_threshold`, and `build_graph` passes the `Settings` values to the `Verifier`. A blocked trace has any INVALID step, or a payload conclusion that is not VALID. Its score is capped at `min(pass, retry) - 0.01`, which is below both thresholds (0.39 by default). The rule is also categorical: `VerificationMonitor.decide` and `BaseAgent` never PASS a blocked verdict, whatever the score or threshold. ADR-0007 is amended. The repro now passes.
+
 ## 2. High: LLM failures that are not a `ValueError` crash the graph instead of escalating
 
 **Impact.** CLAUDE.md Phase 4 says "On permanent errors, escalate." In practice, `escalate_permanent_errors` converts only `ValueError` into an `error` HITL request. Several realistic live failures escape `graph.ainvoke` and end `autolab run` with a traceback.
@@ -66,6 +68,8 @@ Also validate in `Settings` that `retry_threshold <= pass_threshold`.
 - Add a `StructuredOutputError(ValueError)`, or `LLMRefusalError`, raised by `ClaudeLLMClient` and caught by the formalizer, which turns it into UNGROUNDED.
 - Have `escalate_permanent_errors` also catch `anthropic.APIStatusError` that is not in `TRANSIENT_ERRORS`.
 - Check `response.stop_reason` (`refusal`, `max_tokens`) before reading `parsed_output`, so the HITL reason says why the call failed.
+
+**Resolution (SG7, partial).** `Formalizer.formalize` maps any `RuntimeError` from `call_structured` to `FormalizationError`. That covers a refusal or empty structured output, including SG8's `StructuredOutputError`. Only that step becomes UNGROUNDED/`formalization_failed`. `test_formalizer_turns_a_refusal_into_formalization_error` now passes. Graph-level escalation (`test_llm_refusal_pauses_at_hitl_instead_of_crashing_the_graph`) belongs to SG8.
 
 ## 3. High: the model writes entity ids and timestamps, and the store upserts by id across runs
 

@@ -47,3 +47,15 @@ Only non-premise steps can be INVALID, because premises are assumed. So this is 
 ## Amendment (SG4, 2026-10-19): retry first
 
 The owner's default is that a refuted trace is retried with the verifier's feedback before a human sees it. `INVALID_SCORE_CAP` is now `PASS_THRESHOLD - 0.01`: a refuted step still never passes, but a diluted trace lands in the retry band. `VerificationMonitor` (`retry_rework=True`) also routes any trace with an INVALID step or a `no_premises` step (an unbound conclusion, score 0.0) to RETRY whatever its score. It escalates after `max_retries`. To go back to escalate-first, set `retry_rework=False` and the cap back to `RETRY_THRESHOLD - 0.01`.
+
+## Amendment (SG7, 2026-10-19): blocked traces, configured cap, premise checks
+
+AUDIT-1 #1–#6 and AUDIT-3 #1 showed that a score threshold alone cannot keep wrong traces out.
+
+- **Blocked traces never pass.** A verdict is *blocked* when it has an INVALID step or a `no_premises` step, or when its final step (the payload conclusion) is not VALID (`verification_monitor.blocking_reason`). `VerificationMonitor.decide` checks this before the score. `BaseAgent` gates with the same monitor, so the agent and the monitor always agree. Retry-first stays the default: a blocked trace goes to RETRY, then ESCALATE after `max_retries`. `retry_rework=False` routes it by score instead, which can never give PASS.
+- **Cap from configured thresholds.** `consistency_score(verdicts, pass_threshold=, retry_threshold=, require_final_valid=)` caps a blocked trace at `score_cap = max(0, min(pass, retry) - 0.01)`. That is below both bands, 0.39 by default. `Verifier` takes both thresholds, and `build_graph` passes `Settings`. `INVALID_SCORE_CAP` is removed. To go escalate-first, set only `retry_rework=False`.
+- **Premises are checked.** A premise is assumed only if it is satisfiable together with `context.facts` and every earlier VALID step. Otherwise it is INVALID/`premises_inconsistent`. Premises can therefore be INVALID now.
+- **Bound conclusions must be proven, not assumed.** Every step is formalized first. Then, when the payload conclusion is VALID, the verifier checks three things. If the conclusion is a tautology, it becomes UNGROUNDED/`formalization_failed`. A VALID premise whose normalized claim equals the payload claim, or whose formula alone entails the conclusion, becomes UNGROUNDED/`no_premises` (circular), and the trace is re-checked without it. An inconclusive check on either fails closed. Two premises that only jointly entail the conclusion (`P`, `P => C`) are accepted. This is the shape `register_trivial_trace` now uses.
+- **Declarations are declarations.** Each line must be exactly one `declare-const` / `declare-fun` / `declare-sort` form (AUDIT-1 #2).
+
+Consequences: each premise now costs one solver check, and a bound trace with a VALID conclusion costs 1 + (#premises) more single-premise checks. These checks are small. The explosion golden traces now flag the contradicting premise itself (overall still INVALID).
