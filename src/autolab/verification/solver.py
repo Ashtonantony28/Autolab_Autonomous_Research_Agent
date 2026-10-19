@@ -1,9 +1,12 @@
 """Z3 wrapper for entailment checking.
 
-Each step is verified by asking Z3: `premises and not claim` — if `unsat`, the
-claim is entailed by its premises (VALID); if `sat`, there's a model that
-satisfies the premises but contradicts the claim (INVALID); if `unknown`
-(timeout or undecidable), we conservatively return UNGROUNDED.
+Each step is verified in two checks. First the premises alone must be
+satisfiable; an unsat premise set would entail anything (ex falso), so it is
+INVALID with reason `premises_inconsistent`. Then Z3 is asked about
+`premises and not claim` — if `unsat`, the claim is entailed (VALID); if
+`sat`, there's a model that satisfies the premises but contradicts the claim
+(INVALID); if `unknown` (timeout or undecidable), we conservatively return
+UNGROUNDED.
 
 Inputs are SMT-LIB 2 strings, parsed via `z3.parse_smt2_string` so the
 boundary between LLM-produced text and Z3's AST is explicit.
@@ -57,6 +60,7 @@ class Z3Solver:
 
         Conventions:
           - No premises → UNGROUNDED.
+          - premises alone unsat → INVALID (`premises_inconsistent`).
           - premises and not claim is unsat → VALID.
           - premises and not claim is sat   → INVALID.
           - Any solver error / unknown / timeout → UNGROUNDED.
@@ -78,7 +82,24 @@ class Z3Solver:
 
         solver = z3.Solver()
         solver.set("timeout", int(self.timeout_seconds * 1000))
-        solver.add(assertions)
+        # The negated claim is always the last assertion `_build_smt2` emits.
+        negated_claim = assertions[len(assertions) - 1]
+        for i in range(len(assertions) - 1):
+            solver.add(assertions[i])
+        consistency = solver.check()
+        if consistency == z3.unsat:
+            return SolverOutcome(
+                verdict="INVALID",
+                reason="premises_inconsistent",
+                details="premises are mutually unsatisfiable",
+            )
+        if consistency != z3.sat:
+            return SolverOutcome(
+                verdict="UNGROUNDED",
+                reason="timeout",
+                details=f"premise consistency check returned {consistency}",
+            )
+        solver.add(negated_claim)
         result = solver.check()
         if result == z3.unsat:
             return SolverOutcome(

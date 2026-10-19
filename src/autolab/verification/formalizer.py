@@ -5,8 +5,10 @@ trace: when step N is formalized, the symbol declarations from steps 1..N-1
 are passed in so the LLM keeps names consistent (CLAUDE.md §7 Pattern C).
 Re-declaring a symbol with a different signature is rejected.
 
-The LLM is expected to return a JSON object with two fields, `declarations`
-and `assertion`, both strings of SMT-LIB 2.
+The LLM returns a `FormalizedStep` (via `LLMClient.call_structured`) whose
+`declarations` and `assertion` are SMT-LIB 2 strings. The vocabulary is only
+extended once the step's SMT parses, and a merge either applies fully or not
+at all, so a rejected step never leaks symbols into later prompts.
 """
 
 from __future__ import annotations
@@ -15,8 +17,9 @@ import json
 from dataclasses import dataclass, field
 
 import z3
+from pydantic import ValidationError
 
-from autolab.state.models import ReasoningStep
+from autolab.state.models import FormalizedStep, ReasoningStep
 from autolab.verification.llm import LLMClient
 from autolab.verification.solver import SmtFormula
 
@@ -35,9 +38,16 @@ class Vocabulary:
     declarations: dict[str, str] = field(default_factory=dict)
 
     def smt(self) -> str:
+        """Return all declarations as one SMT-LIB block."""
         return "\n".join(self.declarations.values())
 
-    def merge(self, new_decls: str) -> None:
+    def merged(self, new_decls: str) -> Vocabulary:
+        """Return a copy extended with `new_decls`; `self` is never modified.
+
+        Raises:
+            FormalizationError: on an unrecognized or conflicting declaration.
+        """
+        out = dict(self.declarations)
         for line in new_decls.splitlines():
             stripped = line.strip()
             if not stripped:
@@ -45,13 +55,22 @@ class Vocabulary:
             name = _decl_name(stripped)
             if name is None:
                 raise FormalizationError(f"unrecognized declaration: {stripped!r}")
-            existing = self.declarations.get(name)
+            existing = out.get(name)
             if existing is not None and existing != stripped:
                 raise FormalizationError(
                     f"symbol {name!r} re-declared with conflicting signature: "
                     f"had {existing!r}, got {stripped!r}"
                 )
-            self.declarations[name] = stripped
+            out[name] = stripped
+        return Vocabulary(out)
+
+    def merge(self, new_decls: str) -> None:
+        """Atomically extend this vocabulary in place (all lines or none).
+
+        Raises:
+            FormalizationError: on an unrecognized or conflicting declaration.
+        """
+        self.declarations = self.merged(new_decls).declarations
 
 
 class Formalizer:
@@ -62,30 +81,28 @@ class Formalizer:
         self.vocabulary = Vocabulary()
 
     async def formalize(self, step: ReasoningStep) -> SmtFormula:
+        """Formalize `step` and, on success only, extend the vocabulary.
+
+        Raises:
+            FormalizationError: if the LLM output fails schema validation
+                (including an empty assertion), conflicts with the vocabulary,
+                or does not parse as SMT-LIB.
+        """
         prompt = prompt_for(step, self.vocabulary)
-        raw = await self._llm.call("formalize", prompt)
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise FormalizationError(f"LLM did not return JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise FormalizationError(f"LLM JSON must be an object, got {type(payload).__name__}")
-        decls = payload.get("declarations", "")
-        assertion = payload.get("assertion", "")
-        if not isinstance(decls, str) or not isinstance(assertion, str):
-            raise FormalizationError("`declarations` and `assertion` must be strings")
-        if not assertion.strip():
-            raise FormalizationError("empty assertion")
+            out = await self._llm.call_structured("formalize", prompt, FormalizedStep)
+        except (ValidationError, json.JSONDecodeError) as exc:
+            raise FormalizationError(f"LLM output is not a valid FormalizedStep: {exc}") from exc
 
-        self.vocabulary.merge(decls)
-        full_decls = self.vocabulary.smt()
-
+        candidate = self.vocabulary.merged(out.declarations)
+        full_decls = candidate.smt()
         try:
-            z3.parse_smt2_string(f"{full_decls}\n(assert {assertion})")
+            z3.parse_smt2_string(f"{full_decls}\n(assert {out.assertion})")
         except z3.Z3Exception as exc:
             raise FormalizationError(f"invalid SMT for step {step.index}: {exc}") from exc
 
-        return SmtFormula(declarations=full_decls, assertion=assertion)
+        self.vocabulary = candidate
+        return SmtFormula(declarations=full_decls, assertion=out.assertion)
 
 
 def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
