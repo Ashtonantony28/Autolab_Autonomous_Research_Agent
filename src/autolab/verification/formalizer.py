@@ -14,7 +14,9 @@ at all, so a rejected step never leaks symbols into later prompts.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
+from typing import Final
 
 import z3
 from pydantic import ValidationError
@@ -45,7 +47,8 @@ class Vocabulary:
         """Return a copy extended with `new_decls`; `self` is never modified.
 
         Raises:
-            FormalizationError: on an unrecognized or conflicting declaration.
+            FormalizationError: on an unrecognized or conflicting declaration,
+                or one that names an SMT-LIB builtin or reserved word (AUDIT-5 #1).
         """
         out = dict(self.declarations)
         for line in new_decls.splitlines():
@@ -55,6 +58,8 @@ class Vocabulary:
             name = _decl_name(stripped)
             if name is None:
                 raise FormalizationError(f"unrecognized declaration: {stripped!r}")
+            if name in RESERVED_SYMBOLS:
+                raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             existing = out.get(name)
             if existing is not None and existing != stripped:
                 raise FormalizationError(
@@ -101,12 +106,27 @@ class Formalizer:
         candidate = self.vocabulary.merged(out.declarations)
         full_decls = candidate.smt()
         try:
-            z3.parse_smt2_string(f"{full_decls}\n(assert {out.assertion})")
+            z3.parse_smt2_string(f"{full_decls}\n(assert {out.assertion})", ctx=_parse_context())
         except z3.Z3Exception as exc:
             raise FormalizationError(f"invalid SMT for step {step.index}: {exc}") from exc
 
         self.vocabulary = candidate
         return SmtFormula(declarations=full_decls, assertion=out.assertion)
+
+
+_PARSE_CONTEXTS = threading.local()
+
+
+def _parse_context() -> z3.Context:
+    """This thread's Z3 context for parse checks; Z3's global one is not thread-safe (AUDIT-6 #1).
+
+    Declarations do not persist between `parse_smt2_string` calls, so reusing a
+    per-thread context is equivalent to a fresh one and saves ~1.5 ms per step.
+    """
+    ctx: z3.Context | None = getattr(_PARSE_CONTEXTS, "ctx", None)
+    if ctx is None:
+        ctx = _PARSE_CONTEXTS.ctx = z3.Context()
+    return ctx
 
 
 def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
@@ -131,6 +151,36 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
 
 
 _DECL_HEADS = frozenset({"declare-const", "declare-fun", "declare-sort"})
+
+# SMT-LIB core, Ints/Reals/Arrays theory symbols, sorts, syntax keywords and
+# commands, plus common Z3 extensions. Z3 lets a declaration shadow most of them.
+RESERVED_SYMBOLS: Final[frozenset[str]] = frozenset(
+    {
+        # Core
+        "true", "false", "not", "=>", "and", "or", "xor", "=", "distinct", "ite",
+        # Arithmetic
+        "+", "-", "*", "/", "div", "mod", "abs", "<", "<=", ">", ">=",
+        "to_real", "to_int", "is_int",
+        # Arrays
+        "select", "store",
+        # Sorts
+        "Bool", "Int", "Real", "Array", "String", "Seq", "RegLan", "BitVec",
+        "FloatingPoint", "RoundingMode",
+        # Syntax keywords
+        "!", "_", "as", "let", "forall", "exists", "match", "par",
+        "NUMERAL", "DECIMAL", "STRING", "BINARY", "HEXADECIMAL",
+        # Commands
+        "assert", "check-sat", "check-sat-assuming", "declare-const", "declare-datatype",
+        "declare-datatypes", "declare-fun", "declare-sort", "define-fun", "define-fun-rec",
+        "define-funs-rec", "define-sort", "echo", "exit", "get-assertions",
+        "get-assignment", "get-info", "get-model", "get-option", "get-proof",
+        "get-unsat-assumptions", "get-unsat-core", "get-value", "pop", "push",
+        "reset", "reset-assertions", "set-info", "set-logic", "set-option",
+        # Z3 extensions
+        "rem", "^", "iff", "implies", "if", "divisible", "pi", "euler", "root-obj",
+        "const", "lambda",
+    }
+)  # fmt: skip
 
 
 def _decl_name(decl: str) -> str | None:
@@ -158,4 +208,4 @@ def _decl_name(decl: str) -> str | None:
     return tokens[1]
 
 
-__all__ = ["FormalizationError", "Formalizer", "Vocabulary", "prompt_for"]
+__all__ = ["RESERVED_SYMBOLS", "FormalizationError", "Formalizer", "Vocabulary", "prompt_for"]

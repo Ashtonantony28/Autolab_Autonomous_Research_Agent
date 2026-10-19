@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import z3
 from pydantic import BaseModel
 
-from autolab.state.models import ClaimType, FormalizedStep, ReasoningStep
+from autolab.state.models import ClaimType, FormalizedStep, ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import (
+    RESERVED_SYMBOLS,
     FormalizationError,
     Formalizer,
     Vocabulary,
+    _parse_context,
     prompt_for,
 )
 from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
+from autolab.verification.vericot import Verifier
 
 
 def _step(index: int, claim: str = "claim", claim_type: ClaimType = "inference") -> ReasoningStep:
@@ -271,3 +276,50 @@ class _RefusingLLM(FakeLLMClient):
 async def test_refusal_becomes_formalization_error() -> None:
     with pytest.raises(FormalizationError, match="no structured output"):
         await Formalizer(_RefusingLLM()).formalize(_step(0))
+
+
+@pytest.mark.parametrize("name", sorted(RESERVED_SYMBOLS))
+def test_merge_rejects_reserved_symbols(name: str) -> None:
+    # AUDIT-5 #1: a declaration must not shadow an SMT-LIB builtin.
+    v = Vocabulary({"p": "(declare-const p Bool)"})
+    with pytest.raises(FormalizationError, match="reserved symbol"):
+        v.merge(f"(declare-const ok Bool)\n(declare-fun {name} (Real Real) Bool)")
+    assert set(v.declarations) == {"p"}
+
+
+@pytest.mark.parametrize("name", ["gt", "not_ready", "and_gate", "Truth", "x-1", "absorbance"])
+def test_merge_accepts_user_symbols_near_reserved_words(name: str) -> None:
+    assert name in Vocabulary().merged(f"(declare-fun {name} (Real) Bool)").declarations
+
+
+async def test_reserved_declaration_makes_the_step_formalization_failed() -> None:
+    fake = FakeLLMClient()
+    steps = (_step(0, "x exceeds 1", "premise"), _step(1, "y holds", "premise"))
+    fake.register(
+        "formalize",
+        prompt_for(steps[0], Vocabulary()),
+        json.dumps({"declarations": "(declare-fun > (Real Real) Bool)", "assertion": "true"}),
+    )
+    fake.register(
+        "formalize",
+        prompt_for(steps[1], Vocabulary()),
+        json.dumps({"declarations": "(declare-const y Bool)", "assertion": "y"}),
+    )
+
+    result = await Verifier(fake).verify(ReasoningTrace(agent="t", steps=steps))
+
+    first, second = result.step_verdicts
+    assert (first.verdict, first.reason) == ("UNGROUNDED", "formalization_failed")
+    assert "reserved symbol '>'" in first.details
+    assert second.verdict == "VALID"
+
+
+def test_parse_context_is_per_thread_and_never_the_global_one() -> None:
+    # AUDIT-6 #1: Z3's main context is not thread-safe.
+    with ThreadPoolExecutor(1) as pool:
+        other = pool.submit(_parse_context).result()
+        assert pool.submit(_parse_context).result() is other
+    here = _parse_context()
+    assert here is _parse_context()
+    assert here is not other
+    assert z3.main_ctx() not in (here, other)
