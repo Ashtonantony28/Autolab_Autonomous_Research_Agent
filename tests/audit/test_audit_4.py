@@ -28,7 +28,7 @@ from autolab.state.schema import AutoLabState, empty_state
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, Z3Solver
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_trace, register_trivial_trace
+from tests.fixtures.agent_helpers import content, register_trace, register_trivial_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator.test_graph import (
     FAILING_SUMMARY,
@@ -106,7 +106,7 @@ async def test_agent_score_equal_to_threshold_passes() -> None:
 
     assert update["confidence"] == 1.0
     assert update["hitl_pending"] is None
-    assert update["hypotheses"] == [HYPOTHESIS]
+    assert content(*update["hypotheses"]) == content(HYPOTHESIS)
 
 
 async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
@@ -150,7 +150,7 @@ async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
     assert verdict.consistency_score == PASS_THRESHOLD
     assert VerificationMonitor().decide(verdict) is AgentDecision.PASS
     assert update["hitl_pending"] is None
-    assert update["hypotheses"] == [HYPOTHESIS]
+    assert content(*update["hypotheses"]) == content(HYPOTHESIS)
 
 
 # --------------------------------------------------------------------------

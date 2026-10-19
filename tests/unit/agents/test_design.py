@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
-
 import pytest
 
 from autolab.agents.design import (
@@ -15,7 +13,7 @@ from autolab.state.models import ExperimentDesign, Hypothesis
 from autolab.state.schema import empty_state
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_trivial_trace
+from tests.fixtures.agent_helpers import content, register_trivial_trace
 
 HYPOTHESIS = Hypothesis(question="Q?", statement="S", rationale="R")
 DESIGN = ExperimentDesign(
@@ -43,7 +41,9 @@ async def test_design_agent_emits_experiment_design() -> None:
     agent = DesignAgent(verifier=Verifier(fake), llm=fake)
     update = await agent(state)
 
-    assert update["current_experiment"] == DESIGN
+    design = update["current_experiment"]
+    assert content(design) == content(DESIGN)
+    assert design.hypothesis_id == HYPOTHESIS.id and design.id != DESIGN.id
     assert update["hitl_pending"] is None
 
 
@@ -81,9 +81,8 @@ async def test_design_agent_uses_latest_hypothesis() -> None:
     state["hypotheses"] = [older, newer]
     agent = DesignAgent(verifier=Verifier(fake), llm=fake)
     update = await agent(state)
-    assert update["current_experiment"] == design_for_newer
+    assert content(update["current_experiment"]) == content(design_for_newer)
     assert update["current_experiment"].hypothesis_id == newer.id
-    assert newer.id != uuid4()  # silly sanity
 
 
 async def test_design_agent_rejects_trace_concluding_the_hypothesis_not_the_protocol() -> None:
@@ -108,16 +107,29 @@ async def test_design_agent_rejects_trace_concluding_the_hypothesis_not_the_prot
     assert "current_experiment" not in update
 
 
-async def test_design_agent_rejects_design_for_a_different_hypothesis() -> None:
+async def test_design_agent_ignores_a_model_supplied_id_and_hypothesis_id() -> None:
     other = Hypothesis(question="Q?", statement="other", rationale="r")
     stray = DESIGN.model_copy(update={"hypothesis_id": other.id})
     fake = FakeLLMClient()
     fake.register("design.experiment", build_design_prompt(HYPOTHESIS), stray.model_dump_json())
+    register_trivial_trace(
+        fake,
+        agent="design",
+        trace_purpose="design.trace",
+        trace_prompt=build_design_trace_prompt(HYPOTHESIS, stray),
+        conclusion=stray.protocol,
+    )
     state = empty_state("Q?")
     state["hypotheses"] = [other, HYPOTHESIS]
 
-    with pytest.raises(ValueError, match=f"hypothesis_id={other.id}.*{HYPOTHESIS.id}"):
-        await DesignAgent(verifier=Verifier(fake), llm=fake)(state)
+    design = (await DesignAgent(verifier=Verifier(fake), llm=fake)(state))["current_experiment"]
+
+    assert design.hypothesis_id == HYPOTHESIS.id
+    assert design.id != stray.id
+
+
+def test_design_prompt_carries_no_ids() -> None:
+    assert str(HYPOTHESIS.id) not in build_design_prompt(HYPOTHESIS)
 
 
 def test_design_trace_prompt_names_the_required_conclusion() -> None:

@@ -24,7 +24,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | done (PR pending) |
 | SG7 | Soundness round 2 (AUDIT-1 #1–#4, AUDIT-3 #1) | audit round 1 | `verification/*` (except solver executor), `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/*` | done (PR pending) |
 | SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | done (PR pending) |
-| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | todo |
+| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | done (PR pending) |
 | SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
@@ -173,6 +173,26 @@ Round 1 found 1 critical and 9 high findings (AUDIT-1..4 at the repo root; repro
   - `id` and `created_at` are assigned in code, not by the model (AUDIT-3 #3).
   - Store keys include `run_id`.
   - Upserts are race-free (AUDIT-2 store findings).
+
+  **Result (2026-10-19):** Files changed: `agents/common.py`, `research.py`, `design.py`, `analysis.py`, `state/store.py`, `monitoring/tracer.py` (docstring only), and `verification/llm.py` (reply-schema registry and two system-prompt sentences only). Also changed: the tests, and the Resolution lines in AUDIT-2.md (#2, #3) and AUDIT-3.md (#3). `models.py`, `config.py` and `schema.py` are untouched.
+
+  Tests: 23 new or rewritten test functions. They include the new `tests/unit/agents/test_identity.py`, 9 store tests (15 cases), 30 concurrent traced graph runs on one store, and agent tests where a model-supplied id is ignored. Expected-value checks that relied on fixture ids now compare content through `agent_helpers.content`. Flipped: AUDIT-3 #3 (4 tests: the schema repro ×3 and the cross-run repro) and AUDIT-2 #2 ×2 and #3.
+
+  Verify: lint and mypy clean. Full suite: 600 passed, 13 skipped, 6 xfailed. `tests/audit`: 38 passed, 6 xfailed. Resume, monitoring and store tests: 44 passed, 1 skipped. The benchmark is unchanged: each scenario pauses once on its policy trigger.
+
+  As built:
+  - `content_schema(model, server_owned)` derives `HYPOTHESIS_REPLY`, `DESIGN_REPLY` and `REPORT_REPLY` with `create_model`, ignoring extra keys. Agents call `call_structured` with them and build the domain model in code: a fresh `id`/`created_at`, `question` from state, and `hypothesis_id`/`result_id` from the targeted state entity.
+  - Prompts carry no ids, so fixture prompts are id-independent. `llm.reply_schema` serves only `.trace` purposes.
+  - SG3's id-mismatch checks are removed, because they could no longer fire.
+  - The simulator seed follows the code-assigned `design.id`.
+  - The store's entity primary key is `(run_id, id)`. All writes go through `upsert_statement(dialect, row, values)`, a single `INSERT ... ON CONFLICT` for `sqlite` or `postgresql`: `DO UPDATE` for entities and `DO NOTHING` for runs. Any other dialect raises `ValueError`.
+  - The schema is still created by `create_all`, since no Alembic migration history exists.
+
+  Open:
+  - An existing database file keeps the old single-column key until it is recreated, because there is no migration.
+  - Postgres is verified only by compiling the SQL.
+  - `Hypothesis.confidence` is still self-reported by the model and shown on the dashboard.
+  - The AUDIT-3 #3 schema repro is now parametrized over the reply schemas, since `models.py` is an SG0 interface. Its assertions are unchanged.
 - **SG10 Bounded solver executor.**
   - Z3 runs on a dedicated bounded executor, so it never starves `asyncio`'s default pool (AUDIT-2 #1).
   - `solver_ms` is measured inside the worker, so queueing time is excluded.

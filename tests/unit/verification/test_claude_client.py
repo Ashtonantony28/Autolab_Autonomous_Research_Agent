@@ -12,12 +12,10 @@ from anthropic.lib._parse._transform import transform_schema
 from anthropic.types import TextBlock
 from pydantic import BaseModel
 
-from autolab.agents.common import parse_trace
+from autolab.agents.common import DESIGN_REPLY, HYPOTHESIS_REPLY, REPORT_REPLY, parse_trace
 from autolab.state.models import (
     AnalysisReport,
-    ExperimentDesign,
     FormalizedStep,
-    Hypothesis,
     Interpretation,
     ReasoningStep,
 )
@@ -89,23 +87,13 @@ async def test_plain_call_uses_create_with_system_prompt() -> None:
     assert kwargs["messages"] == [{"role": "user", "content": "p"}]
 
 
-def test_reply_schemas_cover_the_agent_json_purposes() -> None:
-    assert reply_schema("research.hypothesis") is Hypothesis
-    assert reply_schema("design.experiment") is ExperimentDesign
-    assert reply_schema("analysis.report") is AnalysisReport
+def test_reply_schemas_cover_only_the_trace_purposes() -> None:
+    # Agent payloads go through `call_structured` with content-only schemas.
+    for purpose in ("research.hypothesis", "design.experiment", "analysis.report"):
+        assert reply_schema(purpose) is None
     traces = {reply_schema(f"{a}.trace") for a in ("research", "design", "execute", "analysis")}
     assert len(traces) == 1 and None not in traces
     assert reply_schema("formalize") is None and reply_schema("commonsense") is None
-
-
-async def test_json_purpose_call_goes_through_structured_output() -> None:
-    hypothesis = Hypothesis(question="q", statement="s", rationale="r")
-    messages = _StubMessages(hypothesis)
-    raw = await _client(messages).call("research.hypothesis", "p")
-    assert Hypothesis.model_validate_json(raw) == hypothesis
-    ((kind, kwargs),) = messages.calls
-    assert kind == "parse" and kwargs["output_format"] is Hypothesis
-    assert kwargs["system"] == SYSTEM_PROMPTS["research"]
 
 
 async def test_trace_purpose_reply_parses_as_an_agent_trace() -> None:
@@ -122,9 +110,9 @@ async def test_trace_purpose_reply_parses_as_an_agent_trace() -> None:
     [
         FormalizedStep,
         FaithfulnessVerdict,
-        Hypothesis,
-        ExperimentDesign,
-        AnalysisReport,
+        HYPOTHESIS_REPLY,
+        DESIGN_REPLY,
+        REPORT_REPLY,
         reply_schema("x.trace"),
     ],
 )
@@ -150,7 +138,7 @@ async def test_one_async_anthropic_client_is_reused(monkeypatch: pytest.MonkeyPa
     client = ClaudeLLMClient("key")
     assert is_live(client)
     await client.call("commonsense", "a")
-    await client.call("analysis.report", "b")
+    await client.call("analysis.trace", "b")
     await client.call_structured("formalize", "c", AnalysisReport)
     assert built == [("key", 0)]  # one client, and the SDK never retries
     assert [kind for kind, _ in messages.calls] == ["create", "parse", "parse"]

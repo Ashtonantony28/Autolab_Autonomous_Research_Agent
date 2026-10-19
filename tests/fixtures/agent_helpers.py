@@ -15,11 +15,22 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Any, Final
+
+from pydantic import BaseModel
 
 from autolab.state.models import FormalizedStep, ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import Vocabulary, prompt_for
 from autolab.verification.llm import FakeLLMClient
 from tests.fixtures.golden_traces import GoldenStep
+
+CODE_OWNED: Final = frozenset({"id", "created_at", "hypothesis_id", "result_id"})
+"""Fields agents assign in code, never from the model's reply."""
+
+
+def content(*models: BaseModel) -> list[dict[str, Any]]:
+    """Each model without its `CODE_OWNED` fields, for comparing agent output to a fixture."""
+    return [m.model_dump(exclude=set(CODE_OWNED)) for m in models]
 
 
 def _sym(agent: str, letter: str) -> str:

@@ -20,7 +20,7 @@ from autolab.state.models import HITLResolution
 from autolab.state.schema import empty_state
 from autolab.state.store import StateStore
 from autolab.verification.llm import FakeLLMClient
-from tests.fixtures.agent_helpers import register_trivial_trace
+from tests.fixtures.agent_helpers import content, register_trivial_trace
 from tests.integration.orchestrator.test_graph import (
     DESIGN,
     EXPENSIVE,
@@ -85,7 +85,9 @@ async def pause_at_design(db: Path, store_url: str | None = None) -> str:
     thread_id = str(uuid4())
     paused = await run_in_fresh_process(db, fake, empty_state(QUESTION), thread_id, store_url)
     assert paused["hitl_pending"].agent == "design"
-    assert paused["hitl_payload"] == {"current_experiment": EXPENSIVE}
+    withheld = paused["hitl_payload"]["current_experiment"]
+    assert content(withheld) == content(EXPENSIVE)
+    assert withheld.hypothesis_id == paused["hypotheses"][0].id
     return thread_id
 
 
@@ -109,9 +111,9 @@ async def test_approve_after_restart_resumes_to_the_end(
     )
 
     assert "__interrupt__" not in final
-    assert final["hypotheses"] == [HYPOTHESIS]
+    assert content(*final["hypotheses"]) == content(HYPOTHESIS)
     assert final["results"] == [RESULT]
-    assert final["analysis_reports"] == [REPORT]
+    assert content(*final["analysis_reports"]) == content(REPORT)
     assert final["hitl_pending"] is None
     assert agents(final) == ["research", "design", "execute", "analysis"]
 
@@ -128,7 +130,7 @@ async def test_retry_after_restart_reruns_the_paused_agent(tmp_path: Path) -> No
         db, fake, Command(resume={"action": "retry", "note": note}), thread_id
     )
 
-    assert final["analysis_reports"] == [REPORT]
+    assert content(*final["analysis_reports"]) == content(REPORT)
     assert agents(final) == ["research", "design", "design", "execute", "analysis"]
 
 
@@ -152,7 +154,7 @@ async def test_threads_are_isolated_in_one_checkpoint_file(tmp_path: Path) -> No
     _seed_full_run(fake)
     other = await run_in_fresh_process(db, fake, empty_state(QUESTION), str(uuid4()))
 
-    assert other["analysis_reports"] == [REPORT]
+    assert content(*other["analysis_reports"]) == content(REPORT)
     async with sqlite_saver(db) as saver:
         graph = build_graph(llm=FakeLLMClient(), checkpointer=saver)
         snapshot = await graph.aget_state({"configurable": {"thread_id": paused}})
@@ -166,7 +168,7 @@ async def test_traces_across_restart_are_persisted_once(tmp_path: Path) -> None:
 
     fake = FakeLLMClient()
     seed_downstream(fake)
-    await run_in_fresh_process(
+    final = await run_in_fresh_process(
         db, fake, Command(resume={"action": "approve"}), thread_id, store_url
     )
 
@@ -183,9 +185,10 @@ async def test_traces_across_restart_are_persisted_once(tmp_path: Path) -> None:
             ("analysis", "pass"),
         ]
         assert [t.agent for t in traces] == ["research", "design", "execute", "analysis"]
-        assert await store.load_hypotheses(run_id) == [HYPOTHESIS]
+        # The resumed tracer re-records the checkpointed hypothesis; it is stored once.
+        assert await store.load_hypotheses(run_id) == final["hypotheses"]
         assert len(await store.load_verifications(run_id)) == 4
-        assert await store.load_reports(run_id) == [REPORT]
+        assert await store.load_reports(run_id) == final["analysis_reports"]
     finally:
         await store.dispose()
 

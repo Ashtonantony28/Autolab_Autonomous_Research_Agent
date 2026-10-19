@@ -29,6 +29,7 @@ from autolab.state.schema import AutoLabState, empty_state
 from autolab.tools.lab_hardware.simulator import LabSimulator
 from autolab.verification.llm import FakeLLMClient, LLMPurpose
 from tests.fixtures.agent_helpers import (
+    content,
     register_failing_trace,
     register_trace,
     register_trivial_trace,
@@ -172,7 +173,8 @@ def _agents(state: dict[str, Any]) -> list[str]:
 def _assert_completed(state: dict[str, Any]) -> None:
     assert "__interrupt__" not in state
     assert state["results"] == [RESULT]
-    assert state["analysis_reports"] == [REPORT]
+    assert content(*state["analysis_reports"]) == content(REPORT)
+    assert state["analysis_reports"][0].result_id == RESULT.id
     assert state["hitl_pending"] is None
     assert state["hitl_payload"] is None
     assert state["current_agent"] == "analysis"
@@ -186,7 +188,7 @@ async def test_full_run_reaches_end_with_all_agents_passing() -> None:
     final = await graph.ainvoke(empty_state(QUESTION), config=config)
 
     _assert_completed(final)
-    assert final["hypotheses"] == [HYPOTHESIS]
+    assert content(*final["hypotheses"]) == content(HYPOTHESIS)
     assert _agents(final) == ["research", "design", "execute", "analysis"]
     assert all(v.consistency_score >= 0.7 for v in final["verification_history"])
     assert final["retry_count"] == 0
@@ -243,7 +245,7 @@ async def test_unbound_conclusion_is_retried_not_escalated() -> None:
     _assert_completed(final)
     assert final["verification_history"][0].consistency_score == 0.0
     assert _agents(final)[:2] == ["research", "research"]
-    assert final["hypotheses"] == [HYPOTHESIS]
+    assert content(*final["hypotheses"]) == content(HYPOTHESIS)
 
 
 async def test_retries_exhausted_escalates_then_approve_merges_withheld_payload() -> None:
@@ -258,7 +260,9 @@ async def test_retries_exhausted_escalates_then_approve_merges_withheld_payload(
     assert _agents(paused) == ["research", "design", "design", "design"]  # 1 + max_retries
     assert paused["retry_count"] == 2
     assert paused["current_experiment"] is None
-    assert paused["hitl_payload"] == {"current_experiment": DESIGN}
+    withheld = paused["hitl_payload"]["current_experiment"]
+    assert content(withheld) == content(DESIGN)
+    assert withheld.hypothesis_id == paused["hypotheses"][0].id
     pause = _interrupt(paused)
     assert pause["agent"] == "design"
     assert pause["payload"]["trigger"] == "verification"
@@ -366,7 +370,7 @@ async def test_contradicting_hypothesis_pauses() -> None:
     assert pause["agent"] == "research"
     assert pause["reason"] == "hypothesis contradicts 1 prior hypothesis(es) in state"
     assert paused["hypotheses"] == [prior]
-    assert paused["hitl_payload"] == {"hypotheses": [HYPOTHESIS]}
+    assert content(*paused["hitl_payload"]["hypotheses"]) == content(HYPOTHESIS)
 
 
 async def test_consistent_hypothesis_does_not_pause() -> None:
@@ -379,7 +383,8 @@ async def test_consistent_hypothesis_does_not_pause() -> None:
     final = await graph.ainvoke(_with_prior(prior), config=config)
 
     _assert_completed(final)
-    assert final["hypotheses"] == [prior, HYPOTHESIS]
+    assert final["hypotheses"][0] == prior
+    assert content(*final["hypotheses"]) == content(prior, HYPOTHESIS)
 
 
 async def test_malformed_llm_response_escalates_instead_of_crashing() -> None:
@@ -400,18 +405,20 @@ async def test_malformed_llm_response_escalates_instead_of_crashing() -> None:
     assert final["hitl_pending"] is None
 
 
-async def test_design_hypothesis_id_mismatch_escalates() -> None:
+async def test_model_supplied_ids_are_replaced_in_code() -> None:
     fake = FakeLLMClient()
     _seed_full_run(fake)
     stray = DESIGN.model_copy(update={"hypothesis_id": uuid4()})
     fake.register("design.experiment", build_design_prompt(HYPOTHESIS), stray.model_dump_json())
     graph, config = _graph(fake)
 
-    paused = await graph.ainvoke(empty_state(QUESTION), config=config)
+    final = await graph.ainvoke(empty_state(QUESTION), config=config)
 
-    pause = _interrupt(paused)
-    assert pause["agent"] == "design"
-    assert pause["reason"].startswith("ValueError: ExperimentDesign.hypothesis_id=")
+    _assert_completed(final)
+    (hypothesis,) = final["hypotheses"]
+    assert hypothesis.id != HYPOTHESIS.id and hypothesis.created_at > HYPOTHESIS.created_at
+    (report,) = final["analysis_reports"]
+    assert report.id != REPORT.id and report.result_id == RESULT.id
 
 
 async def test_transient_error_is_retried() -> None:
@@ -443,5 +450,5 @@ async def test_compiled_graph_is_reusable_across_threads() -> None:
     f1 = await graph.ainvoke(empty_state(QUESTION), config=cfg1)
     f2 = await graph.ainvoke(empty_state(QUESTION), config=cfg2)
 
-    assert f1["hypotheses"] == [HYPOTHESIS]
-    assert f2["hypotheses"] == [HYPOTHESIS]
+    assert content(*f1["hypotheses"], *f2["hypotheses"]) == content(HYPOTHESIS, HYPOTHESIS)
+    assert f1["hypotheses"][0].id != f2["hypotheses"][0].id
