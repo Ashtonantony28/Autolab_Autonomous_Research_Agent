@@ -10,6 +10,7 @@ from autolab.agents.common import (
     measurement_facts,
     parse_trace,
     result_claim,
+    with_feedback,
 )
 from autolab.state.models import (
     AnalysisReport,
@@ -36,7 +37,10 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
         if not results:
             raise ValueError("AnalysisAgent invoked without any results in state")
         latest = results[-1]
-        raw = await self._llm.call("analysis.report", build_analysis_prompt(latest))
+        feedback = state.get("feedback", "")
+        raw = await self._llm.call(
+            "analysis.report", with_feedback(build_analysis_prompt(latest), feedback)
+        )
         payload = AnalysisReport.model_validate_json(raw)
         if payload.result_id != latest.id:
             raise ValueError(
@@ -45,7 +49,8 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
             )
 
         trace_raw = await self._llm.call(
-            "analysis.trace", build_analysis_trace_prompt(latest, payload)
+            "analysis.trace",
+            with_feedback(build_analysis_trace_prompt(latest, payload), feedback),
         )
         trace = parse_trace(self.name, trace_raw)
         context = VerificationContext(
@@ -54,7 +59,7 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     def _merge_payload(self, payload: AnalysisReport) -> dict[str, Any]:
-        return {}  # AnalysisReport is informational; not appended to state in Phase 3.
+        return {"analysis_reports": [payload]}
 
 
 def build_analysis_prompt(result: ExperimentResult) -> str:

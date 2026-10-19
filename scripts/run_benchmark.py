@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import TypedDict
 from uuid import uuid4
 
+from langgraph.types import Command
+
 from autolab.agents.analysis import build_analysis_prompt, build_analysis_trace_prompt
 from autolab.agents.common import measurement_facts, result_claim
 from autolab.agents.design import build_design_prompt, build_design_trace_prompt
@@ -25,6 +27,7 @@ from autolab.state.models import (
     ExperimentDesign,
     ExperimentParameter,
     ExperimentResult,
+    HITLResolution,
     Hypothesis,
     Interpretation,
     Measurement,
@@ -178,14 +181,20 @@ class ScenarioRow(TypedDict):
     results: int
     traces: int
     verifications: int
+    hitl: list[str]
 
 
 async def run_one(scenario: Scenario) -> ScenarioRow:
+    """Run one scenario, approving every HITL pause (recorded in `hitl`)."""
     fake = FakeLLMClient()
     result = _seed(fake, scenario)
     graph = build_graph(llm=fake, simulator=FixedResultSimulator(result))
     config = {"configurable": {"thread_id": str(uuid4())}}
     final = await graph.ainvoke(empty_state(scenario.question), config=config)
+    pauses: list[str] = []
+    while "__interrupt__" in final:
+        pauses.append(final["hitl_pending"].reason)
+        final = await graph.ainvoke(Command(resume=HITLResolution(action="approve")), config=config)
     return ScenarioRow(
         scenario=scenario.id,
         confidence=final["confidence"],
@@ -193,6 +202,7 @@ async def run_one(scenario: Scenario) -> ScenarioRow:
         results=len(final["results"]),
         traces=len(final["reasoning_traces"]),
         verifications=len(final["verification_history"]),
+        hitl=pauses,
     )
 
 

@@ -31,6 +31,11 @@ def conclusion_instruction(claim: str) -> str:
     return f"The final step must be a conclusion whose claim is exactly: {claim}"
 
 
+def with_feedback(prompt: str, feedback: str) -> str:
+    """Append feedback on a previous attempt (verifier summary or human note), if any."""
+    return f"{prompt}\n\nfeedback_on_previous_attempt: {feedback}" if feedback else prompt
+
+
 def result_claim(result: ExperimentResult) -> str:
     """The claim an Execute trace must conclude: the status and measured values."""
     readings = ", ".join(f"{m.name} = {_decimal(m.value)}" for m in result.measurements)
@@ -71,4 +76,10 @@ def _real(value: float) -> str:
     return f"(- {text[1:]})" if text.startswith("-") else text
 
 
-__all__ = ["conclusion_instruction", "measurement_facts", "parse_trace", "result_claim"]
+__all__ = [
+    "conclusion_instruction",
+    "measurement_facts",
+    "parse_trace",
+    "result_claim",
+    "with_feedback",
+]

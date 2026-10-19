@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from autolab.config import RETRY_THRESHOLD
+from autolab.config import PASS_THRESHOLD
 from autolab.state.models import (
     ClaimType,
     FormalizedStep,
@@ -78,7 +78,7 @@ async def test_invalid_inference_is_caught() -> None:
 
     assert result.step_verdicts[0].verdict == "VALID"  # premise
     assert result.step_verdicts[1].verdict == "INVALID"
-    assert result.consistency_score < RETRY_THRESHOLD
+    assert result.consistency_score < PASS_THRESHOLD
 
 
 async def test_malformed_formalization_yields_ungrounded() -> None:
@@ -198,4 +198,4 @@ async def test_diluted_invalid_trace_cannot_pass() -> None:
     )
     result = await Verifier(fake).verify(trace)
     assert [sv.verdict for sv in result.step_verdicts].count("INVALID") == 1
-    assert result.consistency_score < RETRY_THRESHOLD
+    assert result.consistency_score < PASS_THRESHOLD
