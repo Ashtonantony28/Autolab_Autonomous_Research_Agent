@@ -207,7 +207,7 @@ AUDIT-4 H1 (offline tests never exercise NL→SMT) is closed by SG5's live accur
 
 ### Audit round 2 → SG11–SG14
 
-Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 2 high findings. Repros are strict xfails in `tests/audit/test_audit_{5..8}.py`. Each sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG11 and SG12 run in parallel (no shared files); SG13 and SG14 follow.
+Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high findings. Repros are strict xfails in `tests/audit/test_audit_{5..8}.py`. Each sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG11 and SG12 run in parallel (no shared files); SG13 and SG14 follow.
 
 - **SG11 Formalizer symbol safety.**
   - A declaration may not name an SMT-LIB builtin or reserved word (`>`, `<`, `=`, `not`, `and`, `or`, `=>`, `ite`, `+`, `-`, `*`, `true`, `false`, …). That gives a formalization failure (AUDIT-5 #1, critical).
@@ -246,7 +246,7 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 
 ## Log
 
-- 2026-10-19: audit round 2 done (2 critical, 2 high); SG11–SG14 added.
+- 2026-10-19: audit round 2 done (2 critical, 3 high); SG11–SG14 added.
 - 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
 - 2026-10-19: plan approved by Ashton; SG0 built.
 - 2026-10-19: plan drafted. Baseline numbers (140 tests, coverage by module) are quoted from `docs/status.md` and have not yet been re-run in this environment.
