@@ -29,7 +29,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | done (PR pending) |
 | SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (PR pending) |
 | SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | todo |
-| SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | todo |
+| SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | done (PR pending) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -249,6 +249,17 @@ Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high f
   - Wall-clock tests carry a `perf` marker. Each guarantee that only a timing test covers (cancel, shutdown, queueing excluded from `solver_ms`, the injected executor being used) also gets a deterministic test, using events or counters instead of sleeps.
   - `test_audit_2.py::test_slow_checks_do_not_starve_the_default_executor` stops flaking under full-suite load, and its assertion still kills mutant S07.
   - **Verify:** `make test` passes 3 times in a row while a second `make test` runs at the same time · `uv run pytest -m "not perf" -q`.
+
+  **Result (2026-10-19):** Files changed: `pyproject.toml`, `uv.lock`, `tests/unit/verification/test_solver_executor.py`, `tests/unit/verification/test_latency.py`, `tests/audit/test_audit_2.py`, and one marker in `tests/audit/test_audit_6.py`. No production code changed; the `Makefile` is unchanged. Tests added: 6 deterministic tests in `test_solver_executor.py`, plus 2 existing executor tests moved from sleep ordering to events. 22 tests carry `perf` (7 in `test_solver_executor.py`, 7 in `test_audit_2.py`, 7 in `test_latency.py`, 1 xfail in `test_audit_6.py`) and stay in `make test`. Verify: lint and mypy clean; full suite 749 passed, 13 skipped, 19 xfailed; `-m "not perf"` 728 passed, 22 deselected. Load test: 3 consecutive `make test` runs, each next to a concurrent `uv run pytest -q -p no:cacheprovider`, were all green, and so were the 5 concurrent runs (749 passed each). A first attempt failed once: under contention a 0.2 s premise check in `test_default_pool_stays_responsive_under_fifty_slow_checks` timed out, so the conclusion became `no_premises`. Mutants were re-applied by hand in a scratch copy, and each was killed by the named test:
+  - S07 (`vericot._check` runs on `loop.run_in_executor(None, ...)`, or `SolverExecutor.run` submits to the default executor): `test_slow_checks_do_not_starve_the_default_executor` fails with `assert 1 == 0`.
+  - S01 (`asyncio.Semaphore(10**6)`): `test_callers_beyond_the_worker_count_wait_outside_the_pool` (6 == 2) and `test_audit_8`'s submit spy.
+  - S02 (no `interrupt.request()` on cancel) and S09 (worker never sets `_worker.interrupt`): `test_cancelling_a_caller_interrupts_its_z3_context`.
+  - S04 (`shutdown` skips the interrupts): `test_shutdown_interrupts_the_running_z3_context`.
+  - S05 (`run` timed on the caller): `test_run_time_excludes_waiting_for_a_worker` (1e6 == 0), plus the relative bounds in `test_timeout_bounds_each_check_under_concurrency` and `test_default_pool_stays_responsive_under_fifty_slow_checks`.
+  - V09 (`Verifier` ignores `solver_executor`): `test_verifier_runs_every_check_on_the_injected_executor`.
+  - Judges awaited inline: `test_judge_runs_while_the_next_step_is_formalized` and `test_ten_step_trace_overlaps_its_llm_calls` (3.06 s vs. 0.8 × 3.07 s).
+
+  As built: `pytest-timeout` defaults to 60 s per test. The deterministic tests use a `z3.Solver.check`/`z3.Context.interrupt` spy, threading gates, a fake clock patched into `solver_mod.time`, and `CountingExecutor`; `_WAIT_S` (10 s) bounds only a failing wait. The starvation test counts the slow checks finished when a default-executor probe runs: it must be 0, with every one of the `default_executor_workers()` slow checks (2 s timeout) running. Before, the probe had to return within 0.25 s. The ten-step test compares against a serial baseline run in the same test (`wall < 0.8 × serial`; about 0.6 when idle). Worst `solver_ms` must be under 0.6 or 0.5 of the wall time, with a looser absolute bound kept. Open: the perf tests are not split into a separate retried CI job. The starvation test assumes `SOLVER_WORKERS` equals asyncio's default pool size. The ten-step test now takes about 5 s. The remaining absolute bounds (`test_latency.py`, `test_cancelled_verify_releases_its_worker_thread`, `test_both_checks_share_one_deadline`) are unchanged and passed under load.
 
 Medium and low round-2 findings stay in the AUDIT files for a later pass. After SG11–SG14, audit round 3 re-runs all four audits with fresh agents. SG5 live acceptance still waits on an `ANTHROPIC_API_KEY`.
 
