@@ -20,6 +20,12 @@ never blocks the event loop and concurrent `verify` calls overlap.
 A formalization failure on a step yields an UNGROUNDED verdict — the
 trace remains verifiable as a whole even if one step's LLM output was
 malformed.
+
+Payload binding: when `context.payload_claim` is set, the trace's last step
+must be a `conclusion` whose claim equals it after whitespace and case
+normalization. Otherwise nothing is formalized; every step is UNGROUNDED
+with reason `no_premises` and the score is 0.0, so the trace cannot pass at
+any threshold.
 """
 
 from __future__ import annotations
@@ -65,6 +71,10 @@ class Verifier:
         `context.facts` are added to every step's premises and their
         declarations seed the formalizer's vocabulary.
         """
+        if context and context.payload_claim is not None:
+            unbound = _unbound_result(trace, context.payload_claim)
+            if unbound is not None:
+                return unbound
         formalizer = Formalizer(self._llm)
         facts = context.facts if context else ()
         for fact in facts:
@@ -139,6 +149,32 @@ class Verifier:
             ),
             formula,
         )
+
+
+def _normalize(claim: str) -> str:
+    return " ".join(claim.split()).casefold()
+
+
+def _unbound_result(trace: ReasoningTrace, payload_claim: str) -> VerificationResult | None:
+    """Return a failing result if `trace` does not conclude `payload_claim`, else None."""
+    last = trace.steps[-1] if trace.steps else None
+    if (
+        last is not None
+        and last.claim_type == "conclusion"
+        and _normalize(last.claim) == _normalize(payload_claim)
+    ):
+        return None
+    details = f"trace does not conclude payload claim {payload_claim!r}"
+    verdicts = tuple(
+        StepVerdict(step_index=s.index, verdict="UNGROUNDED", reason="no_premises", details=details)
+        for s in trace.steps
+    )
+    return VerificationResult(
+        trace_id=trace.id,
+        step_verdicts=verdicts,
+        consistency_score=0.0,
+        summary=f"{details}; {summarize(verdicts)}",
+    )
 
 
 __all__ = ["Verifier"]
