@@ -67,6 +67,8 @@ Also validate in `Settings` that `retry_threshold <= pass_threshold`.
 - Have `escalate_permanent_errors` also catch `anthropic.APIStatusError` that is not in `TRANSIENT_ERRORS`.
 - Check `response.stop_reason` (`refusal`, `max_tokens`) before reading `parsed_output`, so the HITL reason says why the call failed.
 
+**Resolution (SG8):** `ClaudeLLMClient` raises `StructuredOutputError(RuntimeError)` naming the `stop_reason`. `escalate_permanent_errors` turns `ValueError`, `RuntimeError` and every non-transient `anthropic.APIError` into an `error` HITL request whose payload carries the error type and HTTP status, so the graph pauses instead of crashing (`test_llm_refusal_pauses_at_hitl_instead_of_crashing_the_graph` flipped). Open for SG7: the formalizer still lets the refusal escape as `RuntimeError` rather than `FormalizationError`, contrary to its docstring, so `test_formalizer_turns_a_refusal_into_formalization_error` stays xfail. Exhausted transient errors still propagate.
+
 ## 3. High: the model writes entity ids and timestamps, and the store upserts by id across runs
 
 **Impact.** `messages.parse(output_format=Hypothesis)` sends the full Pydantic schema. It offers the model `id` (format `uuid`), `created_at` (format `date-time`), `confidence` and `question`, and the same holds for `ExperimentDesign.id` and `AnalysisReport.id`/`created_at`. Because those fields have `default_factory`, they are optional, so the model may fill them, and anything it fills is kept. This was verified with the SDK's own `transform_schema` (`anthropic/lib/_parse/_transform.py`). The consequences:
@@ -98,6 +100,8 @@ Also validate in `Settings` that `retry_threshold <= pass_threshold`.
 **Root cause.** `src/autolab/orchestrator/recovery.py:17-24`.
 
 **Fix.** Classify by status code instead: retry `APIStatusError` when `status_code in {408, 409, 429}` or `status_code >= 500`. Or import `anthropic._exceptions.OverloadedError` explicitly, with a comment, since it is not public.
+
+**Resolution (SG8):** `recovery.is_transient` classifies `APIStatusError` by status as the SDK's `_should_retry` does (408, 409, 429, any 5xx including 529, with `x-should-retry` overriding), plus connection and timeout errors.
 
 ## 5. Medium: the `anthropic>=0.40` floor allows an SDK without `messages.parse(output_format=)`
 
@@ -167,6 +171,8 @@ Each item gives the doc location first, then the code it contradicts.
 
 **Fix.** Add `live: bool` to the `LLMClient` protocol, with `FakeLLMClient.live = False`, so that mypy forces wrappers to declare it. Or default to `True` and turn the check off explicitly in tests.
 
+**Resolution (SG8):** `is_live` now follows a wrapper contract instead of changing the `LLMClient` protocol: a decorator either declares `live` itself or keeps its client in `_inner`, which `is_live` unwraps. `RetryingLLMClient` no longer forwards `live` by hand. A wrapper that does neither still fails open.
+
 ## 10. Low: schema constraints are not enforced at decode time
 
 **Impact.**
@@ -183,9 +189,13 @@ Each item gives the doc location first, then the code it contradicts.
 
 `AsyncAnthropic` is built with the SDK default `max_retries=2` (`llm.py:187`). It is wrapped by `RetryingLLMClient(max_attempts=3)` (`recovery.py:27`, `graph.py:76`), so one logical call can make up to 9 HTTP attempts, each with the SDK's non-streaming timeout. Pick one layer: either `AsyncAnthropic(max_retries=0)`, or drop the API errors from `TRANSIENT_ERRORS`.
 
+**Resolution (SG8):** `ClaudeLLMClient` builds `AsyncAnthropic(max_retries=0)`, so `RetryingLLMClient` is the only retry layer: one HTTP request per attempt, with full jitter and `retry-after` honoured (see AUDIT-2 #4).
+
 ## 12. Low: the model id is hard-coded and does not match the brief
 
 `ClaudeLLMClient(model="claude-sonnet-4-6")` (`llm.py:172`) is built with defaults by the CLI (`cli.py:81`), and no `Settings` field can change the model. The id is valid in SDK 0.102 (`types/model_param.py`), supports structured outputs (checked against the live structured-outputs docs), and is not in `DEPRECATED_MODELS`. CLAUDE.md §3 (`CLAUDE.md:55`) names "Claude Opus 4.7 for orchestrator", but the orchestrator makes no LLM calls, so the brief and the build disagree. Add `Settings.agent_model` and amend CLAUDE.md §3 or an ADR.
+
+**Resolution (SG8, partial):** the id is now the single module constant `llm.DEFAULT_MODEL`. Still open: a `Settings` field (an SG0 interface change) and the CLAUDE.md "Opus for orchestrator" mismatch.
 
 ## 13. Low: small inconsistencies
 

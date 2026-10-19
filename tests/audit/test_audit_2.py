@@ -125,7 +125,6 @@ async def test_same_entity_id_in_two_runs_stays_in_both(tmp_path: Path) -> None:
 # --- #4 (medium): retry layers compound, have no jitter, ignore retry-after ---
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #4")
 async def test_one_logical_call_makes_at_most_three_http_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,7 +157,6 @@ class _AlwaysFails(FakeLLMClient):
         raise self.exc
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #4")
 async def test_concurrent_retries_are_jittered() -> None:
     backoff_s = 0.1
     fakes = [_AlwaysFails(ConnectionError("reset")) for _ in range(20)]
@@ -170,7 +168,6 @@ async def test_concurrent_retries_are_jittered() -> None:
     assert max(second) - min(second) >= 0.1 * backoff_s
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #4")
 async def test_rate_limit_retry_after_is_honoured() -> None:
     retry_after_s = 1.0
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
