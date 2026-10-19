@@ -10,7 +10,7 @@ import anthropic
 
 from autolab.state.models import HITLRequest
 from autolab.state.schema import AutoLabState
-from autolab.verification.llm import LLMClient, LLMPurpose, SchemaT
+from autolab.verification.llm import LLMClient, LLMPurpose, SchemaT, is_live
 
 T = TypeVar("T")
 
@@ -70,6 +70,7 @@ class RetryingLLMClient:
         initial_backoff_seconds: float = INITIAL_BACKOFF_S,
     ) -> None:
         self._inner = inner
+        self.live = is_live(inner)
         self._max_attempts = max_attempts
         self._backoff = initial_backoff_seconds
 
