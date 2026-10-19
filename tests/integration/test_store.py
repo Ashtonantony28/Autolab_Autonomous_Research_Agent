@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
 
+from autolab.monitoring.events import TraceEvent
 from autolab.state.models import (
+    AnalysisReport,
     Citation,
     ExperimentDesign,
     ExperimentParameter,
     ExperimentResult,
     Hypothesis,
+    Interpretation,
     Measurement,
     ReasoningStep,
     ReasoningTrace,
@@ -115,3 +119,68 @@ async def test_multiple_runs_are_isolated(store: StateStore) -> None:
     assert await store.load_hypotheses(run_b) == [h_b]
     # Unrelated run id returns empty.
     assert await store.load_hypotheses(uuid4()) == []
+
+
+async def test_create_run_with_given_id_and_ensure_run_is_idempotent(store: StateStore) -> None:
+    rid = uuid4()
+    assert await store.create_run("Q?", run_id=rid) == rid
+    await store.ensure_run(rid, "ignored")
+    other = uuid4()
+    await store.ensure_run(other, "R?")
+    await store.ensure_run(other, "R?")
+
+    assert sorted(await store.list_runs()) == sorted([(rid, "Q?"), (other, "R?")])
+
+
+async def test_list_runs_is_newest_first(store: StateStore) -> None:
+    first = await store.create_run("first")
+    second = await store.create_run("second")
+
+    assert [r for r, _ in await store.list_runs()] == [second, first]
+
+
+async def test_append_is_idempotent_across_store_instances(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'store.db'}"
+    t = ReasoningTrace(agent="a", steps=(ReasoningStep(index=0, claim="c", claim_type="premise"),))
+    v = VerificationResult(
+        trace_id=t.id,
+        step_verdicts=(StepVerdict(step_index=0, verdict="VALID"),),
+        consistency_score=1.0,
+    )
+    rid = uuid4()
+    for _ in range(2):  # a restart: fresh store, same rows re-recorded
+        s = await StateStore.create(url)
+        try:
+            await s.ensure_run(rid, "Q")
+            await s.append(rid, t)
+            await s.append(rid, v)
+            await s.append(rid, v)
+        finally:
+            await s.dispose()
+
+    s = await StateStore.create(url)
+    try:
+        assert await s.load_traces(rid) == [t]
+        assert await s.load_verifications(rid) == [v]
+    finally:
+        await s.dispose()
+
+
+async def test_round_trip_reports_and_events_in_order(store: StateStore) -> None:
+    rid = await store.create_run("Q")
+    report = AnalysisReport(
+        result_id=uuid4(),
+        interpretations=(Interpretation(statement="x", rank=0, likelihood=0.5),),
+        summary="s",
+    )
+    events = [
+        TraceEvent(run_id=rid, node=n, attempt=1, latency_ms=1.0, decision="pass")
+        for n in ("research", "design", "execute")
+    ]
+    await store.append(rid, report)
+    for e in reversed(events):
+        await store.append(rid, e)
+
+    assert await store.load_reports(rid) == [report]
+    assert await store.load_events(rid) == events  # by started_at, not insertion
+    assert await store.load_events(uuid4()) == []
