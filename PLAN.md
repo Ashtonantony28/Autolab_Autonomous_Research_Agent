@@ -39,6 +39,10 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG21 | Design figures and fact symbols (AUDIT-13 #3, AUDIT-15 #1, AUDIT-16 #1) | audit round 4 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
 | SG22 | Solver timeout and fair scheduling (AUDIT-14 #1, #2) | SG23 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
 | SG23 | Deterministic gate (flaky AUDIT-6 #7 repro, SQLite lock in concurrent-store test) | audit round 4 | `tests/audit/test_audit_6.py` (#7 repro only), `state/store.py` (connection setup only), `tests/integration/monitoring/test_graph_observability.py`, `tests/audit/test_audit_14.py` (#1 repros), `tests/audit/test_audit_10.py` (#1 test), `tests/audit/test_audit_6.py` (#3 repro) | done (PR pending) |
+| SG24 | Formalizer probe cost and annotation tokenizing (AUDIT-18 #1, AUDIT-20 #2, #4) | audit round 5 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py`, `tests/audit/test_audit_13.py` (#2 helper only) | open |
+| SG25 | Independent cost and duration estimate for designs (AUDIT-17 #1–#3, AUDIT-19 #1, #2) | audit round 5 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/`, `orchestrator/routing.py` (figure retry only) | open |
+| SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | open |
+| SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | open |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -391,6 +395,30 @@ Round 4 (AUDIT-13..16, fresh agents, base `fee50eb`) found 2 critical and 7 high
   - Open: SQLite writes are not serialized or retried, so a lock held for more than 30 s still fails a run. Postgres was not measured. The AUDIT-14 repros take about 7 s each.
 
 Medium and low round-4 findings not folded in above stay in the AUDIT files.
+
+### Audit round 5 → SG24–SG27
+
+Round 5 (AUDIT-17..20, fresh agents, base `603e452`) found 1 critical and 9 high findings. The verifier admitted no wrong trace; every high soundness finding is in the Design figure guard. Repros are strict xfails in `tests/audit/test_audit_{17..20}.py`. A sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG24, SG25 and SG26 run in parallel; SG27 runs after SG26.
+
+- **SG24 Formalizer probe cost and annotation tokenizing.**
+  - SG20's applied-builtin probe parses every Int/Real combination of a function's arguments on the event loop: one reply declaring a 16-argument function blocks the process for 21 s, and about 26 arguments never finish (AUDIT-18 #1, critical). The probe must make a bounded number of parses per declaration.
+  - The tokenizer reads `p:named` as one token, while Z3 splits it, so `(! p:named false)` passes the `:keyword` rule. Tokenize names the way Z3 does (`:` and `#` end a symbol), so the annotation ban and the earlier-use rule see what Z3 sees (AUDIT-20 #4, high; AUDIT-17 #5, low).
+  - The AUDIT-13 #2 repro helper skips any step containing `:named`, so on the pre-SG20 formalizer the repros fail on a KeyError, not on their assertions. Restore them so they fail on their assertions against the old code (AUDIT-20 #2, high).
+  - **Flip:** AUDIT-18 #1, AUDIT-20 #2, AUDIT-17 #5. **Verify:** `uv run pytest tests/audit/test_audit_9.py tests/audit/test_audit_13.py tests/audit/test_audit_17.py tests/audit/test_audit_18.py tests/audit/test_audit_20.py tests/unit/verification -q` · error injection · bench.
+- **SG25 Independent cost and duration estimate for designs.**
+  - Three rounds of word-list fixes to `protocol_figures` keep missing ordinary phrasings ("3 nights", "a week", a unit in a parameter name, `success_criteria`) and keep rejecting honest protocols (gene names such as TOP10, "8-week-old mice") (AUDIT-17 #1–#3, high and medium; AUDIT-19 #1, medium).
+  - The default chosen here, pending the owner's answer on the decision card: replace the text scan with an independent structured estimate. A separate LLM call (tool use, Pydantic schema) reads the protocol, parameters and success criteria and returns its own cost and duration. The larger of the two estimates drives the cost/duration HITL trigger, and a large disagreement escalates. No figure is parsed from text with regex (CLAUDE.md §4, §9).
+  - A figure rejection or disagreement is retried with its reason as feedback before it escalates (AUDIT-19 #2; AUDIT-15 #3's retry half).
+  - **Flip:** AUDIT-17 #1–#4, AUDIT-19 #1 ×2, #2 ×2; keep the AUDIT-5 #2, AUDIT-12 #1, AUDIT-13 #3, AUDIT-15 and AUDIT-16 #1 repros passing. **Verify:** `uv run pytest tests/audit tests/unit/agents tests/integration -q` · `uv run python -m scripts.run_benchmark` · error injection.
+- **SG26 Solver scheduling without executor internals.**
+  - SG22's slot hand-off relies on `ThreadPoolExecutor` starting a new thread, which it skips when a stale idle permit exists, so checks run one at a time: an easy verify beside 3 hard runs takes 150 s (AUDIT-18 #2, high; AUDIT-17 #6). Manage the worker threads explicitly instead of resizing `_max_workers`.
+  - SG22's core fixes are guarded only by `perf` tests (AUDIT-20 #5, high): add deterministic tests for the asserted claim, the `_SETUP_SHARE` guard and the slow-worker cap.
+  - The AUDIT-6 #7 repro is timing-dependent again (AUDIT-20 #1, high), and the AUDIT-14 #1 timeout repro only reaches the setup guard (AUDIT-20 #3, high). Make both deterministic and make sure each catches what it names.
+  - Fold in: the slow-lane cap above which hard checks starve easy ones, and sizing from the CPUs actually available (AUDIT-18 #4, #5, medium).
+  - **Flip:** AUDIT-18 #2, #4, #5, AUDIT-20 #1, #3. **Verify:** the SG22 verify set plus `tests/audit/test_audit_18.py tests/audit/test_audit_20.py` · bench · the AUDIT-10, AUDIT-14 and AUDIT-18 loads · `make test` green 5 times under load.
+- **SG27 Real-valued premise pools honour timeouts.** Real-valued premise pools ignore the solver timeout (up to 20×) and cancels (a worker held 9.4 s), and cost 9–12× the same pool over Int (AUDIT-18 #3, high). The audit suggests checking each trace incrementally on one solver. **Flip:** AUDIT-18 #3 ×3, #7. **Verify:** as SG26, plus error injection.
+
+Medium and low round-5 findings not folded in above stay in the AUDIT files.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -404,9 +432,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-5..8 | Round 2 of the same four focuses, on SG7–SG10 |
 | AUDIT-9..12 | Round 3, on SG11–SG14 |
 | AUDIT-13..16 | Round 4, on SG15–SG19 |
+| AUDIT-17..20 | Round 5, on SG20–SG23 |
 
 ## Log
 
+- 2026-10-20: audit round 5 done (1 critical, 9 high); SG24–SG27 added. No wrong trace admitted by the verifier; the Design figure guard is replaced by an independent estimate (SG25).
 - 2026-10-20: audit round 4 done (2 critical, 7 high); SG20–SG23 added. AUDIT-9 #1 and AUDIT-12 #1 reopened.
 - 2026-10-20: audit round 3 done (1 critical, 7 high); SG15–SG19 added. AUDIT-5 #2 reopened by AUDIT-12 #1.
 - 2026-10-19: audit round 2 done (2 critical, 3 high); SG11–SG14 added.
