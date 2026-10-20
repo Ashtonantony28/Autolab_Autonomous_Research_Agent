@@ -22,7 +22,7 @@ from autolab.state.models import ExperimentDesign, HITLResolution
 from autolab.state.schema import empty_state
 from autolab.state.store import StateStore
 from autolab.verification.llm import FakeLLMClient
-from tests.fixtures.agent_helpers import register_failing_trace
+from tests.fixtures.agent_helpers import register_estimate, register_failing_trace
 from tests.integration.orchestrator.test_graph import (
     DESIGN,
     EXPENSIVE,
@@ -83,6 +83,7 @@ def fail_design(fake: FakeLLMClient, design: ExperimentDesign = DESIGN) -> None:
         conclusion=design_claim(design),
         facts=design_facts(design),
     )
+    register_estimate(fake, design)
 
 
 def decisions(events: list[Any]) -> list[tuple[str, str]]:

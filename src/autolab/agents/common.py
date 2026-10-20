@@ -124,7 +124,7 @@ _TIME_WORDS: Final = _wordset(
     "min mins minute minutes hr hrs hour hours day days wk wks week weeks fortnight "
     "fortnights mth mths month months yr yrs year years"
 )
-_TIME_EXACT: Final = frozenset({"s", "m", "h", "d", "y", "ms", "µs", "μs", "mo", "mos", "am", "pm"})
+_TIME_EXACT: Final = frozenset({"s", "h", "d", "y", "ms", "µs", "μs", "mo", "mos", "am", "pm"})
 """Short units matched in this case only: `16S` (Svedberg), `3D`, `5 M`, `MS` are not times."""
 _MULTIPLIERS: Final = frozenset(
     {"k", "K", "M", "B", "mn", "bn", "thousand", "thousands", "million", "millions"}
@@ -144,7 +144,12 @@ _TOKEN: Final = re.compile(
     re.DOTALL,
 )
 _LEAD_IN: Final = frozenset(":=~≈.")
-"""Between a unit word and the number after it: `USD 500`, `Rs. 500`, `day: 3`."""
+"""Between a unit word and the number after it: `USD 500`, `Rs. 500`, `minutes: 240`."""
+_CONFUSABLES: Final = str.maketrans(
+    "аеһіјорсѕухԁӏАВЕКМНОРСТХУІЈЅαοιρυνκΑΒΕΖΗΙΚΜΝΟΡΤΥΧ",
+    "aehijopcsyxdlABEKMHOPCTXYIJSaoipuvkABEZHIKMNOPTYX",
+)
+"""Cyrillic and Greek letters that look Latin: `48 \\u04bbours` (Cyrillic shha) reads as hours."""
 _DOTTED: Final = re.compile(r"\b(?:[A-Za-z]\.){2,}")
 _WINDOW: Final = 3
 
@@ -163,18 +168,26 @@ def _is_amount(match: re.Match[str]) -> bool:
     )
 
 
-def protocol_figures(protocol: str) -> tuple[str, ...]:
-    """Currency amounts and durations stated in a design's free text.
+def _normalized(text: str) -> str:
+    """NFKC, without format characters (soft hyphen, zero-width space), confusables folded."""
+    kept = (c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf")
+    return "".join(kept).translate(_CONFUSABLES)
 
-    The protocol may not state its own cost or duration: those live only in the
-    bound `estimated_cost_usd` / `estimated_duration_minutes` fields. This is a
-    rejection check, not parsing into state (CLAUDE.md §9): a match only blocks
-    admission, and no value is read back from the text. It fails closed: any
-    currency symbol, and any amount (digits or a number word) next to a time unit
-    (milliseconds to years), a currency word or an ISO 4217 code, counts, with
-    spaces, hyphens or a k/M multiplier between them, on either side.
+
+def protocol_figures(protocol: str) -> tuple[str, ...]:
+    """Currency amounts and durations stated outright in a design's free text.
+
+    Cost and duration live only in the bound `estimated_cost_usd` /
+    `estimated_duration_minutes` fields. This is a rejection check, not parsing
+    into state (CLAUDE.md §9): a match only blocks admission (with a retry), and
+    no value is read back from the text. It is not the guard against understated
+    figures, which is the Design agent's independent estimate (SG25), so it flags
+    only explicit forms: any currency symbol, and any amount (digits or a number
+    word) next to a time unit, a currency word or an ISO 4217 code, with spaces,
+    hyphens or a k/M multiplier between them. Gene names (`TOP10`), ages
+    (`8-week-old`), day labels (`Day 1`), `per cent` and metres are not figures.
     """
-    text = _DOTTED.sub(lambda m: m.group().replace(".", ""), protocol)
+    text = _DOTTED.sub(lambda m: m.group().replace(".", ""), _normalized(protocol))
     toks = list(_TOKEN.finditer(text))
     found: list[str] = []
     for i, tok in enumerate(toks):
@@ -184,21 +197,31 @@ def protocol_figures(protocol: str) -> tuple[str, ...]:
             hi = i + 1 if i + 1 < len(toks) and toks[i + 1].lastgroup == "num" else i
             found.append(text[toks[lo].start() : toks[hi].end()])
         elif _is_amount(tok):
-            words = _words_after(toks, i)
-            if words and words[0].group() in _MULTIPLIERS:
-                words = words[1:]
-            if words and (_is_time(words[0].group()) or _is_currency(words[0].group())):
-                found.append(text[tok.start() : words[0].end()])
-            elif len(words) > 1 and (
-                _is_time(words[1].group(), short=False)
-                or words[1].group().lower() in _CURRENCY_WORDS
+            after = _words_after(toks, i)
+            if after and after[0].group() in _MULTIPLIERS:
+                after = after[1:]
+            words = [w.group() for w in after]
+            if words and (_is_time(words[0]) or _is_currency(words[0])):
+                if not (_is_time(words[0]) and words[1:2] == ["old"]):  # `8-week-old`: an age
+                    found.append(text[tok.start() : after[0].end()])
+            elif (
+                len(words) > 1
+                and words[0].lower() != "per"  # `2 per cent`
+                and (_is_time(words[1], short=False) or words[1].lower() in _CURRENCY_WORDS)
             ):
-                found.append(text[tok.start() : words[1].end()])
+                found.append(text[tok.start() : after[1].end()])
         elif kind == "word" and (_is_currency(word) or _is_time(word, short=False)):
-            j = i + 1
+            j, lead_in = i + 1, False
             while j < len(toks) and (toks[j].lastgroup == "sep" or toks[j].group() in _LEAD_IN):
+                lead_in = lead_in or toks[j].group() in _LEAD_IN
                 j += 1
-            if j < len(toks) and toks[j].lastgroup == "num":
+            # A time word needs `:`/`=` before its number (`Day 1` is a label), and a bare
+            # ISO code a separator (`TOP10`, `PGK1` are genes; `USD500` is a price).
+            if not _is_currency(word):
+                stated = lead_in
+            else:
+                stated = j > i + 1 or word.lower() in _CURRENCY_WORDS
+            if stated and j < len(toks) and toks[j].lastgroup == "num":
                 found.append(text[tok.start() : toks[j].end()])
     return tuple(found)
 
