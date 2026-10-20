@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from autolab.agents.common import measurement_facts, parse_trace, result_claim
 from autolab.state.models import ExperimentResult, Measurement
+from autolab.verification.formalizer import Vocabulary
 
 
 def _result(*measurements: tuple[str, float]) -> ExperimentResult:
@@ -63,8 +64,13 @@ def test_parse_trace_rejects_malformed_replies(raw: str) -> None:
         ("delta", -3.25, "(declare-const delta Real)", "(= delta (- 3.25))"),
         ("tiny", 1e-05, "(declare-const tiny Real)", "(= tiny 0.00001)"),
         ("huge", 1e20, "(declare-const huge Real)", "(= huge 100000000000000000000.0)"),
-        ("OD 600", 0.5, "(declare-const OD_600 Real)", "(= OD_600 0.5)"),
-        ("600nm", 7.0, "(declare-const m_600nm Real)", "(= m_600nm 7.0)"),
+        (
+            "OD 600",
+            0.5,
+            "(declare-const m_OD_600_f098d37748c9 Real)",
+            "(= m_OD_600_f098d37748c9 0.5)",
+        ),
+        ("600nm", 7.0, "(declare-const m_600nm_f97f7fb63691 Real)", "(= m_600nm_f97f7fb63691 7.0)"),
     ],
 )
 def test_measurement_facts_are_parseable_real_equalities(
@@ -95,3 +101,16 @@ def test_measurement_facts_reject_non_finite_values(value: float) -> None:
 def test_result_claim_lists_status_and_values() -> None:
     assert result_claim(_result(("a", -1.5), ("b", 2.0))) == "experiment partial: a = -1.5, b = 2.0"
     assert result_claim(_result()) == "experiment partial: no measurements"
+
+
+# SG21 (AUDIT-15 #1): fact symbols are plain ASCII identifiers and stay distinct.
+
+ODD_NAMES = ["OD₆₀₀", "OD600", "OD 600", "OD_600", "m_OD_600", "température", "volume_µL", "_x"]
+
+
+def test_measurement_fact_symbols_merge_into_a_vocabulary_and_stay_distinct() -> None:
+    facts = measurement_facts(_result(*((n, 1.0) for n in ODD_NAMES)))
+    vocab = Vocabulary()
+    for fact in facts:
+        vocab = vocab.merged(fact.declarations)
+    assert len(vocab.declarations) == len(ODD_NAMES)

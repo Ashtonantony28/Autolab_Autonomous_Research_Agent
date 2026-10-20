@@ -10,8 +10,8 @@ from autolab.agents.common import (
     conclusion_instruction,
     design_claim,
     design_facts,
+    design_figures,
     parse_trace,
-    protocol_figures,
     with_feedback,
 )
 from autolab.state.models import ExperimentDesign, Hypothesis, VerificationContext
@@ -25,9 +25,9 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
 
     Cost, duration and numeric parameters become code-built `context.facts`, and
     the trace must conclude `design_claim(design)`, so the fields that drive the
-    cost/duration pause and the simulator are verified, not trusted. A protocol
-    whose text states its own cost or duration (`protocol_figures`) is never
-    admitted: those figures could disagree with the bound fields unseen.
+    cost/duration pause and the simulator are verified, not trusted. A design
+    whose protocol or parameter text states a cost or duration (`design_figures`)
+    is never admitted: those figures could disagree with the bound fields unseen.
     """
 
     name = "design"
@@ -57,16 +57,26 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     async def __call__(self, state: AutoLabState) -> dict[str, Any]:
-        """Run the base template, then reject a protocol that states cost or duration."""
+        """Run the base template, then reject a design whose text states cost or duration."""
         update = await super().__call__(state)
         design = update.get("current_experiment") or (update.get("hitl_payload") or {}).get(
             "current_experiment"
         )
-        figures = protocol_figures(design.protocol) if design is not None else ()
-        if design is None or not figures:
+        if design is None:
+            return update
+        in_protocol, in_parameters = design_figures(design)
+        stated = [
+            f"{where} cost or duration figures {list(figures)}"
+            for where, figures in (
+                ("protocol states", in_protocol),
+                ("parameters state", in_parameters),
+            )
+            if figures
+        ]
+        if not stated:
             return update
         reason = (
-            f"protocol states cost or duration figures {list(figures)}; "
+            f"{'; '.join(stated)}; "
             "these belong only in estimated_cost_usd / estimated_duration_minutes"
         )
         pending = self._request(
@@ -80,7 +90,8 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
 
 
 PROTOCOL_FIGURES_RULE = (
-    "Do not state any cost (currency amount) or duration (time) figure in the protocol text; "
+    "Do not state any cost (currency amount) or duration (time) figure in the protocol text "
+    "or in any parameter's name, text value or unit; "
     "put them only in estimated_cost_usd and estimated_duration_minutes."
 )
 
