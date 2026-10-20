@@ -247,7 +247,6 @@ async def test_a_trace_cannot_change_z3_global_parameters() -> None:
 # payload claim (AUDIT-1 #1 again).
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-9 #3")
 async def test_premise_inconsistent_in_pass_one_cannot_prove_the_claim_in_pass_two() -> None:
     fake = FakeLLMClient()
     trace = _register(
