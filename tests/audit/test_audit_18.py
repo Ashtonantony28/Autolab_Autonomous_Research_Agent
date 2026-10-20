@@ -23,7 +23,7 @@ from autolab.verification import formalizer as formalizer_mod
 from autolab.verification import solver as solver_mod
 from autolab.verification.formalizer import Formalizer, Vocabulary, prompt_for
 from autolab.verification.llm import FakeLLMClient
-from autolab.verification.solver import Z3Solver
+from autolab.verification.solver import SmtFormula, Z3Solver
 from scripts.audit_load_4 import cancel_release_s, timed_check
 from scripts.audit_load_5 import (
     bool_chain,
@@ -95,29 +95,36 @@ async def test_an_easy_check_never_queues_behind_a_check_that_gave_up_its_slot()
 
 _REAL_POOL: Final = 1000
 _OVERRUN_LIMIT: Final = 1.5
+_SHARE: Final = 5
+"""Timeouts and cancels land at 1/_SHARE of the check's own run time on this machine."""
+
+
+def _real_premise_check() -> tuple[list[SmtFormula], SmtFormula, float]:
+    """The premise check of step 1000 of a Real-valued trace, and its untimed wall s."""
+    premises, claim = real_chain(_REAL_POOL, claim="true")
+    return premises, claim, timed_check(premises, claim, 300.0)[1]
 
 
 @pytest.mark.perf
 @pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 def test_a_real_premise_check_returns_within_its_timeout() -> None:
-    # The premise check of step 1000 of a Real-valued trace (999 chained `>` premises).
-    # Z3's consistency check on it runs ~2.3 s without polling its limit: 4.7x a 0.5 s
-    # timeout. The same pool over Int returns after 0.5 s.
-    premises, claim = real_chain(_REAL_POOL, claim="true")
-    timeout_s = 0.5
+    # 999 chained `>` premises: Z3's consistency check never polls its limit, so a
+    # timeout at a fifth of the check's run time is overrun ~5x. Over Int it holds.
+    premises, claim, alone_s = _real_premise_check()
+    timeout_s = alone_s / _SHARE
     reason, wall_s = timed_check(premises, claim, timeout_s)
     assert reason == "timeout"
-    assert wall_s / timeout_s <= _OVERRUN_LIMIT, f"{wall_s:.2f} s"
+    assert wall_s / timeout_s <= _OVERRUN_LIMIT, f"{wall_s:.2f} s of {timeout_s:.2f} s"
 
 
 @pytest.mark.perf
 @pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> None:
-    # Same check, 30 s timeout, cancelled 0.3 s in: the re-send thread interrupts every
+    # Same check, cancelled a tenth of the way in: the re-send thread interrupts every
     # 5 ms, and the worker stays busy until the consistency check ends by itself.
-    premises, claim = real_chain(_REAL_POOL, claim="true")
-    freed_s, sent, _ = await cancel_release_s(premises, claim, after_s=0.3)
-    assert freed_s < 0.5, f"freed after {freed_s:.2f} s, {sent} interrupts"
+    premises, claim, alone_s = _real_premise_check()
+    freed_s, sent, _ = await cancel_release_s(premises, claim, after_s=alone_s / (2 * _SHARE))
+    assert freed_s < alone_s / _SHARE, f"freed after {freed_s:.2f} s, {sent} interrupts"
 
 
 @pytest.mark.perf
