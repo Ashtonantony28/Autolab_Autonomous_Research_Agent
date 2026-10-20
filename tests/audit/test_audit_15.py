@@ -155,7 +155,6 @@ async def test_a_cost_stated_in_a_string_parameter_is_not_admitted() -> None:
 # --- #5 (medium): a premise whose head starts with "assert" is dropped ------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #5")
 def test_a_premise_whose_predicate_starts_with_assert_is_kept() -> None:
     decl = "(declare-fun assertive (Int) Bool)"
     Vocabulary().merge(decl)  # the formalizer accepts the name and the term

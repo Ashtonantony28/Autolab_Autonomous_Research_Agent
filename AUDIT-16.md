@@ -198,6 +198,7 @@ None.
 - *Measured:* with S10 applied, 15 runs of the cancel and shutdown pair. `test_cancelling_a_caller_interrupts_its_z3_context` passed once (run 0); the other 14 runs failed both tests after the full 20 s `_HANG_S`.
 - This is not "tested only by timing", because the AUDIT-12 #2 repro and now `test_audit_16` kill S10 deterministically. But the SG19 comment ("The first interrupt lands before the check starts, where Z3 drops it") is not guaranteed.
 - *Suggested:* in `z3_spy`, call `real_interrupt(self)` first and then `spy.interrupted.set()`. Better, wait for a count of sent interrupts, as `_HeldCheck` in `test_audit_16.py` does.
+- **Resolution (SG22).** The `z3_spy` interrupt wrapper calls the real `Context.interrupt()` first and sets `interrupted` after it. The repro passes as a plain test with its assertion unchanged. The #4 kill tests are unchanged and pass.
 
 **#5. A premise UNGROUNDED in pass 1 can be assumed in pass 2 (V08 survived).**
 - SG16's contract: "A premise that was not VALID keeps its verdict". Both SG16 tests use INVALID premises. Changing the check to `== "INVALID"` lets a premise whose pass-1 consistency check was inconclusive drop its UNGROUNDED verdict.

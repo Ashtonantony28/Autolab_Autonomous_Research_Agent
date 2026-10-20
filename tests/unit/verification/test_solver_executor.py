@@ -26,6 +26,7 @@ from autolab.verification.solver import (
 from autolab.verification.vericot import Verifier
 from scripts.audit_load import NO_CUBES, POSITIVE, XYZ, LatencyLLM, chain, pathological
 from scripts.audit_load_2 import CountingExecutor
+from scripts.audit_load_4 import fast_trace_under_slow_runs
 from tests.fixtures.golden_traces import build
 
 _SLOW_S: Final = 0.2
@@ -91,6 +92,7 @@ async def test_default_pool_stays_responsive_under_fifty_slow_checks(
 @pytest.mark.perf
 async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
+    executor.slow_workers = 0  # every check holds the only slot, so the others queue
     built = [pathological() for _ in range(4)]
     started = time.perf_counter()
     results = await asyncio.gather(
@@ -182,6 +184,57 @@ async def test_cancel_while_queued_submits_nothing(make_executor: ExecutorFactor
     with pytest.raises(asyncio.CancelledError):
         await queued
     assert calls == []
+
+
+@pytest.mark.perf
+async def test_hard_runs_do_not_starve_an_easy_verify_on_one_worker() -> None:
+    # A 1-CPU host: one slot. Each hard check leaves it after `_SLICE_S` (AUDIT-14 #2).
+    timeout_s = 0.5
+    _, loaded = await fast_trace_under_slow_runs(workers=1, slow_runs=2, timeout_s=timeout_s)
+    assert loaded < timeout_s
+
+
+async def test_slow_checks_are_bounded_by_slow_workers() -> None:
+    executor = SolverExecutor(1, slow_workers=1)
+    lock = threading.Lock()
+    running, peak = 0, 0
+
+    def hard() -> solver_mod.SolverOutcome:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        try:
+            return Z3Solver(0.3).check_entailment(
+                [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
+            )
+        finally:
+            with lock:
+                running -= 1
+
+    try:
+        outs = await asyncio.gather(*(executor.run(hard) for _ in range(3)))
+        threads = len(executor._pool._threads)
+    finally:
+        executor.shutdown()
+    assert [o.reason for o, _ in outs] == ["timeout"] * 3
+    # One check in the slot and one slow check; the third waits for a slow one to end.
+    assert peak == 2
+    assert threads <= 2
+    assert executor._slow == 0
+
+
+async def test_only_a_running_z3_check_gives_up_its_slot(make_executor: ExecutorFactory) -> None:
+    executor = make_executor(1)
+    gate = threading.Event()
+    held = asyncio.create_task(executor.run(partial(gate.wait, _WAIT_S)))
+    calls: list[int] = []
+    queued = asyncio.create_task(executor.run(lambda: calls.append(1)))
+    await asyncio.sleep(4 * solver_mod._SLICE_S)
+    assert calls == []
+    gate.set()
+    await asyncio.gather(held, queued)
+    assert calls == [1]
 
 
 @pytest.mark.perf
@@ -293,8 +346,8 @@ def z3_spy(monkeypatch: pytest.MonkeyPatch) -> _Z3Spy:
         return real_check(self, *args)
 
     def interrupt(self: z3.Context) -> None:
+        real_interrupt(self)  # sent first, then signalled (AUDIT-16 #2)
         spy.interrupted.set()
-        real_interrupt(self)
 
     monkeypatch.setattr(z3.Solver, "check", check)
     monkeypatch.setattr(z3.Context, "interrupt", interrupt)
@@ -411,6 +464,26 @@ def test_each_check_starts_from_default_global_parameters() -> None:
     finally:
         z3.reset_params()
     assert out.verdict == "VALID"
+
+
+def test_no_entailment_check_starts_without_the_time_the_consistency_check_took(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    real_check = z3.Solver.check
+
+    def slow_check(self: z3.Solver, *args: object) -> object:
+        calls.append(1)
+        out = real_check(self, *args)
+        time.sleep(0.15)  # the consistency check takes 0.15 s of a 0.2 s budget
+        return out
+
+    monkeypatch.setattr(z3.Solver, "check", slow_check)
+    decls = "(declare-const p Bool)"
+    out = Z3Solver(0.2).check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
+    assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
+    assert out.details == "too little time left for the entailment check"
+    assert calls == [1]
 
 
 def test_counter_model_does_not_use_the_shared_printer(monkeypatch: pytest.MonkeyPatch) -> None:
