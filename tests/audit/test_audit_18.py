@@ -105,7 +105,6 @@ def _real_premise_check() -> tuple[list[SmtFormula], SmtFormula, float]:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 def test_a_real_premise_check_returns_within_its_timeout() -> None:
     # 999 chained `>` premises: Z3's consistency check never polls its limit, so a
     # timeout at a fifth of the check's run time is overrun ~5x. Over Int it holds.
@@ -117,7 +116,6 @@ def test_a_real_premise_check_returns_within_its_timeout() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> None:
     # Same check, cancelled a tenth of the way in: the re-send thread interrupts every
     # 5 ms, and the worker stays busy until the consistency check ends by itself.
@@ -127,7 +125,6 @@ async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> No
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 def test_a_real_premise_pool_costs_no_more_than_its_int_twin() -> None:
     # The premise check re-checks all 999 earlier premises from scratch. Over Int it
     # takes ~0.2 s; over Real ~2.1 s (9-11x).
@@ -179,7 +176,6 @@ async def test_a_checkpoint_write_waits_out_a_lock_like_the_store_does(tmp_path:
 # --- #7 (low): `_SETUP_SHARE` skips entailment checks that need no time ---------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #7")
 def test_a_premise_check_finishes_when_its_entailment_step_needs_no_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

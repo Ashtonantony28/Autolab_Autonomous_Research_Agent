@@ -19,11 +19,15 @@ The pool starts a thread for every admitted check that finds none idle
 (AUDIT-18 #2). Cancelling a caller interrupts its Z3 check, including one that
 has not started yet (AUDIT-12 #2).
 
-Inputs are SMT-LIB 2 strings, parsed by `Solver.from_string` so the
-boundary between LLM-produced text and Z3's AST is explicit. Every check
-runs in a fresh `z3.Context`, created from default global parameters, so
-checks are safe to run on worker threads, and both checks share one
-`timeout_seconds` deadline.
+Inputs are SMT-LIB 2 strings, parsed by Z3 in one call so the boundary
+between LLM-produced text and Z3's AST is explicit. Given a long pool at once,
+Z3's simplex runs for seconds without stopping for its timeout or interrupts,
+so a pool of more than `_LOAD_ABOVE` premises is asserted one formula at a
+time, each after a check that keeps the simplex feasible (AUDIT-18 #3). The
+claim `true` needs no entailment check (AUDIT-18 #7). Every check runs in a
+fresh `z3.Context`, created from default global parameters, so checks are
+safe to run on worker threads, and all checks share one `timeout_seconds`
+deadline.
 """
 
 from __future__ import annotations
@@ -75,6 +79,10 @@ _SETUP_SHARE: Final[float] = 0.5
 the time the consistency check took; with less time left the check is not started."""
 _NEGATED_CLAIM: Final[str] = "claim!"
 """Not a plain identifier, so no formalized step can declare it."""
+_LOAD_ABOVE: Final[int] = 100
+"""Pools of more premises are loaded one formula at a time; smaller ones in one call."""
+_RESET_SHARE: Final[float] = 0.9
+"""While loading, the timeout is set again once less than this share of it is left."""
 _REARM_S: Final[float] = 0.005
 """How often a requested interrupt is re-sent: Z3 drops one sent outside `Solver.check()`."""
 
@@ -150,10 +158,15 @@ class Z3Solver:
         interrupt: _Interrupt,
     ) -> SolverOutcome:
         solver = z3.Solver(ctx=ctx)
+        smt2 = _build_smt2(premises, claim)
+        loading: z3.AstVector | None = None
         try:
-            # One C call; asserting the parsed AstVector item by item costs a GIL
-            # hand-off per call (AUDIT-10 #1).
-            solver.from_string(_build_smt2(premises, claim))
+            if len(premises) > _LOAD_ABOVE:
+                loading = z3.parse_smt2_string(smt2, ctx=ctx)
+            else:
+                # One C call; asserting the parsed AstVector item by item costs a GIL
+                # hand-off per call (AUDIT-10 #1).
+                solver.from_string(smt2)
         except z3.Z3Exception as exc:
             if interrupt.requested():
                 return _INTERRUPTED
@@ -162,9 +175,11 @@ class Z3Solver:
                 reason="formalization_failed",
                 details=f"SMT parse error: {exc}",
             )
-        solver.set("timeout", _remaining_ms(deadline))
+        consistency = z3.sat if loading is None else _load(solver, loading, deadline, interrupt)
         started = time.monotonic()
-        consistency = solver.check()
+        if consistency == z3.sat:
+            solver.set("timeout", _remaining_ms(deadline))
+            consistency = solver.check()
         took = time.monotonic() - started
         if consistency == z3.unsat:
             return SolverOutcome(
@@ -173,6 +188,11 @@ class Z3Solver:
                 details="premises are mutually unsatisfiable",
             )
         details = f"premise consistency check returned {consistency}"
+        if consistency == z3.sat and claim.assertion.strip() == "true":
+            # Anything entails `true`: no entailment check, so no guard (AUDIT-18 #7).
+            return SolverOutcome(
+                verdict="VALID", reason="entailed", details="premises entail claim"
+            )
         if consistency == z3.sat and deadline - time.monotonic() < _SETUP_SHARE * took:
             # Z3 sets the entailment check up without polling its limit (AUDIT-14 #1).
             details = "too little time left for the entailment check"
@@ -206,6 +226,34 @@ _INTERRUPTED: Final = SolverOutcome(verdict="UNGROUNDED", reason="timeout", deta
 def _remaining_ms(deadline: float) -> int:
     """Milliseconds left before `deadline`, at least 1 (Z3 treats 0 as no limit)."""
     return max(1, int((deadline - time.monotonic()) * _MS_PER_S))
+
+
+def _load(
+    solver: z3.Solver, assertions: z3.AstVector, deadline: float, interrupt: _Interrupt
+) -> z3.CheckSatResult:
+    """Assert `assertions` one at a time, checking before each but the first.
+
+    One new bound at a time keeps every simplex run short, and the deadline and
+    interrupt are polled between them (AUDIT-18 #3). The checks go through the
+    C API: they only keep the simplex feasible, and the caller's `Solver.check()`
+    is the consistency check.
+    Returns unsat once a prefix is unsat, unknown once the deadline passes or an
+    interrupt is requested, else sat (all asserted, consistency not yet decided).
+    """
+    ref, handle, vector = solver.ctx.ref(), solver.solver, assertions.vector
+    limit = 0
+    for i in range(len(assertions)):
+        if i:
+            remaining = _remaining_ms(deadline)
+            if remaining < _RESET_SHARE * limit or not limit:
+                limit = remaining
+                solver.set("timeout", limit)
+            if z3.Z3_solver_check(ref, handle) == z3.Z3_L_FALSE:
+                return z3.unsat
+            if interrupt.requested() or time.monotonic() >= deadline:
+                return z3.unknown
+        z3.Z3_solver_assert(ref, handle, z3.Z3_ast_vector_get(ref, vector, i))
+    return z3.sat
 
 
 def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:
