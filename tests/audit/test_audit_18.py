@@ -157,10 +157,11 @@ async def test_hard_runs_above_the_slow_cap_do_not_starve_an_easy_verify() -> No
 @pytest.mark.xfail(strict=True, reason="AUDIT-18 #5")
 def test_concurrent_checks_reach_the_verdict_they_reach_alone() -> None:
     # A child pinned to one CPU while os.cpu_count() says 4, as in a 1-CPU container on a
-    # 4-CPU host: 2 workers, 8 slow. One lia_chain(1600) check decides `not_entailed` in
-    # ~0.8 s against a 3 s timeout. Ten at once all run (2 slots + 8 slow), share the CPU,
-    # and each reaches its wall-clock deadline first. With slow_workers=0 all ten decide.
-    report = oversubscribed(10, cpus=4, n=1600, timeout_s=3.0)
+    # 4-CPU host: 2 workers, 8 slow. The timeout is 4x one lia_chain(1600) check's run
+    # time alone. Ten at once all run (2 slots + 8 slow), share the CPU, and each reaches
+    # its wall-clock deadline first. With slow_workers=0 all ten decide.
+    alone_s = oversubscribed(0, cpus=4, n=1600, timeout_s=60.0)["alone_s"]
+    report = oversubscribed(10, cpus=4, n=1600, timeout_s=4 * alone_s)
     assert report["alone"] == "not_entailed"
     assert report["reasons"] == ["not_entailed"] * 10
 
