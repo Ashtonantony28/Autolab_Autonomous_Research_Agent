@@ -57,7 +57,8 @@ class Vocabulary:
         Raises:
             FormalizationError: on an unrecognized or conflicting declaration,
                 or one that names an SMT-LIB reserved word (AUDIT-5 #1), a Z3
-                builtin, or anything but a plain identifier (AUDIT-9 #1).
+                builtin, or anything but a plain identifier (AUDIT-9 #1), or that
+                takes more than `MAX_ARITY` arguments (AUDIT-22 #1).
         """
         out = dict(self.declarations)
         for line in new_decls.splitlines():
@@ -71,6 +72,11 @@ class Vocabulary:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             if not _IDENTIFIER.fullmatch(name):
                 raise FormalizationError(f"declared name {name!r} is not a plain identifier")
+            arity = _arity(_decl_tokens(stripped))
+            if arity > MAX_ARITY:
+                raise FormalizationError(
+                    f"declaration of {name!r} takes {arity} arguments; at most {MAX_ARITY} allowed"
+                )
             mentioned = _tokens(stripped)
             sorts = tuple(
                 d for n, d in out.items() if d.startswith("(declare-sort") and n in mentioned
@@ -181,6 +187,7 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
         "|quoted| symbol, and not an SMT-LIB reserved word or Z3 builtin, with or without "
         "arguments (for example not map, union, default, sin, equals, if_then_else).",
         "- Do not declare a name that an earlier step already used.",
+        f"- A declared function or sort takes at most {MAX_ARITY} arguments.",
         "- declarations holds only declare-const, declare-fun or declare-sort lines, one per line.",
         "- assertion is exactly one Bool term: no SMT commands, no second term, no ! "
         "annotations (:named, :pattern), and no | or ; anywhere (so no ; comments).",
@@ -258,6 +265,28 @@ def _is_z3_builtin(name: str) -> bool:
 
 _NUMERIC: Final = frozenset({"Int", "Real"})
 
+MAX_ARITY: Final = 32
+"""Most arguments a declared function or sort may take; bounds the applied probe (AUDIT-22 #1)."""
+
+
+def _decl_tokens(decl: str) -> list[str]:
+    """Tokens of a declaration form, parentheses split out, its outer pair dropped."""
+    return decl[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+
+
+def _arity(tokens: list[str]) -> int:
+    """Arguments the declaration in `tokens` takes; `MAX_ARITY + 1` for any longer numeral."""
+    head = tokens[0]
+    if head == "declare-sort":
+        n = tokens[2] if len(tokens) > 2 else ""
+        if not (n.isascii() and n.isdigit()):
+            return 0
+        digits = n.lstrip("0") or "0"
+        return int(digits) if len(digits) <= len(str(MAX_ARITY)) else MAX_ARITY + 1
+    if head == "declare-fun" and len(tokens) > 2 and tokens[2] == "(":
+        return len(_sexprs(tokens[3:]))
+    return 0
+
 
 @functools.lru_cache(maxsize=4096)
 def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
@@ -266,12 +295,13 @@ def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
     Z3 resolves a user function only at its declared arity, with Int and Real
     coerced, so probing those argument sorts covers every use the declaration
     could take over (AUDIT-13 #1). An unknown sort is left to the parse check.
-    `sort_decls` holds the `declare-sort` lines `decl` mentions.
+    `sort_decls` holds the `declare-sort` lines `decl` mentions. `merged` refuses
+    more than `MAX_ARITY` arguments first, so the probe's total size is bounded.
     """
-    tokens = decl[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+    tokens = _decl_tokens(decl)
     head, name = tokens[0], tokens[1]
     if head == "declare-sort":
-        arity = int(tokens[2]) if len(tokens) > 2 and tokens[2].isdigit() else 0
+        arity = _arity(tokens)
         if arity == 0:
             return False
         uses: Iterable[str] = [f"(declare-const x ({name}{' Int' * arity}))"]
@@ -337,7 +367,8 @@ def _sexprs(tokens: list[str]) -> list[str]:
 
 def _tokens(text: str) -> set[str]:
     """Every symbol, keyword and literal token in `text`, split as Z3's lexer splits it."""
-    return {m.group(1) for m in _TERM_TOKEN.finditer(text)} - {"(", ")"}
+    # Stripped first: trailing blanks make every `\s*` scan to the end (quadratic, AUDIT-22).
+    return {m.group(1) for m in _TERM_TOKEN.finditer(text.rstrip())} - {"(", ")"}
 
 
 _SYMBOL_CHARS: Final = r"A-Za-z0-9~!@$%^&*_\-+=<>.?/,"
@@ -394,7 +425,7 @@ def _decl_name(decl: str) -> str | None:
             break
     if depth != 0:
         return None
-    tokens = body[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+    tokens = _decl_tokens(body)
     if len(tokens) < 2 or tokens[0] not in _DECL_HEADS or tokens[1] in {"(", ")"}:
         return None
     return tokens[1]
