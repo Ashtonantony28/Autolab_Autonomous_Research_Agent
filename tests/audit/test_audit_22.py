@@ -59,7 +59,6 @@ _GIL_WAITS: Final = 40
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #2")
 def test_a_long_premise_check_waits_for_the_gil_a_bounded_number_of_times() -> None:
     # A Python thread runs beside the check, as the event loop does while it formalizes
     # other runs. Each `Z3_solver_check` and `Z3_solver_assert` of SG27's loading drops
@@ -72,7 +71,6 @@ def test_a_long_premise_check_waits_for_the_gil_a_bounded_number_of_times() -> N
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #2")
 def test_an_entailment_beside_python_work_reaches_its_quiet_verdict() -> None:
     # 400 Boolean premises entail the claim in ~40 ms alone. With a timeout of 20x that,
     # the same check beside a Python thread returns `timeout` (UNGROUNDED): the step's
@@ -91,7 +89,6 @@ _OVERRUN_LIMIT: Final = 1.5
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #3")
 def test_a_pool_of_long_real_premises_returns_within_its_timeout() -> None:
     # The 999 Real bounds of AUDIT-18 #3, stated by 50 steps of 20 bounds each: 50
     # premises, so SG27 loads them in one call and Z3's simplex runs without polling.
@@ -105,7 +102,6 @@ def test_a_pool_of_long_real_premises_returns_within_its_timeout() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #3")
 async def test_cancelling_a_check_of_long_real_premises_frees_its_worker_promptly() -> None:
     # Same pool, cancelled a tenth of the way in: the worker stays busy until the
     # simplex ends by itself.
@@ -137,7 +133,6 @@ async def test_a_new_runs_first_check_is_not_starved_by_short_callers() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #5")
 async def test_cancelling_a_slow_check_does_not_hold_up_the_next_one() -> None:
     # 1 worker, 1 slow place. A check Z3 cannot interrupt (#3's pool) goes slow, so the
     # pool has a thread for the next caller; then its caller is cancelled. `run` gives
@@ -154,7 +149,6 @@ async def test_cancelling_a_slow_check_does_not_hold_up_the_next_one() -> None:
 # --- #6 (medium): the solver is sized from the affinity, not the CPU quota -----------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #6")
 def test_the_solver_is_sized_to_a_one_cpu_quota() -> None:
     # A child whose cgroup files (v2 `cpu.max`, v1 `cpu.cfs_quota_us`) allow one CPU, on
     # this 4-CPU host: `docker --cpus=1` or a Kubernetes CPU limit. The affinity still

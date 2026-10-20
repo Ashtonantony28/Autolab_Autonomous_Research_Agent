@@ -365,6 +365,7 @@ def context_overhead_ratio(rounds: int = 200) -> float:
         if s.check() != z3.sat:
             raise AssertionError("premises should be consistent")
         s.add(assertions[len(assertions) - 1])
+        s.add(z3.Bool(solver_mod._NEGATED_CLAIM, ctx))  # the negated claim is named (SG19)
         if s.check() != z3.unsat:
             raise AssertionError("claim should be entailed")
 

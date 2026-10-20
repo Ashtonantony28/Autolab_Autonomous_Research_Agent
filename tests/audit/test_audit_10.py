@@ -57,11 +57,12 @@ async def test_the_default_solver_pool_does_not_inflate_solver_ms_under_concurre
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-10 #2")
 def test_a_hung_main_thread_solver_check_fails_within_the_per_test_limit() -> None:
     # AUDIT-8 H1's mutant S08 (no solver time limit) on a sync test whose Z3 check runs on
     # the main thread, with --timeout=1. The signal-based timeout cannot interrupt the C
     # call, so the child pytest never finishes; it is killed after 8 s with no test named.
+    # Since SG29 the check runs in a worker process and the main thread waits on a pipe,
+    # which the signal interrupts.
     wall, killed, out = s08_suite_probe(limit_s=1.0, kill_after_s=8.0)
     assert not killed
     assert "test_hard_premise_consistency_check_times_out" in out

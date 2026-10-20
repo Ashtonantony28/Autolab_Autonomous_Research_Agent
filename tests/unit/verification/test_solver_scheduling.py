@@ -481,7 +481,7 @@ def test_the_negated_claim_is_asserted_and_checked_without_assumptions(
 
     monkeypatch.setattr(z3.Solver, "add", add)
     monkeypatch.setattr(z3.Solver, "check", check)
-    out = Z3Solver(5.0).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(5.0)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     assert out.verdict == "VALID"
     assert added == [solver_mod._NEGATED_CLAIM]
     assert assumed == [0, 0]
@@ -519,7 +519,7 @@ def test_the_setup_guard_needs_half_the_consistency_time_left(
 
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3.Solver, "check", check)
-    out = Z3Solver(1.0).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(1.0)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     assert len(calls) == checks
     if checks == 1:
         assert (out.reason, out.details) == (

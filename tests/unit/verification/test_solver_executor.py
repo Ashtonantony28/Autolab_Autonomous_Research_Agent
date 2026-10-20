@@ -15,6 +15,7 @@ import pytest
 import z3
 
 from autolab.verification import solver as solver_mod
+from autolab.verification import solver_workers
 from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
 from autolab.verification.solver import (
     SmtFormula,
@@ -316,44 +317,13 @@ async def test_formalize_error_cancels_pending_judges() -> None:
 
 
 # --- Deterministic counterparts of the timing tests above (AUDIT-8 H1) ----------
-
-
-class _Z3Spy:
-    """Signals when an entailment check is running and when a context is interrupted."""
-
-    def __init__(self) -> None:
-        self.checks = 0
-        self.entailing = threading.Event()
-        self.interrupted = threading.Event()
-
-
-@pytest.fixture
-def z3_spy(monkeypatch: pytest.MonkeyPatch) -> _Z3Spy:
-    spy = _Z3Spy()
-    lock = threading.Lock()
-    real_check, real_interrupt = z3.Solver.check, z3.Context.interrupt
-
-    def check(self: z3.Solver, *args: object) -> object:
-        with lock:
-            spy.checks += 1
-            entailing = spy.checks == 2  # premise consistency first, then the entailment check
-        if entailing:
-            spy.entailing.set()
-            # The first interrupt lands before the check starts, where Z3 drops it.
-            assert spy.interrupted.wait(_WAIT_S)
-        return real_check(self, *args)
-
-    def interrupt(self: z3.Context) -> None:
-        real_interrupt(self)  # sent first, then signalled (AUDIT-16 #2)
-        spy.interrupted.set()
-
-    monkeypatch.setattr(z3.Solver, "check", check)
-    monkeypatch.setattr(z3.Context, "interrupt", interrupt)
-    return spy
+# Checks run in worker processes (ADR 0009). A cancel kills the check's worker, so
+# where in the check it lands does not matter: these tests wait until the check is
+# attached to its worker, then assert how it ended and that the worker is gone.
 
 
 class _Undecidable:
-    """An entailment check only an interrupt ends before `_HANG_S`; records how it ended."""
+    """An entailment check only a cancel ends before `_HANG_S`; records how it ended."""
 
     def __init__(self) -> None:
         self.outcome: solver_mod.SolverOutcome | None = None
@@ -373,48 +343,54 @@ class _Undecidable:
             self.done.set()
 
 
-async def test_cancelling_a_caller_interrupts_its_z3_context(
-    make_executor: ExecutorFactory, z3_spy: _Z3Spy
-) -> None:
+async def attached_worker(executor: SolverExecutor) -> solver_workers.Worker:
+    """The worker of the executor's running check, once its request has been sent."""
+    deadline = time.monotonic() + _WAIT_S
+    while time.monotonic() < deadline:
+        for interrupt in list(executor._running):
+            target = interrupt._target
+            if isinstance(target, solver_workers.Worker) and target._ready:
+                return target
+        await asyncio.sleep(0.005)
+    raise AssertionError("no check attached to a worker")
+
+
+async def test_cancelling_a_caller_kills_its_worker(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     check = _Undecidable()
     task = asyncio.create_task(executor.run(check))
-    # The spy signals just before `Solver.check()` starts, where Z3 drops an interrupt.
-    assert await asyncio.to_thread(z3_spy.entailing.wait, _WAIT_S)
+    worker = await attached_worker(executor)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert await asyncio.to_thread(check.done.wait, _WAIT_S)
-    assert z3_spy.interrupted.is_set()
-    assert check.outcome is not None
-    assert check.outcome.details == "interrupted"
-    assert check.elapsed_s < _WAIT_S
+    assert check.outcome == solver_mod._INTERRUPTED
+    assert check.elapsed_s < _HANG_S / 2
+    assert not worker.alive()
     assert (await executor.run(lambda: "free"))[0] == "free"
 
 
-async def test_shutdown_interrupts_the_running_z3_context(
-    make_executor: ExecutorFactory, z3_spy: _Z3Spy
-) -> None:
+async def test_shutdown_kills_the_running_worker(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     check = _Undecidable()
     task = asyncio.create_task(executor.run(check))
-    assert await asyncio.to_thread(z3_spy.entailing.wait, _WAIT_S)
+    worker = await attached_worker(executor)
     await asyncio.to_thread(executor.shutdown)
-    assert z3_spy.interrupted.is_set()
     outcome, _ = await task
     assert (outcome.verdict, outcome.reason, outcome.details) == (
         "UNGROUNDED",
         "timeout",
         "interrupted",
     )
-    assert check.elapsed_s < _WAIT_S
+    assert check.elapsed_s < _HANG_S / 2
+    assert not worker.alive()
 
 
 async def test_cancel_during_a_check_returns_it_promptly(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     check = _Undecidable()
     task = asyncio.create_task(executor.run(check))
-    await asyncio.sleep(0.2)  # well inside the entailment check; no spy widens a window
+    await asyncio.sleep(0.2)  # well inside the entailment check
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -437,31 +413,67 @@ async def test_interrupt_never_reaches_a_later_check(make_executor: ExecutorFact
     assert result.consistency_score == 1.0
 
 
-async def test_a_parse_cut_short_by_a_cancel_is_not_a_formalization_failure(
-    make_executor: ExecutorFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def cancelled_parse(self: z3.Solver, s: str) -> None:
-        solver_mod._worker.interrupt.request()
-        raise z3.Z3Exception("canceled")
+def test_a_check_past_its_timeout_and_grace_is_killed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No grace and no time: the parent stops waiting at once and kills the worker.
+    monkeypatch.setattr(solver_mod, "_grace_s", lambda timeout_s: -timeout_s)
+    pool = solver_mod._workers()
+    seen: list[solver_workers.Worker] = []
+    real_call = solver_workers.Worker.call
 
-    monkeypatch.setattr(z3.Solver, "from_string", cancelled_parse)
-    executor = make_executor(1)
+    def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        seen.append(worker)
+        assert budget_s == 0
+        return real_call(worker, args, budget_s)
+
+    monkeypatch.setattr(solver_workers.Worker, "call", call)
+    out = Z3Solver(_HANG_S).check_entailment([SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES))
+    assert out == solver_mod._KILLED
+    assert out.verdict == "UNGROUNDED"
+    assert not seen[0].alive()
+    assert seen[0] not in pool._idle
+
+
+def test_a_check_whose_worker_dies_is_never_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The worker dies after the request is sent; the claim is entailed, so only a reply
+    # that never came could have made it VALID.
+    real_call = solver_workers.Worker.call
+
+    def dying(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        worker.process.kill()
+        worker.process.join()
+        return real_call(worker, args, budget_s)
+
+    monkeypatch.setattr(solver_workers.Worker, "call", dying)
     decls = "(declare-const p Bool)"
-    check = partial(Z3Solver().check_entailment, [SmtFormula(decls, "p")], SmtFormula(decls, "p"))
-    outcome, _ = await executor.run(check)
-    assert outcome.details == "interrupted"
+    out = Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
+    assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
+
+
+def test_a_check_that_raises_in_its_worker_raises_in_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        return (False, "Z3Exception: model is not available")
+
+    monkeypatch.setattr(solver_workers.Worker, "call", failing)
+    decls = "(declare-const p Bool)"
+    with pytest.raises(solver_mod.SolverWorkerError, match="model is not available"):
+        Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "q"))
 
 
 def test_each_check_starts_from_default_global_parameters() -> None:
     decls = "(declare-const p Bool)\n(declare-const q Bool)"
+    premises, claim = (
+        [SmtFormula(decls, "p"), SmtFormula(decls, "(=> p q)")],
+        SmtFormula(decls, "q"),
+    )
     z3.set_param("rlimit", 1)  # what a `(set-option :rlimit 1)` parsed anywhere would leave
     try:
-        out = Z3Solver().check_entailment(
-            [SmtFormula(decls, "p"), SmtFormula(decls, "(=> p q)")], SmtFormula(decls, "q")
-        )
+        here = Z3Solver()._check_here(premises, claim)  # the worker's own process
     finally:
         z3.reset_params()
-    assert out.verdict == "VALID"
+    assert here.verdict == "VALID"
+    assert Z3Solver().check_entailment(premises, claim).verdict == "VALID"
 
 
 def test_no_entailment_check_starts_without_the_time_the_consistency_check_took(
@@ -478,7 +490,7 @@ def test_no_entailment_check_starts_without_the_time_the_consistency_check_took(
 
     monkeypatch.setattr(z3.Solver, "check", slow_check)
     decls = "(declare-const p Bool)"
-    out = Z3Solver(0.2).check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
+    out = Z3Solver(0.2)._check_here([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
     assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
     assert out.details == "too little time left for the entailment check"
     assert calls == [1]
@@ -490,7 +502,7 @@ def test_counter_model_does_not_use_the_shared_printer(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(z3.z3printer.PP, "__call__", printer)
     decls = "(declare-const p Bool)\n(declare-const q Bool)"
-    out = Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "q"))
+    out = Z3Solver()._check_here([SmtFormula(decls, "p")], SmtFormula(decls, "q"))
     assert out.verdict == "INVALID"
     assert "define-fun q" in out.counter_model
 
