@@ -9,12 +9,16 @@ INVALID with reason `premises_inconsistent`. Then Z3 is asked about
 UNGROUNDED.
 
 Checks run on `SolverExecutor`, a bounded thread pool separate from asyncio's
-default executor (AUDIT-2 #1). Cancelling a caller interrupts its Z3 check.
+default executor (AUDIT-2 #1). z3py drops the GIL around every C call, so
+checks on several threads convoy on it; the default pool is small (AUDIT-10 #1).
+Cancelling a caller interrupts its Z3 check, including one that has not
+started yet (AUDIT-12 #2).
 
-Inputs are SMT-LIB 2 strings, parsed via `z3.parse_smt2_string` so the
+Inputs are SMT-LIB 2 strings, parsed by `Solver.from_string` so the
 boundary between LLM-produced text and Z3's AST is explicit. Every check
-runs in a fresh `z3.Context`, so checks are safe to run on worker threads,
-and both checks share one `timeout_seconds` deadline.
+runs in a fresh `z3.Context`, created from default global parameters, so
+checks are safe to run on worker threads, and both checks share one
+`timeout_seconds` deadline.
 """
 
 from __future__ import annotations
@@ -35,8 +39,12 @@ from autolab.config import SOLVER_TIMEOUT_S
 from autolab.state.models import StepReason, Verdict
 
 _MS_PER_S: Final[int] = 1000
-SOLVER_WORKERS: Final[int] = min(32, (os.cpu_count() or 1) + 4)
-"""Default size of the Z3 pool (asyncio's default-executor formula)."""
+SOLVER_WORKERS: Final[int] = min(2, os.cpu_count() or 1)
+"""Default size of the Z3 pool; more threads only contend for the GIL (AUDIT-10 #1)."""
+_NEGATED_CLAIM: Final[str] = "claim!"
+"""Not a plain identifier, so no formalized step can declare it."""
+_REARM_S: Final[float] = 0.005
+"""How often a requested interrupt is re-sent: Z3 drops one sent outside `Solver.check()`."""
 
 T = TypeVar("T")
 
@@ -91,26 +99,38 @@ class Z3Solver:
             )
 
         deadline = time.monotonic() + self.timeout_seconds
+        z3.reset_params()  # the context below starts from default parameters (AUDIT-9 #2)
         ctx = z3.Context()
-        interrupt: _Interrupt | None = getattr(_worker, "interrupt", None)
-        if interrupt is not None and not interrupt.attach(ctx):
-            return SolverOutcome(verdict="UNGROUNDED", reason="timeout", details="interrupted")
-        smt = _build_smt2(premises, claim)
+        interrupt: _Interrupt = getattr(_worker, "interrupt", None) or _Interrupt()
+        if not interrupt.attach(ctx):
+            return _INTERRUPTED
         try:
-            assertions = z3.parse_smt2_string(smt, ctx=ctx)
+            return self._check(premises, claim, ctx, deadline, interrupt)
+        finally:
+            interrupt.detach()
+
+    def _check(
+        self,
+        premises: list[SmtFormula],
+        claim: SmtFormula,
+        ctx: z3.Context,
+        deadline: float,
+        interrupt: _Interrupt,
+    ) -> SolverOutcome:
+        solver = z3.Solver(ctx=ctx)
+        try:
+            # One C call; asserting the parsed AstVector item by item costs a GIL
+            # hand-off per call (AUDIT-10 #1).
+            solver.from_string(_build_smt2(premises, claim))
         except z3.Z3Exception as exc:
+            if interrupt.requested():
+                return _INTERRUPTED
             return SolverOutcome(
                 verdict="UNGROUNDED",
                 reason="formalization_failed",
                 details=f"SMT parse error: {exc}",
             )
-
-        solver = z3.Solver(ctx=ctx)
         solver.set("timeout", _remaining_ms(deadline))
-        # The negated claim is always the last assertion `_build_smt2` emits.
-        negated_claim = assertions[len(assertions) - 1]
-        for i in range(len(assertions) - 1):
-            solver.add(assertions[i])
         consistency = solver.check()
         if consistency == z3.unsat:
             return SolverOutcome(
@@ -118,32 +138,29 @@ class Z3Solver:
                 reason="premises_inconsistent",
                 details="premises are mutually unsatisfiable",
             )
-        if consistency != z3.sat:
-            return SolverOutcome(
-                verdict="UNGROUNDED",
-                reason="timeout",
-                details=f"premise consistency check returned {consistency}",
-            )
-        solver.add(negated_claim)
-        solver.set("timeout", _remaining_ms(deadline))
-        result = solver.check()
-        if result == z3.unsat:
-            return SolverOutcome(
-                verdict="VALID", reason="entailed", details="premises entail claim"
-            )
-        if result == z3.sat:
-            model = solver.model()
-            return SolverOutcome(
-                verdict="INVALID",
-                reason="not_entailed",
-                details="premises do not entail claim",
-                counter_model=str(model),
-            )
-        return SolverOutcome(
-            verdict="UNGROUNDED",
-            reason="timeout",
-            details=f"solver returned {result}",
-        )
+        details = f"premise consistency check returned {consistency}"
+        if consistency == z3.sat:
+            solver.set("timeout", _remaining_ms(deadline))
+            result = solver.check(z3.Bool(_NEGATED_CLAIM, ctx))
+            if result == z3.unsat:
+                return SolverOutcome(
+                    verdict="VALID", reason="entailed", details="premises entail claim"
+                )
+            if result == z3.sat:
+                return SolverOutcome(
+                    verdict="INVALID",
+                    reason="not_entailed",
+                    details="premises do not entail claim",
+                    # `sexpr` is formatted in C; z3py's printer keeps global state (AUDIT-10 #5).
+                    counter_model=solver.model().sexpr(),
+                )
+            details = f"solver returned {result}"
+        if interrupt.requested():
+            return _INTERRUPTED
+        return SolverOutcome(verdict="UNGROUNDED", reason="timeout", details=details)
+
+
+_INTERRUPTED: Final = SolverOutcome(verdict="UNGROUNDED", reason="timeout", details="interrupted")
 
 
 def _remaining_ms(deadline: float) -> int:
@@ -154,8 +171,10 @@ def _remaining_ms(deadline: float) -> int:
 def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:
     """Compose a single SMT-LIB 2 document from premises + negated claim.
 
-    Declarations are deduplicated line-by-line so identical declares across
-    premises don't conflict. Order is preserved (first occurrence wins).
+    The negated claim is named by `_NEGATED_CLAIM`, so it holds only when
+    checked as an assumption. Declarations are deduplicated line-by-line so
+    identical declares across premises don't conflict. Order is preserved
+    (first occurrence wins).
     """
     seen: set[str] = set()
     decls: list[str] = []
@@ -170,7 +189,8 @@ def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:
     parts: list[str] = [*decls]
     for p in premises:
         parts.append(_wrap_assert(p.assertion))
-    parts.append(f"(assert (not {claim.assertion}))")
+    parts.append(f"(declare-const {_NEGATED_CLAIM} Bool)")
+    parts.append(f"(assert (= {_NEGATED_CLAIM} (not {claim.assertion})))")
     return "\n".join(parts)
 
 
@@ -182,25 +202,53 @@ def _wrap_assert(body: str) -> str:
 
 
 class _Interrupt:
-    """Lets the event loop stop the Z3 check running on one worker thread."""
+    """Lets the event loop stop the Z3 check running on one worker thread.
+
+    Z3 ignores `Context.interrupt()` while no `Solver.check()` runs, so once
+    requested the interrupt is re-sent every `_REARM_S` until the check ends.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ctx: z3.Context | None = None
         self._requested = False
+        self._detached = threading.Event()
+
+    def requested(self) -> bool:
+        """Whether an interrupt has been requested."""
+        return self._requested
 
     def request(self) -> None:
-        """Interrupt the attached context now, or the next one attached."""
+        """Interrupt the attached context until it is detached, or refuse the next attach."""
         with self._lock:
+            if self._requested:
+                return
             self._requested = True
-            if self._ctx is not None:
-                self._ctx.interrupt()
+            if self._ctx is None:
+                return
+            self._ctx.interrupt()
+        threading.Thread(target=self._rearm, name="z3-interrupt", daemon=True).start()
 
     def attach(self, ctx: z3.Context) -> bool:
-        """Attach `ctx`; False if an interrupt was already requested."""
+        """Attach `ctx`; False, attaching nothing, if an interrupt was already requested."""
         with self._lock:
+            if self._requested:
+                return False
             self._ctx = ctx
-            return not self._requested
+            self._detached.clear()
+            return True
+
+    def detach(self) -> None:
+        """Detach the context; no interrupt reaches it afterwards."""
+        with self._lock:
+            self._ctx = None
+        self._detached.set()
+
+    def _rearm(self) -> None:
+        while not self._detached.wait(_REARM_S):
+            with self._lock:
+                if self._ctx is not None:
+                    self._ctx.interrupt()
 
 
 _worker = threading.local()
