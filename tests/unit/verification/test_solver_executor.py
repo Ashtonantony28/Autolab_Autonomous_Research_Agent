@@ -93,16 +93,14 @@ async def test_default_pool_stays_responsive_under_fifty_slow_checks(
 async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     executor.slow_workers = 0  # every check holds the only slot, so the others queue
-    built = [pathological() for _ in range(4)]
-    started = time.perf_counter()
-    results = await asyncio.gather(
-        *(
-            Verifier(f, solver_timeout_seconds=_SLOW_S, solver_executor=executor).verify(t)
-            for t, f in built
-        )
+    # Fresh callers with no short check behind them, so no stuck slot lends them a place.
+    hard = partial(
+        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
+    started = time.perf_counter()
+    results = await asyncio.gather(*(executor.run(hard) for _ in range(4)))
     wall_ms = (time.perf_counter() - started) * 1000
-    slow = [r.step_verdicts[-1].solver_ms for r in results]
+    slow = [ms for _, ms in results]
     assert wall_ms >= 4 * _SLOW_S * 1000  # one worker: the checks queued
     assert all(_SLOW_S * 1000 * 0.9 <= ms < (_SLOW_S + _SLACK_S) * 1000 for ms in slow)
 

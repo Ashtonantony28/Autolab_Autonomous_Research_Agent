@@ -13,8 +13,11 @@ default executor (AUDIT-2 #1). z3py drops the GIL around every C call, so
 checks on several threads convoy on it; the default pool is small (AUDIT-10 #1).
 A check still in Z3 after `_SLICE_S` waits on Z3, not on the GIL, so it gives
 its slot to the next caller and runs on as one of at most `slow_workers` slow
-checks: hard runs cannot starve easy ones (AUDIT-14 #2). Cancelling a caller
-interrupts its Z3 check, including one that has not started yet (AUDIT-12 #2).
+checks: hard runs cannot starve easy ones (AUDIT-14 #2). With no slow room
+left, its slot still admits a caller whose last check was short (AUDIT-18 #4).
+The pool starts a thread for every admitted check that finds none idle
+(AUDIT-18 #2). Cancelling a caller interrupts its Z3 check, including one that
+has not started yet (AUDIT-12 #2).
 
 Inputs are SMT-LIB 2 strings, parsed by `Solver.from_string` so the
 boundary between LLM-produced text and Z3's AST is explicit. Every check
@@ -27,13 +30,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import threading
 import time
 import weakref
+from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Final, TypeVar
+from typing import Any, Final, TypeVar
 
 import z3
 
@@ -41,12 +46,30 @@ from autolab.config import SOLVER_TIMEOUT_S
 from autolab.state.models import StepReason, Verdict
 
 _MS_PER_S: Final[int] = 1000
-SOLVER_WORKERS: Final[int] = min(2, os.cpu_count() or 1)
+
+
+def _available_cpus() -> int:
+    """CPUs this process may run on: its affinity where known, not the host's count."""
+    process_cpu_count: Callable[[], int | None] | None = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        return process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1  # pragma: no cover - platforms without affinity
+
+
+_CPUS: Final[int] = _available_cpus()
+SOLVER_WORKERS: Final[int] = min(2, _CPUS)
 """Default size of the Z3 pool; more threads only contend for the GIL (AUDIT-10 #1)."""
-SOLVER_SLOW_WORKERS: Final[int] = min(32, (os.cpu_count() or 1) + 4)
-"""Default number of long checks that may run beside the pool's own slots (AUDIT-14 #2)."""
+SOLVER_SLOW_WORKERS: Final[int] = max(0, _CPUS - SOLVER_WORKERS)
+"""Default number of long checks that may run beside the pool's own slots (AUDIT-14 #2).
+Long checks are CPU-bound and timeouts are wall-clock, so slots and slow checks
+together do not outnumber the CPUs (AUDIT-18 #5)."""
 _SLICE_S: Final[float] = 0.05
 """How long a Z3 check holds its slot before it runs on as a slow check."""
+_HARD_SLICES: Final[int] = 4
+"""A caller whose last check ran this many slices loses its priority and lent places;
+an easy check slowed by load stays well under it (AUDIT-18 #4)."""
 _SETUP_SHARE: Final[float] = 0.5
 """Z3 sets up the entailment check, without polling its limit, in up to this share of
 the time the consistency check took; with less time left the check is not started."""
@@ -272,14 +295,178 @@ class _Interrupt:
 _worker = threading.local()
 
 
+class _Job:
+    """One call submitted to `_Pool`."""
+
+    __slots__ = ("args", "fn", "future")
+
+    def __init__(self, fn: Callable[..., Any], args: tuple[Any, ...]) -> None:
+        self.future: Future[Any] = Future()
+        self.fn = fn
+        self.args = args
+
+    def run(self) -> None:
+        if not self.future.set_running_or_notify_cancel():
+            return
+        try:
+            result = self.fn(*self.args)
+        except BaseException as exc:  # handed to the caller, as `ThreadPoolExecutor` does
+            self.future.set_exception(exc)
+        else:
+            self.future.set_result(result)
+
+
+class _Pool:
+    """Worker threads for `SolverExecutor`, at most `_max_workers` of them.
+
+    Under one lock, every submitted call is matched with an idle thread, a new
+    thread, or, at the limit, the next thread to finish a call. So a call never
+    waits for a thread while one is idle or the limit allows another (AUDIT-18 #2).
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        self._lock = threading.Lock()
+        self._work_queue: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
+        self._threads: set[threading.Thread] = set()
+        self._idle = 0
+        self._unclaimed = 0
+        self._shutdown = False
+
+    def submit(self, fn: Callable[..., T], /, *args: Any) -> Future[T]:
+        """Run `fn(*args)` on a worker thread; RuntimeError after `shutdown`."""
+        job = _Job(fn, args)
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._work_queue.put(job)
+            self._unclaimed += 1
+            self._claim()
+        return job.future
+
+    def resize(self, delta: int) -> None:
+        """Move the thread limit by `delta`; a raised limit starts threads for queued calls."""
+        with self._lock:
+            self._max_workers += delta
+            self._claim()
+
+    def shutdown(self) -> None:
+        """Refuse new calls, let queued ones run, and join every thread."""
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+            for _ in threads:
+                self._work_queue.put(None)
+        for thread in threads:
+            thread.join()
+
+    def _claim(self) -> None:
+        while self._unclaimed and self._idle:
+            self._unclaimed -= 1
+            self._idle -= 1
+        while self._unclaimed and len(self._threads) < self._max_workers:
+            self._unclaimed -= 1
+            thread = threading.Thread(target=self._work, name="z3", daemon=True)
+            self._threads.add(thread)
+            thread.start()
+
+    def _work(self) -> None:
+        while (job := self._work_queue.get()) is not None:
+            job.run()
+            del job
+            if not self._next():
+                return
+
+    def _next(self) -> bool:
+        """After a call: take an unclaimed one or count as idle; False ends the thread."""
+        with self._lock:
+            if self._unclaimed:
+                self._unclaimed -= 1
+                return True
+            if len(self._threads) > self._max_workers:
+                self._threads.discard(threading.current_thread())
+                return False
+            self._idle += 1
+            return True
+
+
+class _Slots:
+    """Admission for one event loop: `workers` slots, granted in FIFO order, callers
+    whose last check ended within its slice first.
+
+    A slot whose Z3 check is stuck (past `_SLICE_S` with no slow room) also lends
+    a place to one caller whose last check ended within its slice, so easy runs
+    keep moving however many hard runs there are (AUDIT-18 #4).
+    """
+
+    def __init__(self, workers: int) -> None:
+        self.workers = workers
+        self.held = 0
+        self.stuck = 0
+        self.lent = 0
+        self._waiters: deque[tuple[asyncio.Future[bool], bool]] = deque()
+
+    async def acquire(self, short: bool) -> bool:
+        """Wait for a place; True if a stuck slot lent it."""
+        lent = self._grant(short)
+        if lent is not None:
+            return lent
+        waiter: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        entry = (waiter, short)
+        self._waiters.append(entry)
+        try:
+            return await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                self.release(waiter.result())
+            else:
+                self._waiters.remove(entry)
+            raise
+
+    def release(self, lent: bool) -> None:
+        if lent:
+            self.lent -= 1
+        else:
+            self.held -= 1
+        self._wake()
+
+    def stick(self) -> None:
+        self.stuck += 1
+        self._wake()
+
+    def unstick(self) -> None:
+        self.stuck -= 1
+
+    def _grant(self, short: bool) -> bool | None:
+        if self.held < self.workers:
+            self.held += 1
+            return False
+        if short and self.lent < self.stuck:
+            self.lent += 1
+            return True
+        return None
+
+    def _wake(self) -> None:
+        # Short callers first: a free slot goes to a hard run only when no easy one waits.
+        for entry in sorted(self._waiters, key=lambda e: not e[1]):
+            waiter, short = entry
+            if waiter.done():  # cancelled; its caller removes it
+                continue
+            lent = self._grant(short)
+            if lent is not None:
+                self._waiters.remove(entry)
+                waiter.set_result(lent)
+
+
 class SolverExecutor:
     """A bounded thread pool for Z3 checks, separate from asyncio's default executor.
 
     At most `workers` checks hold a slot at once; other callers wait as
-    coroutines on a per-loop semaphore. A Z3 check still running after
+    coroutines on a per-loop `_Slots`. A Z3 check still running after
     `_SLICE_S` frees its slot while fewer than `slow_workers` checks have done
-    so; the pool may then start a thread for the next caller. Cancelling a
-    caller interrupts its check.
+    so; otherwise its slot lends a place to callers whose last check was short.
+    The pool starts a thread for each such check. Cancelling a caller
+    interrupts its check.
     """
 
     def __init__(
@@ -287,27 +474,41 @@ class SolverExecutor:
     ) -> None:
         self.workers = workers
         self.slow_workers = slow_workers
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="z3")
+        self._pool = _Pool(workers)
         self._slow = 0
+        self._closed = False
         self._lock = threading.Lock()
-        self._slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+        self._slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _Slots] = (
             weakref.WeakKeyDictionary()
         )
         self._running: set[_Interrupt] = set()
+        self._short: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
 
     async def run(self, fn: Callable[[], T]) -> tuple[T, float]:
         """Run `fn` on the pool; return its result and its run time in ms, queueing excluded."""
-        slot = self._slot()
-        await slot.acquire()
-        slow = False
+        slots = self._slot()
+        task = asyncio.current_task()
+        with self._lock:
+            short = task in self._short
+        lent = await slots.acquire(short)
+        slow = stuck = False
+        slices = 0
         try:
+            if lent:
+                self._pool.resize(1)
             interrupt = _Interrupt()
             future = asyncio.wrap_future(self._pool.submit(self._call, fn, interrupt))
             try:
                 while not slow and not (await asyncio.wait((future,), timeout=_SLICE_S))[0]:
+                    slices += 1
                     slow = self._to_slow(interrupt)
-                if slow:
-                    slot.release()
+                    if slow:
+                        if stuck:
+                            slots.unstick()
+                        slots.release(lent)
+                    elif not (stuck or lent) and interrupt.attached():
+                        stuck = True
+                        slots.stick()
                 return await future
             except asyncio.CancelledError:
                 future.cancel()
@@ -317,9 +518,19 @@ class SolverExecutor:
             if slow:
                 with self._lock:
                     self._slow -= 1
-                    self._pool._max_workers -= 1
+                self._pool.resize(-1)
             else:
-                slot.release()
+                if stuck:
+                    slots.unstick()
+                slots.release(lent)
+            if lent:
+                self._pool.resize(-1)
+            if task is not None:
+                with self._lock:
+                    if slices >= _HARD_SLICES:
+                        self._short.discard(task)
+                    else:
+                        self._short.add(task)
 
     def _to_slow(self, interrupt: _Interrupt) -> bool:
         """Count a running Z3 check as slow if there is room; False leaves it in its slot."""
@@ -327,29 +538,37 @@ class SolverExecutor:
             if self._slow >= self.slow_workers or not interrupt.attached():
                 return False
             self._slow += 1
-            # Room for one more thread, so the next caller does not wait for this check.
-            self._pool._max_workers += 1
+            # A thread for the next caller, so it does not wait for this check.
+            self._pool.resize(1)
             return True
 
     def shutdown(self) -> None:
-        """Interrupt running checks, drop queued ones and join the worker threads."""
+        """Interrupt running and queued checks and join the worker threads.
+
+        Queued calls still run, so their callers get a result, not a cancellation
+        (AUDIT-6 #7); a Z3 check among them returns at once as interrupted. Later
+        calls raise RuntimeError.
+        """
         with self._lock:
+            self._closed = True
             running = list(self._running)
         for interrupt in running:
             interrupt.request()
-        self._pool.shutdown(wait=True, cancel_futures=True)
+        self._pool.shutdown()
 
-    def _slot(self) -> asyncio.Semaphore:
+    def _slot(self) -> _Slots:
         loop = asyncio.get_running_loop()
         with self._lock:
-            slot = self._slots.get(loop)
-            if slot is None:
-                slot = self._slots[loop] = asyncio.Semaphore(self.workers)
-            return slot
+            slots = self._slots.get(loop)
+            if slots is None:
+                slots = self._slots[loop] = _Slots(self.workers)
+            return slots
 
     def _call(self, fn: Callable[[], T], interrupt: _Interrupt) -> tuple[T, float]:
         with self._lock:
             self._running.add(interrupt)
+            if self._closed:
+                interrupt.request()
         _worker.interrupt = interrupt
         started = time.perf_counter()
         try:

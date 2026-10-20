@@ -63,14 +63,49 @@ def _phases_s(premises: list[SmtFormula], claim: SmtFormula) -> tuple[float, flo
     return min(until), min(entail)
 
 
+_TIMEOUT_SHARE: Final = 3.0
+"""The timeout of `_timeout_case`, in multiples of the time until its entailment check
+starts (~0.5 s here). That check runs ~11 s; on the assumption path its unpolled phase
+alone takes ~10x the consistency check, so the bounds scale with the machine."""
+
+_HOLES: Final = 9
+
+
+def _pigeonhole(holes: int) -> tuple[str, str]:
+    """Declarations and formula of `holes + 1` pigeons in `holes` holes: unsat, slow to refute."""
+    pigeons = range(holes + 1)
+    decls = "\n".join(f"(declare-const q{p}_{h} Bool)" for p in pigeons for h in range(holes))
+    each = [f"(or {' '.join(f'q{p}_{h}' for h in range(holes))})" for p in pigeons]
+    apart = [
+        f"(not (and q{p}_{h} q{r}_{h}))"
+        for h in range(holes)
+        for p in pigeons
+        for r in range(p + 1, holes + 1)
+    ]
+    return decls, f"(and {' '.join(each + apart)})"
+
+
+def _timeout_case() -> tuple[list[SmtFormula], SmtFormula, float]:
+    """`lia_chain(_POOL)` with a claim whose entailment check runs past its timeout.
+
+    The claim `b0 > 0 or not PHP` is entailed, and Z3 must refute the pigeonhole
+    formula to see it. Its consistency check is the chain's, measured here, so the
+    `_SETUP_SHARE` guard lets the entailment check start (AUDIT-20 #3); that check polls the limit
+    once set up, so the deadline lands inside it. On the assumption path the check
+    first spends ~5 s in a phase Z3 does not interrupt.
+    """
+    premises, claim = lia_chain(_POOL)
+    decls, php = _pigeonhole(_HOLES)
+    hard = SmtFormula(f"{claim.declarations}\n{decls}", f"(or {claim.assertion} (not {php}))")
+    until_s, _ = _phases_s(premises, claim)
+    return premises, hard, _TIMEOUT_SHARE * until_s
+
+
 @pytest.mark.perf
 def test_a_check_returns_within_its_timeout() -> None:
     # The pre-SG19 add-based check honours the timeout; checking `claim!` as an assumption
-    # runs into a phase Z3 does not interrupt, and returns `timeout` after ~4x the timeout.
-    # The deadline falls inside the entailment check, measured on this machine.
-    premises, claim = lia_chain(_POOL)
-    until_s, entail_s = _phases_s(premises, claim)
-    timeout_s = until_s + _INTO_ENTAILMENT * entail_s
+    # runs into a phase Z3 does not interrupt, and returns `timeout` after ~3x the timeout.
+    premises, claim, timeout_s = _timeout_case()
     reason, wall_s = timed_check(premises, claim, timeout_s)
     assert reason == "timeout"
     assert wall_s / timeout_s <= _OVERRUN_LIMIT

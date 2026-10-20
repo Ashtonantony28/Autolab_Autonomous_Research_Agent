@@ -239,9 +239,8 @@ def _sleep_on(executor: SolverExecutor, seconds: float) -> None:
     asyncio.run(one())
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #6")
 async def test_slot_hand_off_starts_a_thread_after_earlier_work() -> None:
-    executor = SolverExecutor(1)
+    executor = SolverExecutor(1, slow_workers=1)
     try:
         # Earlier work: two runs from two loops. The second queues behind the first on
         # the pool's one thread, so two items complete for one thread: two permits.
