@@ -232,7 +232,6 @@ async def test_named_prior_hypothesis_cannot_hide_a_contradiction() -> None:
 # takes far more, and the cost/duration pause (principle 7b) never fires.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #3")
 @pytest.mark.parametrize(
     "protocol",
     [

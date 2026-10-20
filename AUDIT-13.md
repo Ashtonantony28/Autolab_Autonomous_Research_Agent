@@ -161,6 +161,8 @@ rule to an allow-list. Refuse any number in the protocol that is followed (after
 optional hyphen or space) by an alphabetic token outside a list of lab units (mL, µL,
 °C, rpm, nm, mM, …), and send everything else to review.
 
+**Resolution (SG21).** `protocol_figures` is now a token scan, not one regex. It flags any currency symbol (Unicode category `Sc`, so `500$`, `US$`, `₹`), and any amount (digits, superscripts, fractions or a number word such as `four`) next to a time unit from milliseconds to years (`ms`, `s`, `min`, `h`, `d`, `wk`, `mo`, `yr`, `am`/`pm`, plurals and long forms), a currency word (`dollars`, `rupees`, `kr`, …) or an ISO 4217 code, on either side (`USD 500`, `day 14`), with spaces, hyphens, `_` or a `k`/`M`/`thousand` multiplier between them (`240-minute`, `12-hour`, `5k USD`, `500 US dollars`). It stays a rejection check: no figure is read into state. All six forms here are rejected and the repro is flipped with its assertions unchanged.
+
 ---
 
 ## Note on the builtin search (#1)
