@@ -80,17 +80,26 @@ class Worker:
         child.close()
         self._ready = False
 
+    def ready(self) -> bool:
+        """Wait until the worker has started; False if it died or took over `_BOOT_S`."""
+        try:
+            if not self._ready:
+                if not self.conn.poll(_BOOT_S):
+                    return False
+                self.conn.recv()
+                self._ready = True
+            return True
+        except (EOFError, OSError):  # killed, or died
+            return False
+
     def call(self, args: tuple[Any, ...], budget_s: float) -> Reply | None:
         """`target(*args)`'s reply, or None if the worker died or ran past `budget_s`.
 
         The budget starts once the worker is ready, so start-up never counts against it.
         """
         try:
-            if not self._ready:
-                if not self.conn.poll(_BOOT_S):
-                    return None
-                self.conn.recv()
-                self._ready = True
+            if not self.ready():
+                return None
             self.conn.send(args)
             if not self.conn.poll(budget_s):
                 return None
