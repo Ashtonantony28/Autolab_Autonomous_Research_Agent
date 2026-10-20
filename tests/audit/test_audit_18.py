@@ -49,7 +49,6 @@ class _ProbeLimit(Exception):
     pass
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #1")
 async def test_formalizing_a_wide_function_makes_a_bounded_number_of_parses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
