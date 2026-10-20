@@ -217,21 +217,32 @@ class Z3Solver:
         if interrupt.requested():
             return _INTERRUPTED
         pool = _workers()
+        setup = time.perf_counter()
         worker = pool.acquire()
         if not interrupt.attach(worker):
             pool.release(worker)
             return _INTERRUPTED
+        booted = worker.ready()
+        checking = time.perf_counter()
         try:
-            reply = worker.call(args, self.timeout_seconds + _grace_s(self.timeout_seconds))
+            budget_s = self.timeout_seconds + _grace_s(self.timeout_seconds)
+            reply = worker.call(args, budget_s) if booted else None
         except BaseException:  # e.g. a per-test timeout's signal: the worker is mid-check
             interrupt.detach()
             pool.discard(worker)
             raise
+        checked = time.perf_counter()
         interrupt.detach()
         if reply is None or interrupt.requested():
             pool.discard(worker)
         else:
             pool.release(worker)
+        # Starting, booting and replacing workers is not the check's own time (`solver_ms`).
+        _worker.overhead_s = (
+            getattr(_worker, "overhead_s", 0.0)
+            + (checking - setup)
+            + (time.perf_counter() - checked)
+        )
         if reply is None:
             return _INTERRUPTED if interrupt.requested() else _KILLED
         ok, value = reply
@@ -754,9 +765,11 @@ class SolverExecutor:
             if self._closed:
                 interrupt.request()
         _worker.interrupt = interrupt
+        _worker.overhead_s = 0.0
         started = time.perf_counter()
         try:
-            return fn(), (time.perf_counter() - started) * _MS_PER_S
+            result = fn()
+            return result, (time.perf_counter() - started - _worker.overhead_s) * _MS_PER_S
         finally:
             _worker.interrupt = None
             with self._lock:

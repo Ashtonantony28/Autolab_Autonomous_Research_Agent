@@ -106,6 +106,34 @@ async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> No
     assert all(_SLOW_S * 1000 * 0.9 <= ms < (_SLOW_S + _SLACK_S) * 1000 for ms in slow)
 
 
+async def test_solver_ms_excludes_worker_start_up(
+    make_executor: ExecutorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready, stop = solver_workers.Worker.ready, solver_workers.Worker.stop
+
+    def slow_boot(worker: solver_workers.Worker) -> bool:
+        if not worker._ready:
+            time.sleep(_SLACK_S)
+        return ready(worker)
+
+    def slow_stop(worker: solver_workers.Worker) -> None:
+        time.sleep(_SLACK_S)
+        stop(worker)
+
+    monkeypatch.setattr(solver_workers.Worker, "ready", slow_boot)
+    monkeypatch.setattr(solver_workers.Worker, "stop", slow_stop)
+    executor = make_executor(1)
+    quick = partial(
+        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, POSITIVE)
+    )
+    hard = partial(
+        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
+    )
+    (_, quick_ms), (_, hard_ms) = [await executor.run(check) for check in (quick, hard)]
+    assert quick_ms < _SLACK_S * 1000  # booting the worker is not counted
+    assert hard_ms < (_SLOW_S + _SLACK_S) * 1000  # nor is replacing the timed-out one
+
+
 @pytest.mark.perf
 async def test_backpressure_bounds_work_in_the_pool(make_executor: ExecutorFactory) -> None:
     executor = make_executor(2)
