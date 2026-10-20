@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import functools
+import itertools
 import json
+import pathlib
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import z3
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from pydantic import BaseModel
 
 from autolab.state.models import ClaimType, FormalizedStep, ReasoningStep, ReasoningTrace
+from autolab.verification import formalizer
 from autolab.verification.formalizer import (
     FormalizationError,
     Formalizer,
@@ -383,7 +390,7 @@ async def test_assertion_must_be_exactly_one_term(
 
 @pytest.mark.parametrize(
     "assertion",
-    ["p", "  (not p)\n", '(= s "a) (assert true")', '(= s "say ""hi""")', "(! p :named n)"],
+    ["p", "  (not p)\n", '(= s "a) (assert true")', '(= s "say ""hi""")', '(= s ":named")'],
 )
 async def test_single_term_assertions_are_accepted(assertion: str) -> None:
     step = _step(0)
@@ -432,3 +439,168 @@ def test_parse_context_is_per_thread_and_never_the_global_one() -> None:
     assert here is _parse_context()
     assert here is not other
     assert z3.main_ctx() not in (here, other)
+
+
+async def _formalize_all(
+    steps: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch | None = None
+) -> list[str | None]:
+    """Formalize (declarations, assertion) pairs in order; None for success, else the error."""
+    fake = FakeLLMClient()
+    f = Formalizer(fake)
+    out: list[str | None] = []
+    for i, (decls, assertion) in enumerate(steps):
+        step = _step(i)
+        fake.register(
+            "formalize",
+            prompt_for(step, f.vocabulary),
+            json.dumps({"declarations": decls, "assertion": assertion}),
+        )
+        try:
+            await f.formalize(step)
+        except FormalizationError as exc:
+            out.append(str(exc))
+        else:
+            out.append(None)
+    return out
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "(declare-fun equals (Int Int) Bool)",
+        "(declare-fun equals (Real Int Real) Bool)",
+        "(declare-fun equiv (Bool Bool) Bool)",
+        "(declare-fun if_then_else (Bool Int Int) Int)",
+        "(declare-fun if_then_else (Int Int Int) Int)",
+        "(declare-sort U 0)\n(declare-fun equals (U U) Bool)",
+    ],
+)
+def test_merge_rejects_builtins_applied_as_declared(decl: str) -> None:
+    # AUDIT-13 #1: Z3 resolves these only with arguments; Int and Real coerce.
+    with pytest.raises(FormalizationError, match="Z3 builtin"):
+        Vocabulary().merged(decl)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "(declare-fun equals (Int) Bool)",
+        "(declare-fun if_then_else (Bool Int) Int)",
+        "(declare-fun f (Real Real) Bool)",
+        "(declare-sort Box 2)",
+    ],
+)
+def test_merge_accepts_names_z3_does_not_resolve_at_the_declared_arity(decl: str) -> None:
+    Vocabulary().merged(decl)
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        "(! p :named false)",
+        "(! p :named pi)",
+        "(! p :named RNE)",
+        "(and q (! p :named n))",
+        "(forall ((x Int)) (! (> x 0) :pattern ((+ x 1))))",
+        "(! p :weight 1)",
+    ],
+)
+async def test_assertions_with_annotations_are_rejected(assertion: str) -> None:
+    # AUDIT-13 #2: `:named` would define a symbol for every later check.
+    (err,) = await _formalize_all([("(declare-const p Bool)\n(declare-const q Bool)", assertion)])
+    assert err is not None and "annotation" in err
+
+
+async def test_a_step_cannot_declare_a_name_an_earlier_step_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The structural half of AUDIT-13 #1: even a builtin the probes miss cannot be
+    # declared once a step has used it, so no earlier step changes meaning.
+    monkeypatch.setattr(formalizer, "_is_z3_builtin", lambda _name: False)
+    monkeypatch.setattr(formalizer, "_applied_builtin", lambda *_: False)
+    errors = await _formalize_all(
+        [
+            ("(declare-const a Real)", "(equals a 0.95)"),
+            ("(declare-fun equals (Real Real) Bool)", "(equals a 0.5)"),
+            ("(declare-const p Bool)", "(let ((t p)) t)"),
+            ("(declare-const t Bool)", "t"),
+            ("(declare-const s Bool)", "s"),
+        ]
+    )
+    assert errors[0] is None and errors[2] is None and errors[4] is None
+    for err in (errors[1], errors[3]):
+        assert err is not None and "meaning of an earlier step" in err
+
+
+async def test_a_step_may_reuse_its_own_and_earlier_declarations() -> None:
+    errors = await _formalize_all(
+        [
+            ("(declare-const p Bool)\n(declare-const q Bool)", "(and p q)"),
+            ("(declare-const p Bool)", "(not p)"),
+        ]
+    )
+    assert errors == [None, None]
+
+
+def test_formalize_prompt_states_what_is_rejected() -> None:
+    # AUDIT-15 #2.
+    text = prompt_for(_step(0), Vocabulary())
+    for rule in ("plain identifier", "builtin", "|quoted|", ";", "commands", "one Bool term", "!"):
+        assert rule in text
+
+
+# --- Every identifier in libz3 (AUDIT-13's search, as a property) ---------------
+
+_PROBE_SORTS = (
+    "Int", "Real", "Bool", "String", "(Seq Int)", "(Array Int Int)", "(_ BitVec 8)",
+    "(_ FloatingPoint 8 24)", "RoundingMode", "RegLan", "(Set Int)",
+)  # fmt: skip
+_SIGNATURES = tuple(
+    sig for k in range(4) for sig in itertools.combinations_with_replacement(_PROBE_SORTS[:4], k)
+)
+
+
+@functools.cache
+def _libz3_identifiers() -> list[str]:
+    lib = pathlib.Path(z3.__file__).parent / "lib" / "libz3.so"
+    raw = re.findall(rb"[A-Za-z_][A-Za-z0-9_]*", lib.read_bytes())
+    return sorted({m.decode() for m in raw if len(m) < 64})
+
+
+def _parse(smt: str) -> str:
+    try:
+        return str(z3.parse_smt2_string(smt, ctx=z3.Context()))
+    except z3.Z3Exception:
+        return "error"
+
+
+@settings(max_examples=150, deadline=None)
+@given(
+    name=st.deferred(lambda: st.sampled_from(_libz3_identifiers())),
+    sig=st.sampled_from(_SIGNATURES),
+    use_sort=st.sampled_from(_PROBE_SORTS),
+)
+@example(name="equals", sig=("Real", "Real"), use_sort="Real")
+@example(name="equals", sig=("Int", "Int"), use_sort="Real")
+@example(name="equiv", sig=("Bool", "Bool"), use_sort="Bool")
+@example(name="if_then_else", sig=("Bool", "Bool", "Bool"), use_sort="Bool")
+@example(name="sin", sig=("Real",), use_sort="Real")
+@example(name="false", sig=(), use_sort="Bool")
+@example(name="pi", sig=(), use_sort="Real")
+async def test_no_libz3_identifier_can_be_declared_or_named_over_a_builtin(
+    name: str, sig: tuple[str, ...], use_sort: str
+) -> None:
+    decl = f"(declare-fun {name} ({' '.join(sig)}) Bool)"
+    try:
+        Vocabulary().merged(decl)
+    except FormalizationError:
+        pass
+    else:
+        # Accepted: Z3 resolves no use of the name at the declared arity, whatever
+        # the argument sort, so the declaration takes nothing over.
+        args = " ".join(f"a{i}" for i in range(len(sig)))
+        consts = "".join(f"(declare-const a{i} {use_sort})" for i in range(len(sig)))
+        use = f"({name} {args})" if sig else name
+        assert _parse(f"{consts}(assert (= {use} {use}))") == "error"
+    (err,) = await _formalize_all([("(declare-const p Bool)", f"(! p :named {name})")])
+    assert err is not None

@@ -58,7 +58,6 @@ def _design(**update: object) -> ExperimentDesign:
 # --- #1 (high): code-built fact symbols break SG15's identifier rule --------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #1")
 async def test_a_design_with_a_unicode_parameter_name_can_be_verified() -> None:
     # `_param_symbol` keeps a name that is all `\w` (Unicode-aware), so
     # `volume_µL` becomes `param_volume_µL`, which `Vocabulary.merged` now
@@ -92,7 +91,6 @@ def _vocab(context: VerificationContext) -> Vocabulary:
     return Vocabulary({f.declarations.split()[1]: f.declarations for f in context.facts})
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #1")
 def test_measurement_fact_symbols_are_plain_identifiers() -> None:
     result = ExperimentResult(
         design_id=uuid4(), status="success", measurements=(Measurement(name=OD600, value=0.4),)
@@ -105,7 +103,6 @@ def test_measurement_fact_symbols_are_plain_identifiers() -> None:
 # --- #2 (medium): the formalize prompt does not state SG15's rules -----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #2")
 def test_formalize_prompt_states_the_identifier_and_single_term_rules() -> None:
     step = ReasoningStep(index=0, claim="the sample is hot", claim_type="premise")
     text = f"{SYSTEM_PROMPTS['formalize']}\n{prompt_for(step, Vocabulary())}".lower()
@@ -119,7 +116,6 @@ def test_formalize_prompt_states_the_identifier_and_single_term_rules() -> None:
 # --- #3 (medium): `protocol_figures` reads Svedberg units as durations -------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #3")
 @pytest.mark.parametrize(
     "protocol",
     ["Sequence the 16S rRNA gene", "Isolate 70S ribosomes", "Purify the 30S subunit"],
@@ -131,7 +127,6 @@ def test_svedberg_units_are_not_protocol_figures(protocol: str) -> None:
 # --- #4 (medium): a string parameter carries a cost into the bound claim -----
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #4")
 async def test_a_cost_stated_in_a_string_parameter_is_not_admitted() -> None:
     # SG17: cost and duration figures live only in the bound numeric fields.
     # A `str` parameter (allowed by DESIGN_REPLY) is named in `design_claim`

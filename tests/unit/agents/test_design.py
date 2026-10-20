@@ -1,10 +1,10 @@
-"""Design Agent: happy path, payload-field binding (SG12) and protocol figures (SG17)."""
+"""Design Agent: happy path, payload-field binding (SG12) and design figures (SG17, SG21)."""
 
 from __future__ import annotations
 
 import pytest
 
-from autolab.agents.common import design_claim, design_facts, protocol_figures
+from autolab.agents.common import design_claim, design_facts, design_figures, protocol_figures
 from autolab.agents.design import (
     DesignAgent,
     build_design_prompt,
@@ -13,6 +13,7 @@ from autolab.agents.design import (
 from autolab.orchestrator.checkpoints import cost_trigger
 from autolab.state.models import ExperimentDesign, ExperimentParameter, Hypothesis
 from autolab.state.schema import empty_state
+from autolab.verification.formalizer import Vocabulary
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.vericot import Verifier
 from tests.fixtures.agent_helpers import content, register_trace, register_trivial_trace
@@ -259,6 +260,35 @@ async def test_design_trace_stating_other_values_is_premises_inconsistent(stated
         "incubate 15 min",
         "culture for 3 days",
         "spin 1.5 hrs",
+        # SG21 (AUDIT-13 #3, AUDIT-16 #1): hyphens, every time unit, suffixes, symbols
+        # on either side, ISO codes and currency words.
+        "a 240-minute run",
+        "4-hour cycles",
+        "a 12\u2011hour soak",
+        "culture for 2 weeks",
+        "3 wk",
+        "3 months",
+        "0.5 d",
+        "for 1 yr",
+        "image at 40x, 2 ms exposure",
+        "2 more minutes",
+        "five hours",
+        "twenty-four hours",
+        "harvest on day 14",
+        "minutes: 240",
+        "5k USD",
+        "2M EUR",
+        "5 thousand Canadian dollars",
+        "500 US dollars",
+        "500$",
+        "US$ 500",
+        "USD500",
+        "U.S.D. 500",
+        "Rs. 500",
+        "40000 INR",
+        "500 SEK",
+        "₹40000",
+        "10³ USD",
     ],
 )
 def test_protocol_figures_flags_currency_and_durations(protocol: str) -> None:
@@ -273,8 +303,14 @@ def test_protocol_figures_flags_currency_and_durations(protocol: str) -> None:
         "dilute to 10 mM in 5 mL PBS",
         "read absorbance at 600 nm in a 96-well plate",
         "run 3 steps of the sweep at pH 7.4",
-        "image at 40x, 2 ms exposure, 1 Hz",
+        "image at 40x, 1 Hz",
         "liquid handler crystal sweep",
+        "Sequence the 16S rRNA gene",
+        "Isolate 70S ribosomes and the 30S subunit",
+        "add 2 mM NAD to 5 M NaCl",
+        "grow a 3D culture",
+        "run 2 MS scans",
+        "order 10 Eurofins primers",
     ],
 )
 def test_protocol_figures_allows_non_cost_non_duration_numbers(protocol: str) -> None:
@@ -283,6 +319,29 @@ def test_protocol_figures_allows_non_cost_non_duration_numbers(protocol: str) ->
 
 def test_design_prompt_tells_the_model_to_keep_figures_out_of_the_protocol() -> None:
     assert "estimated_cost_usd" in build_design_prompt(HYPOTHESIS)
+    assert "parameter" in build_design_prompt(HYPOTHESIS)
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        ExperimentParameter(name="reagent_budget", value="$500"),
+        ExperimentParameter(name="reagent", value="500", unit="USD"),
+        ExperimentParameter(name="incubation", value=240.0, unit="min"),
+        ExperimentParameter(name="budget_500_usd", value=1.0),
+    ],
+)
+def test_design_figures_cover_parameter_names_values_and_units(
+    parameter: ExperimentParameter,
+) -> None:
+    in_protocol, in_parameters = design_figures(
+        DESIGN.model_copy(update={"parameters": (parameter,)})
+    )
+    assert in_protocol == () and in_parameters
+
+
+def test_design_figures_allow_ordinary_parameters() -> None:
+    assert design_figures(SWEEP) == ((), ())
 
 
 async def test_design_whose_protocol_states_figures_is_escalated_not_admitted() -> None:
@@ -310,6 +369,31 @@ async def test_design_whose_protocol_states_figures_is_escalated_not_admitted() 
     assert content(update["hitl_payload"]["current_experiment"]) == content(priced)
 
 
+async def test_design_whose_parameter_states_a_cost_is_escalated_not_admitted() -> None:
+    priced = DESIGN.model_copy(
+        update={"parameters": (ExperimentParameter(name="reagent_budget", value="$500"),)}
+    )
+    fake = FakeLLMClient()
+    fake.register("design.experiment", build_design_prompt(HYPOTHESIS), priced.model_dump_json())
+    register_trivial_trace(
+        fake,
+        agent="design",
+        trace_purpose="design.trace",
+        trace_prompt=build_design_trace_prompt(HYPOTHESIS, priced),
+        conclusion=design_claim(priced),
+        facts=design_facts(priced),
+    )
+
+    update = await DesignAgent(verifier=Verifier(fake), llm=fake)(
+        {**empty_state("Q?"), "hypotheses": [HYPOTHESIS]}
+    )
+
+    assert update["confidence"] == 1.0
+    assert "current_experiment" not in update
+    assert update["hitl_pending"].reason.startswith("parameters state cost or duration figures")
+    assert "$500" in update["hitl_pending"].reason
+
+
 def test_parameter_symbols_are_injective() -> None:
     names = ["temp-C", "temp C", "temp_C", "temp.C"]
     design = SWEEP.model_copy(
@@ -322,3 +406,14 @@ def test_parameter_symbols_are_injective() -> None:
     decls = [f.declarations for f in design_facts(design)[2:]]
     assert len(set(decls)) == len(names)
     assert decls[2] == "(declare-const param_temp_C Real)"
+
+
+def test_parameter_fact_symbols_are_plain_identifiers_that_stay_distinct() -> None:
+    names = ["volume_µL", "volume_uL", "volume__L", "température", "OD₆₀₀", "OD600", "1x"]
+    design = SWEEP.model_copy(
+        update={"parameters": tuple(ExperimentParameter(name=n, value=1.0) for n in names)}
+    )
+    vocab = Vocabulary()
+    for fact in design_facts(design):
+        vocab = vocab.merged(fact.declarations)
+    assert len(vocab.declarations) == len(names) + 2

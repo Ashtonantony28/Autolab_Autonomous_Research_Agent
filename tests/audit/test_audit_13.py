@@ -62,8 +62,14 @@ def _register_steps(
             prompt_for(step, vocab),
             json.dumps({"declarations": decls, "assertion": assertion}),
         )
-        candidate = vocab.merged(decls)
-        z3.parse_smt2_string(f"{candidate.smt()}\n(assert {assertion})", ctx=z3.Context())
+        # As in the formalizer, a rejected step is not judged and does not extend the vocabulary.
+        if ":named" in assertion:
+            continue
+        try:
+            candidate = vocab.merged(decls)
+            z3.parse_smt2_string(f"{candidate.smt()}\n(assert {assertion})", ctx=z3.Context())
+        except (FormalizationError, z3.Z3Exception):
+            continue
         fake.register(
             "faithfulness",
             faithfulness_prompt(step, SmtFormula(candidate.smt(), assertion)),
@@ -107,7 +113,6 @@ ACTIVE = "Compound K-17 is active"
 # predicate (AUDIT-5 #1 / AUDIT-9 #1 again).
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #1")
 async def test_shadowed_equals_hides_a_premise_that_contradicts_a_measurement() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -142,7 +147,6 @@ async def test_shadowed_equals_hides_a_premise_that_contradicts_a_measurement() 
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #1")
 @pytest.mark.parametrize(
     "decl",
     [
@@ -164,7 +168,6 @@ def test_vocabulary_rejects_builtins_that_only_exist_with_arguments(decl: str) -
 # and the parse check see Z3's `false`; the checks see the premise's term.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #2")
 async def test_named_premise_cannot_redefine_false_for_later_steps() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -202,7 +205,6 @@ async def test_named_premise_cannot_redefine_false_for_later_steps() -> None:
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #2")
 async def test_named_prior_hypothesis_cannot_hide_a_contradiction() -> None:
     prior = Hypothesis(question=tg.QUESTION, statement=ACTIVE, rationale="r")
     new = Hypothesis(question=tg.QUESTION, statement="Compound K-17 is not active", rationale="r")
@@ -232,7 +234,6 @@ async def test_named_prior_hypothesis_cannot_hide_a_contradiction() -> None:
 # takes far more, and the cost/duration pause (principle 7b) never fires.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #3")
 @pytest.mark.parametrize(
     "protocol",
     [
