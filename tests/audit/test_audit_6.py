@@ -60,6 +60,9 @@ _LOCK_HOLD_S: Final = 5.5
 P = ParamSpec("P")
 T = TypeVar("T")
 
+P = ParamSpec("P")
+T = TypeVar("T")
+
 
 # --- #1 (critical): verifies on two threads crash the interpreter -------------
 
