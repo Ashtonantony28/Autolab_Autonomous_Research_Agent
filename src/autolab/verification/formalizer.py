@@ -5,6 +5,11 @@ trace: when step N is formalized, the symbol declarations from steps 1..N-1
 are passed in so the LLM keeps names consistent (CLAUDE.md §7 Pattern C).
 Re-declaring a symbol with a different signature is rejected.
 
+No step can change the meaning of a symbol it did not introduce (AUDIT-13 #1, #2):
+a declared name may not be a Z3 builtin, bare or applied to its declared
+argument sorts, nor a name an earlier step already used, and an assertion may
+not carry `!` annotations, whose `:named` would define a symbol for later checks.
+
 The LLM returns a `FormalizedStep` (via `LLMClient.call_structured`) whose
 `declarations` and `assertion` are SMT-LIB 2 strings. The vocabulary is only
 extended once the step's SMT parses, and a merge either applies fully or not
@@ -14,6 +19,7 @@ at all, so a rejected step never leaks symbols into later prompts.
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import re
 import threading
@@ -65,7 +71,8 @@ class Vocabulary:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             if not _IDENTIFIER.fullmatch(name):
                 raise FormalizationError(f"declared name {name!r} is not a plain identifier")
-            if _is_z3_builtin(name):
+            sorts = tuple(d for d in out.values() if d.startswith("(declare-sort"))
+            if _is_z3_builtin(name) or _applied_builtin(stripped, sorts):
                 raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
             existing = out.get(name)
             if existing is not None and existing != stripped:
@@ -91,6 +98,7 @@ class Formalizer:
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
         self.vocabulary = Vocabulary()
+        self._used: set[str] = set()
 
     async def formalize(self, step: ReasoningStep) -> SmtFormula:
         """Formalize `step` and, on success only, extend the vocabulary.
@@ -98,8 +106,9 @@ class Formalizer:
         Raises:
             FormalizationError: if the LLM refuses or returns no structured
                 output, if its output fails schema validation (including an
-                empty assertion), conflicts with the vocabulary, has an
-                assertion that is not exactly one term, or does not parse as SMT-LIB.
+                empty assertion), conflicts with the vocabulary, declares a
+                name an earlier step used, has an assertion that is not exactly
+                one term or carries a `!` annotation, or does not parse as SMT-LIB.
         """
         prompt = prompt_for(step, self.vocabulary)
         try:
@@ -112,7 +121,16 @@ class Formalizer:
 
         if not _is_single_term(out.assertion):
             raise FormalizationError(f"assertion of step {step.index} is not exactly one term")
+        tokens = _tokens(out.assertion)
+        if "!" in tokens or any(t.startswith(":") for t in tokens):
+            raise FormalizationError(f"assertion of step {step.index} has a `!` annotation")
         candidate = self.vocabulary.merged(out.declarations)
+        used = self._used | _tokens(self.vocabulary.smt())
+        for name in candidate.declarations.keys() - self.vocabulary.declarations.keys():
+            if name in used:
+                raise FormalizationError(
+                    f"declaration of {name!r} would change the meaning of an earlier step"
+                )
         full_decls = candidate.smt()
         try:
             z3.parse_smt2_string(f"{full_decls}\n(assert {out.assertion})", ctx=_parse_context())
@@ -120,6 +138,7 @@ class Formalizer:
             raise FormalizationError(f"invalid SMT for step {step.index}: {exc}") from exc
 
         self.vocabulary = candidate
+        self._used |= tokens
         return SmtFormula(declarations=full_decls, assertion=out.assertion)
 
 
@@ -153,6 +172,15 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
         "",
         "Existing vocabulary (do not re-declare these):",
         vocab.smt() or "(none)",
+        "",
+        "Rules (a step that breaks one fails formalization):",
+        "- Every declared name is a plain identifier [A-Za-z_][A-Za-z0-9_]*, never a "
+        "|quoted| symbol, and not an SMT-LIB reserved word or Z3 builtin, with or without "
+        "arguments (for example not map, union, default, sin, equals, if_then_else).",
+        "- Do not declare a name that an earlier step already used.",
+        "- declarations holds only declare-const, declare-fun or declare-sort lines, one per line.",
+        "- assertion is exactly one Bool term: no SMT commands, no second term, no ! "
+        "annotations (:named, :pattern), and no | or ; anywhere (so no ; comments).",
         "",
         'Reply with JSON: {"declarations": "...", "assertion": "..."}',
     ]
@@ -223,6 +251,68 @@ def _is_z3_builtin(name: str) -> bool:
         else:
             return True
     return False
+
+
+_COERCIBLE: Final[dict[str, tuple[str, ...]]] = {"Int": ("Int", "Real"), "Real": ("Real", "Int")}
+
+
+@functools.lru_cache(maxsize=4096)
+def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
+    """True if Z3 resolves the declared name, applied as `decl` declares, with no declaration.
+
+    Z3 resolves a user function only at its declared arity, with Int and Real
+    coerced, so probing those argument sorts covers every use the declaration
+    could take over (AUDIT-13 #1). An unknown sort is left to the parse check.
+    """
+    tokens = decl[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+    head, name = tokens[0], tokens[1]
+    if head == "declare-sort":
+        arity = int(tokens[2]) if len(tokens) > 2 and tokens[2].isdigit() else 0
+        if arity == 0:
+            return False
+        uses = [f"(declare-const x ({name}{' Int' * arity}))"]
+    else:
+        args = _sexprs(tokens[3:]) if head == "declare-fun" and tokens[2] == "(" else []
+        if not args:
+            return False
+        uses = []
+        for sorts in itertools.product(*(_COERCIBLE.get(a, (a,)) for a in args)):
+            consts = "".join(f"(declare-const a{i} {s})" for i, s in enumerate(sorts))
+            app = f"({name} {' '.join(f'a{i}' for i in range(len(sorts)))})"
+            uses.append(f"{consts}(assert (= {app} {app}))")
+    ctx = _parse_context()
+    for use in uses:
+        try:
+            z3.Z3_parse_smtlib2_string(
+                ctx.ref(), "".join(sort_decls) + use, 0, None, None, 0, None, None
+            )
+        except z3.Z3Exception as exc:
+            msg = exc.value.decode() if isinstance(exc.value, bytes) else str(exc.value)
+            if "unknown constant" not in msg and "unknown sort" not in msg:
+                return True
+        else:
+            return True
+    return False
+
+
+def _sexprs(tokens: list[str]) -> list[str]:
+    """Split tokens up to the first unmatched `)` into top-level S-expressions."""
+    out: list[str] = []
+    depth, cur = 0, []
+    for tok in tokens:
+        if tok == ")" and depth == 0:
+            break
+        cur.append(tok)
+        depth += {"(": 1, ")": -1}.get(tok, 0)
+        if depth == 0:
+            out.append(" ".join(cur).replace("( ", "(").replace(" )", ")"))
+            cur = []
+    return out
+
+
+def _tokens(text: str) -> set[str]:
+    """Every symbol, keyword and literal token in `text`."""
+    return {m.group(1) for m in _TERM_TOKEN.finditer(text)} - {"(", ")"}
 
 
 _TERM_TOKEN: Final = re.compile(r'\s*("(?:[^"]|"")*"|[()]|[^\s()"]+)')

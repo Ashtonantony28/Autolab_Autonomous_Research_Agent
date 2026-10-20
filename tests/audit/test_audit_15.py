@@ -105,7 +105,6 @@ def test_measurement_fact_symbols_are_plain_identifiers() -> None:
 # --- #2 (medium): the formalize prompt does not state SG15's rules -----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #2")
 def test_formalize_prompt_states_the_identifier_and_single_term_rules() -> None:
     step = ReasoningStep(index=0, claim="the sample is hot", claim_type="premise")
     text = f"{SYSTEM_PROMPTS['formalize']}\n{prompt_for(step, Vocabulary())}".lower()
