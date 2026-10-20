@@ -62,8 +62,12 @@ def _register(
         )
         try:
             candidate = vocab.merged(gs.declarations)
-            z3.parse_smt2_string(f"{candidate.smt()}\n(assert {gs.assertion})", ctx=z3.Context())
+            parsed = z3.parse_smt2_string(
+                f"{candidate.smt()}\n(assert {gs.assertion})", ctx=z3.Context()
+            )
         except (FormalizationError, z3.Z3Exception):
+            continue
+        if len(parsed) != 1:  # the formalizer rejects an assertion that is not one term
             continue
         if faithful is not None:
             fake.register(
@@ -96,7 +100,6 @@ ACTIVE = "Compound K-17 is active"
 SPECIFIC = "The primer binds specifically"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-9 #1")
 async def test_shadowed_str_len_hides_a_premise_that_contradicts_another() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -139,7 +142,6 @@ async def test_shadowed_str_len_hides_a_premise_that_contradicts_another() -> No
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-9 #1")
 @pytest.mark.parametrize(
     "decl",
     [
@@ -165,7 +167,6 @@ def test_vocabulary_rejects_every_z3_builtin(decl: str) -> None:
 # only at `declarations`.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-9 #2")
 async def test_assertion_cannot_smuggle_a_builtin_redeclaration() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -197,7 +198,6 @@ async def test_assertion_cannot_smuggle_a_builtin_redeclaration() -> None:
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-9 #2")
 async def test_a_trace_cannot_change_z3_global_parameters() -> None:
     fake = FakeLLMClient()
     poisoned = _register(
