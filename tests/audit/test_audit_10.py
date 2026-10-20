@@ -87,7 +87,7 @@ def test_threads_that_have_formalized_do_not_each_keep_a_z3_context() -> None:
 @pytest.mark.xfail(strict=True, reason="AUDIT-10 #4")
 def test_a_trivial_check_is_not_dominated_by_creating_a_context() -> None:
     # The same parse and two checks on one reused context take about a third of the time
-    # `Z3Solver.check_entailment` takes (ratio ~3.0, measured interleaved on one thread).
+    # a worker's in-process check takes (ratio ~2.2, measured interleaved on one thread).
     assert context_overhead_ratio(rounds=150) < 1.5
 
 
