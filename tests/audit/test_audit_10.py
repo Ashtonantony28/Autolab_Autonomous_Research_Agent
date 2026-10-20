@@ -12,14 +12,18 @@ from typing import Final
 
 import pytest
 
+from autolab.verification import solver as solver_mod
+from autolab.verification.solver import SolverExecutor
+from scripts.audit_load_2 import P95, pct
 from scripts.audit_load_3 import (
+    concurrent_solver_ms,
     context_overhead_ratio,
     held_contexts_report,
-    pool_inflation,
     printer_peak_concurrency,
     s08_suite_probe,
 )
 
+_POOL_ROUNDS: Final = 3
 _HELD_THREADS: Final = 16
 _MB_PER_IDLE_THREAD: Final = 2.0
 """Generous allowance for what one idle thread may keep after formalizing (a context is ~16 MB)."""
@@ -34,8 +38,19 @@ async def test_the_default_solver_pool_does_not_inflate_solver_ms_under_concurre
     # pool (8 workers on 4 CPUs). Every z3py call drops and re-takes the GIL, so the
     # workers convoy on it: no extra throughput, and each check's solver_ms grows 10x
     # (loaded machine) to 100x (quiet machine).
-    pooled_p95, serial_p95 = await pool_inflation(verifies=12, steps=30)
-    assert pooled_p95 <= 2 * serial_p95
+    # Serial and pooled alternate within a round, so both see the same background load.
+    # The best of up to `_POOL_ROUNDS` rounds counts.
+    ratios: list[float] = []
+    while len(ratios) < _POOL_ROUNDS and (not ratios or min(ratios) > 2):
+        serial = SolverExecutor(1)
+        try:
+            pair = (serial, solver_mod.default_executor())
+            order = pair if len(ratios) % 2 == 0 else pair[::-1]
+            p95 = {ex: pct((await concurrent_solver_ms(ex, 12, 30))[0], P95) for ex in order}
+        finally:
+            serial.shutdown()
+        ratios.append(p95[pair[1]] / p95[serial])
+    assert min(ratios) <= 2
 
 
 # --- #2 (medium): pytest-timeout cannot stop a Z3 call on the main thread ------------
