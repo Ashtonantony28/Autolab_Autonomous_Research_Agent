@@ -345,7 +345,9 @@ CHAIN_CLAIM: Final = SmtFormula(CHAIN_DECLS, "a10")
 
 
 def context_overhead_ratio(rounds: int = 200) -> float:
-    """Median `Z3Solver.check_entailment` time over the same work on one reused context.
+    """Median in-process `Z3Solver` check time over the same work on one reused context.
+
+    The check runs in this process as its worker runs it, so IPC is left out.
 
     Both run interleaved on this thread, so machine load affects them alike. The
     baseline parses the same SMT document and runs the same two checks; it only
@@ -373,7 +375,7 @@ def context_overhead_ratio(rounds: int = 200) -> float:
     reused_ms: list[float] = []
     for _ in range(rounds):
         started = time.perf_counter()
-        if solver.check_entailment(premises, CHAIN_CLAIM).verdict != "VALID":
+        if solver._check_here(premises, CHAIN_CLAIM).verdict != "VALID":
             raise AssertionError("claim should be entailed")
         fresh_ms.append(time.perf_counter() - started)
         started = time.perf_counter()
