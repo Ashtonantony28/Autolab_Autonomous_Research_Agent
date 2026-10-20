@@ -67,6 +67,9 @@ Long checks are CPU-bound and timeouts are wall-clock, so slots and slow checks
 together do not outnumber the CPUs (AUDIT-18 #5)."""
 _SLICE_S: Final[float] = 0.05
 """How long a Z3 check holds its slot before it runs on as a slow check."""
+_HARD_SLICES: Final[int] = 4
+"""A caller whose last check ran this many slices loses its priority and lent places;
+an easy check slowed by load stays well under it (AUDIT-18 #4)."""
 _SETUP_SHARE: Final[float] = 0.5
 """Z3 sets up the entailment check, without polling its limit, in up to this share of
 the time the consistency check took; with less time left the check is not started."""
@@ -488,7 +491,8 @@ class SolverExecutor:
         with self._lock:
             short = task in self._short
         lent = await slots.acquire(short)
-        slow = stuck = long = False
+        slow = stuck = False
+        slices = 0
         try:
             if lent:
                 self._pool.resize(1)
@@ -496,7 +500,7 @@ class SolverExecutor:
             future = asyncio.wrap_future(self._pool.submit(self._call, fn, interrupt))
             try:
                 while not slow and not (await asyncio.wait((future,), timeout=_SLICE_S))[0]:
-                    long = True
+                    slices += 1
                     slow = self._to_slow(interrupt)
                     if slow:
                         if stuck:
@@ -523,7 +527,7 @@ class SolverExecutor:
                 self._pool.resize(-1)
             if task is not None:
                 with self._lock:
-                    if long:
+                    if slices >= _HARD_SLICES:
                         self._short.discard(task)
                     else:
                         self._short.add(task)

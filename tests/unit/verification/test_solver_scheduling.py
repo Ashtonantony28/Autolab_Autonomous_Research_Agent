@@ -355,6 +355,7 @@ async def test_a_caller_whose_check_ran_long_is_not_lent_a_place(
     task = asyncio.create_task(executor.run(held))
     assert await asyncio.to_thread(held.started.wait, _WAIT_S)
     await _until(lambda: executor._slots[asyncio.get_running_loop()].stuck == 1)
+    await asyncio.sleep(solver_mod._HARD_SLICES * solver_mod._SLICE_S)  # a lower bound
     held.gate.set()
     await task
     assert task not in executor._short
@@ -362,6 +363,8 @@ async def test_a_caller_whose_check_ran_long_is_not_lent_a_place(
     await executor.run(lambda: None)
     assert me in executor._short
     await executor.run(partial(time.sleep, 2 * solver_mod._SLICE_S))
+    assert me in executor._short  # a check slowed by load is not a hard run
+    await executor.run(partial(time.sleep, (solver_mod._HARD_SLICES + 1) * solver_mod._SLICE_S))
     assert me not in executor._short
     await executor.run(lambda: None)
     assert me in executor._short
