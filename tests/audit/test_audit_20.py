@@ -139,7 +139,6 @@ def _without_annotation_ban(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(formalizer, "_tokens", tokens)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-20 #2")
 @pytest.mark.parametrize(
     "repro",
     [
@@ -425,7 +424,7 @@ async def test_a_file_store_uses_wal_and_the_busy_timeout(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------
 
 _GLUED: Final = "(! p:named false)"
-"""Z3 reads `p:named` as `p :named`; `_tokens` reads it as one token."""
+"""Z3 reads `p:named` as `p :named`; since SG24 `_tokens` does too (it read one token)."""
 
 
 def test_a_glued_named_annotation_really_redefines_false_in_z3() -> None:
@@ -436,7 +435,7 @@ def test_a_glued_named_annotation_really_redefines_false_in_z3() -> None:
     s = z3.Solver(ctx=second.ctx)
     s.add(second)
     assert s.check() == z3.sat
-    assert ":named" not in formalizer._tokens(_GLUED)
+    assert ":named" in formalizer._tokens(_GLUED)  # SG24: tokenized as Z3 lexes it
 
 
 async def test_a_glued_named_annotation_is_refused() -> None:
