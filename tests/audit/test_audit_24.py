@@ -99,7 +99,6 @@ class _Held:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #2")
 async def test_a_check_that_ran_long_while_the_loop_was_busy_counts_as_hard() -> None:
     executor = SolverExecutor(1, 0)
     started = threading.Event()
@@ -217,7 +216,6 @@ async def test_a_lent_check_never_lends_a_place() -> None:
     assert await _a_lent_check_never_lends() == (1, 1)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #3")
 async def test_a_lent_check_never_lends_a_place_under_s06(monkeypatch: pytest.MonkeyPatch) -> None:
     _mutant(monkeypatch, SolverExecutor, "run", *_S06)
     assert await _a_lent_check_never_lends() == (1, 1)
