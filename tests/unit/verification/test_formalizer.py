@@ -689,7 +689,7 @@ def test_numeric_variants_are_linear_in_the_arity(k: int) -> None:
     assert {("Int", "Bool") * k, ("Real", "Bool") * k} <= set(variants)
 
 
-@pytest.mark.parametrize("k", [8, 64])
+@pytest.mark.parametrize("k", [8, formalizer.MAX_ARITY // 3])
 def test_a_wide_function_is_probed_with_a_bounded_number_of_parses(
     monkeypatch: pytest.MonkeyPatch, k: int
 ) -> None:
@@ -701,10 +701,11 @@ def test_a_wide_function_is_probed_with_a_bounded_number_of_parses(
     assert parses.count <= 2 * (2 * k) + 2 + 2  # the applied variants and the two bare probes
 
 
-async def test_a_step_with_a_64_argument_function_formalizes() -> None:
+async def test_a_step_with_a_function_of_the_largest_arity_formalizes() -> None:
     formalizer._applied_builtin.cache_clear()
-    decl = f"(declare-fun wide ({' '.join(['Int'] * 64)}) Bool)"
-    (err,) = await _formalize_all([(decl, f"(wide {' '.join(['0'] * 64)})")])
+    k = formalizer.MAX_ARITY
+    decl = f"(declare-fun wide ({' '.join(['Int'] * k)}) Bool)"
+    (err,) = await _formalize_all([(decl, f"(wide {' '.join(['0'] * k)})")])
     assert err is None
 
 
@@ -833,3 +834,159 @@ async def test_a_builtin_glued_to_its_argument_counts_as_used(
     )
     assert errors[0] is None
     assert errors[1] is not None and "meaning of an earlier step" in errors[1]
+
+
+# --- SG28: the applied probe is bounded by a declaration arity cap (AUDIT-22 #1) ----
+
+_MAX = formalizer.MAX_ARITY
+
+
+def _fun(k: int, sort: str = "Int", name: str = "wide") -> str:
+    return f"(declare-fun {name} ({' '.join([sort] * k)}) Bool)"
+
+
+class _ParsedChars:
+    """Total characters handed to `Z3_parse_smtlib2_string`."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.chars = 0
+        real = z3.Z3_parse_smtlib2_string
+
+        def counting(*args: object) -> object:
+            text = args[1]
+            assert isinstance(text, str)
+            self.chars += len(text)
+            return real(*args)
+
+        monkeypatch.setattr(z3, "Z3_parse_smtlib2_string", counting)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        _fun(_MAX + 1),
+        _fun(_MAX + 1, "Bool"),
+        _fun(1024),
+        _fun(4096, "Real"),
+        f"(declare-fun wide ({' '.join(['(Array Int Int)'] * (_MAX + 1))}) Int)",
+        f"(declare-sort Wide {_MAX + 1})",
+        "(declare-sort Wide 100)",
+        f"(declare-sort Wide {'9' * 5000})",
+    ],
+)
+def test_a_declaration_over_the_arity_cap_is_refused_before_any_parse(
+    monkeypatch: pytest.MonkeyPatch, decl: str
+) -> None:
+    formalizer._applied_builtin.cache_clear()
+    formalizer._is_z3_builtin.cache_clear()
+    parses = _Parses(monkeypatch)
+    with pytest.raises(FormalizationError, match=rf"arguments; at most {_MAX} allowed"):
+        Vocabulary().merged(decl)
+    assert parses.count == 0
+
+
+@pytest.mark.parametrize(
+    ("decl", "name"),
+    [
+        (_fun(_MAX), "wide"),
+        (_fun(_MAX, "Bool"), "wide"),
+        (f"(declare-fun wide ({' '.join(['(Array Int Real)'] * _MAX)}) Int)", "wide"),
+        (f"(declare-sort Wide {_MAX})", "Wide"),
+        (f"(declare-sort Wide 0{_MAX})", "Wide"),
+    ],
+)
+def test_a_declaration_at_the_arity_cap_is_accepted(decl: str, name: str) -> None:
+    formalizer._applied_builtin.cache_clear()
+    assert name in Vocabulary().merged(decl).declarations
+
+
+@pytest.mark.parametrize("digit", ["²", "٣", "①"])
+async def test_a_non_ascii_sort_arity_fails_formalization_instead_of_escaping(digit: str) -> None:
+    # `str.isdigit` accepts these but `int` does not: a bare ValueError escaped `merged`.
+    (err,) = await _formalize_all([(f"(declare-sort S {digit})", "true")])
+    assert err is not None and "invalid SMT" in err
+
+
+@pytest.mark.parametrize("k", [1, 4, 16, _MAX])
+def test_the_probe_parses_a_bounded_amount_of_text_up_to_the_cap(
+    monkeypatch: pytest.MonkeyPatch, k: int
+) -> None:
+    formalizer._applied_builtin.cache_clear()
+    formalizer._is_z3_builtin.cache_clear()
+    parsed = _ParsedChars(monkeypatch)
+    sorts = ["Int", "Real"] * (k // 2) + ["Bool"] * (k % 2)
+    Vocabulary().merged(f"(declare-fun wide ({' '.join(sorts)}) Int)")
+    assert parsed.chars <= (2 * k + 2) * (40 * k + 60) + 200
+    assert parsed.chars <= 100_000
+
+
+async def test_an_over_wide_step_fails_with_the_cap_in_its_reason() -> None:
+    fake = FakeLLMClient()
+    f = Formalizer(fake)
+    step = _step(0)
+    fake.register(
+        "formalize",
+        prompt_for(step, f.vocabulary),
+        json.dumps({"declarations": _fun(1024), "assertion": "true"}),
+    )
+    with pytest.raises(FormalizationError, match=f"'wide' takes 1024 arguments; at most {_MAX}"):
+        await f.formalize(step)
+    assert f.vocabulary.declarations == {}
+
+
+def test_the_prompt_states_the_arity_cap() -> None:
+    assert f"at most {_MAX} arguments" in prompt_for(_step(0), Vocabulary())
+
+
+def test_a_wide_line_after_valid_ones_leaves_the_merge_atomic() -> None:
+    base = Vocabulary().merged("(declare-const p Bool)")
+    with pytest.raises(FormalizationError, match="arguments"):
+        base.merged(f"(declare-const q Bool)\n{_fun(_MAX + 1)}")
+    assert base.declarations.keys() == {"p"}
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    sorts=st.lists(
+        st.sampled_from(("Int", "Real", "Bool", "(Array Int Int)", "(_ BitVec 4)")), max_size=48
+    ),
+    ret=st.sampled_from(("Int", "Bool")),
+)
+def test_the_cap_counts_top_level_argument_sorts(sorts: list[str], ret: str) -> None:
+    decl = f"(declare-fun g ({' '.join(sorts)}) {ret})"
+    assert formalizer._arity(formalizer._decl_tokens(decl)) == len(sorts)
+    if len(sorts) > _MAX:
+        with pytest.raises(FormalizationError, match="arguments"):
+            Vocabulary().merged(decl)
+    else:
+        assert "g" in Vocabulary().merged(decl).declarations
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    name=st.sampled_from(_APPLIED_BUILTINS),
+    args=st.lists(st.sampled_from(("Int", "Real", "Bool")), min_size=7, max_size=8),
+)
+def test_the_bounded_probe_agrees_with_every_combination_at_wider_arities(
+    name: str, args: list[str]
+) -> None:
+    decl = f"(declare-fun {name} ({' '.join(args)}) Bool)"
+    assert formalizer._applied_builtin(decl, ()) == _resolves_anywhere(name, tuple(args))
+
+
+# --- SG28: the tokenizer is linear in trailing whitespace (AUDIT-22 #1, low) --------
+
+
+def test_tokens_of_text_with_long_trailing_blanks_stay_fast() -> None:
+    # Each `\s*` used to scan to the end: 16 000 blanks took 12.6 s.
+    assert formalizer._tokens("(and a b)" + " \t\n" * 20_000) == {"and", "a", "b"}
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    text=st.text(alphabet=st.sampled_from(list('ab1:#x"() \t\n.')), max_size=40),
+    tail=st.text(alphabet=" \t\n", max_size=8),
+)
+def test_tokens_match_the_unstripped_scan(text: str, tail: str) -> None:
+    unstripped = {m.group(1) for m in formalizer._TERM_TOKEN.finditer(text + tail)} - {"(", ")"}
+    assert formalizer._tokens(text + tail) == unstripped
