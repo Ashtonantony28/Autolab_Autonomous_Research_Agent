@@ -35,6 +35,10 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
 | SG18 | Trace and persist HITL outcomes (AUDIT-11 #1, #3, #7) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*`, `cli.py` (abort message) | done (PR pending) |
 | SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
+| SG20 | No step can redefine a symbol it did not declare (AUDIT-13 #1, #2) | audit round 4 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | open |
+| SG21 | Design figures and fact symbols (AUDIT-13 #3, AUDIT-15 #1, AUDIT-16 #1) | audit round 4 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | open |
+| SG22 | Solver timeout and fair scheduling (AUDIT-14 #1, #2) | SG23 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | open |
+| SG23 | Deterministic gate (flaky AUDIT-6 #7 repro, SQLite lock in concurrent-store test) | audit round 4 | `tests/audit/test_audit_6.py` (#7 repro only), `state/store.py` (connection setup only), `tests/integration/monitoring/test_graph_observability.py` | open |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -333,6 +337,34 @@ Round 3 (AUDIT-9..12, fresh agents, base `7b8c452`) found 1 critical and 7 high 
 
 Medium and low round-3 findings stay in the AUDIT files. One of them, AUDIT-11 #4, needs the owner's call: should the contradiction trigger read hypotheses from earlier runs? After SG15–SG19, audit round 4 re-runs all four audits.
 
+### Audit round 4 → SG20–SG23
+
+Round 4 (AUDIT-13..16, fresh agents, base `fee50eb`) found 2 critical and 7 high findings. Repros are strict xfails in `tests/audit/test_audit_{13..16}.py`. A sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG20, SG21 and SG23 run in parallel; SG22 runs after SG23 so its timing is measured on a deterministic gate.
+
+- **SG20 No step can redefine a symbol it did not declare.**
+  - SG15 closed shadowing name by name. Three builtins that exist only with arguments (`equals`, `equiv`, `if_then_else`) still pass `_is_z3_builtin`, so a later step can hide a premise (AUDIT-13 #1, critical).
+  - `(! t :named n)` lets a premise define `false`, `pi`, `euler` or a rounding mode for every later check (AUDIT-13 #2, critical).
+  - Close the class, not the names: a declared or named symbol may never change the meaning of a symbol the step did not introduce. The default chosen here is to reject `!` annotations in assertions and to probe builtins with arguments as well as bare. A structural fix (for example, every user symbol gets a prefix at the SMT boundary) is acceptable if it stays inside `formalizer.py`.
+  - Fold in: the formalize prompt states the identifier and single-term rules (AUDIT-15 #2, medium). Keep AUDIT-16 #3's `;` kill tests green.
+  - **Flip:** AUDIT-13 #1 ×2, #2 ×2; AUDIT-15 #2. Add a property test over the libz3 identifier list.
+  - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/audit/test_audit_9.py tests/audit/test_audit_13.py tests/audit/test_audit_16.py tests/unit/verification -q` · `uv run python -m scripts.error_injection` · `uv run python -m scripts.bench_verifier --runs 20`.
+- **SG21 Design figures and fact symbols.**
+  - `protocol_figures` misses ordinary forms: "240-minute", "12-hour", "2 weeks", "5k USD", "500 US dollars", "500$", "40000 INR". The AUDIT-12 #1 attack still admits a $5 / 30 min design (AUDIT-13 #3, AUDIT-16 #1, high).
+  - `_param_symbol` and `_symbol` keep Unicode letters, so a parameter `volume_µL` or a measurement `OD₆₀₀` breaks SG15's identifier rule and the run stalls at Design (AUDIT-15 #1, high).
+  - The check stays a reject-and-escalate guard (no figures parsed into state, CLAUDE.md §9). When in doubt it fails closed.
+  - Fold in: a figure in a string parameter is not admitted (AUDIT-15 #4); Svedberg units are not durations, and a figure rejection is retried with feedback before it escalates (AUDIT-15 #3).
+  - **Flip:** AUDIT-13 #3, AUDIT-15 #1 ×2, #3, #4, AUDIT-16 #1 ×5.
+  - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/audit/test_audit_12.py tests/audit/test_audit_13.py tests/audit/test_audit_15.py tests/audit/test_audit_16.py tests/unit/agents -q` · `uv run python -m scripts.run_benchmark`.
+- **SG22 Solver timeout and fair scheduling.**
+  - SG19's assumption-based check ignores its timeout and interrupts on large integer premise pools: 8–10× the timeout, and a cancel frees the worker 3–4 s late (AUDIT-14 #1, high; regresses AUDIT-2 #6 and AUDIT-10 #1 on integer pools).
+  - Two runs whose checks always hit the timeout starve every other run on the 2-worker pool: an easy 10-step verify takes 30–75 s (AUDIT-14 #2, high).
+  - Keep SG19's single `from_string` load. Fairness must hold without giving back AUDIT-10 #1's step p95.
+  - Fold in: `_wrap_assert` must not skip a term that only starts with the text `(assert` (AUDIT-15 #5); the `z3_spy` signals only after the interrupt is sent (AUDIT-16 #2).
+  - **Flip:** AUDIT-14 #1 ×2, #2; AUDIT-15 #5; AUDIT-16 #2.
+  - **Verify:** `uv run pytest tests/audit/test_audit_2.py tests/audit/test_audit_6.py tests/audit/test_audit_10.py tests/audit/test_audit_12.py tests/audit/test_audit_14.py tests/unit/verification -q` · `uv run python -m scripts.bench_verifier --runs 20` · the AUDIT-10 #1 and AUDIT-14 loads, before and after.
+- **SG23 Deterministic gate.** Three auditors saw `make test` fail under load on the same two tests: the AUDIT-6 #7 strict xfail XPASSes, and `test_concurrent_traced_runs_share_one_store[30]` fails with SQLite "database is locked" (AUDIT-16 #8, AUDIT-6 #2). Make the AUDIT-6 #7 repro deterministic without weakening it, and make the store survive concurrent writers. **Verify:** `make test` green 5 times in a row while another full suite runs alongside.
+
+Medium and low round-4 findings not folded in above stay in the AUDIT files.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -345,9 +377,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-4 | Test coverage: untested branches, weak assertions, fakes that test nothing |
 | AUDIT-5..8 | Round 2 of the same four focuses, on SG7–SG10 |
 | AUDIT-9..12 | Round 3, on SG11–SG14 |
+| AUDIT-13..16 | Round 4, on SG15–SG19 |
 
 ## Log
 
+- 2026-10-20: audit round 4 done (2 critical, 7 high); SG20–SG23 added. AUDIT-9 #1 and AUDIT-12 #1 reopened.
 - 2026-10-20: audit round 3 done (1 critical, 7 high); SG15–SG19 added. AUDIT-5 #2 reopened by AUDIT-12 #1.
 - 2026-10-19: audit round 2 done (2 critical, 3 high); SG11–SG14 added.
 - 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
