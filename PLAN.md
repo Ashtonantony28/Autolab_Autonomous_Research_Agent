@@ -42,7 +42,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG24 | Formalizer probe cost and annotation tokenizing (AUDIT-18 #1, AUDIT-20 #2, #4) | audit round 5 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py`, `tests/audit/test_audit_13.py` (#2 helper only) | done (PR pending) |
 | SG25 | Independent cost and duration estimate for designs (AUDIT-17 #1–#3, AUDIT-19 #1, #2) | audit round 5 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/`, `orchestrator/routing.py` (figure retry only) | done (PR pending) |
 | SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | done (PR pending) |
-| SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | open |
+| SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | done (PR pending) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
