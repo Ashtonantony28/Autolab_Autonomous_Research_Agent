@@ -604,3 +604,232 @@ async def test_no_libz3_identifier_can_be_declared_or_named_over_a_builtin(
         assert _parse(f"{consts}(assert (= {use} {use}))") == "error"
     (err,) = await _formalize_all([("(declare-const p Bool)", f"(! p :named {name})")])
     assert err is not None
+
+
+# --- SG24: a bounded applied probe (AUDIT-18 #1) ---------------------------------
+
+# Every libz3 identifier Z3 resolves with 1-4 arguments of one sort (Int, Real or
+# Bool), found by probing the whole list: the names an applied probe can hit.
+# `foo` and `f` are controls.
+_APPLIED_BUILTINS = (
+    "Char", "NaN", "RNA", "RNE", "RTN", "RTP", "RTZ", "abs", "acos", "acosh", "and",
+    "asin", "asinh", "atan", "atanh", "bit0", "bit1", "bit2bool", "bv2int", "bv2nat",
+    "bvadd", "bvand", "bvashr", "bvcomp", "bvlshr", "bvmul", "bvnand", "bvneg", "bvnego",
+    "bvnor", "bvnot", "bvor", "bvredand", "bvredor", "bvsaddo", "bvsdiv", "bvsdiv0",
+    "bvsdiv_i", "bvsdivo", "bvsge", "bvsgt", "bvshl", "bvsle", "bvslt", "bvsmod",
+    "bvsmod0", "bvsmod_i", "bvsmul_noovfl", "bvsmul_noudfl", "bvsmulo", "bvsrem",
+    "bvsrem0", "bvsrem_i", "bvssubo", "bvsub", "bvuaddo", "bvudiv", "bvudiv0", "bvudiv_i",
+    "bvuge", "bvugt", "bvule", "bvult", "bvumul_noovfl", "bvumulo", "bvurem", "bvurem0",
+    "bvurem_i", "bvusubo", "bvxnor", "bvxor", "char", "complement", "concat", "const",
+    "cos", "default", "distinct", "div", "div0", "equals", "equiv", "euler", "exists",
+    "ext_rotate_left", "ext_rotate_right", "extract", "false", "forall", "fp", "if",
+    "if_then_else", "iff", "implies", "int2bv", "int_to_bv", "intersection", "is",
+    "is_int", "ite", "lambda", "let", "map", "match", "mkbv", "mod", "mod0", "not", "or",
+    "pbeq", "pbge", "pble", "pi", "rem", "repeat", "roundNearestTiesToAway",
+    "roundNearestTiesToEven", "roundTowardNegative", "roundTowardPositive",
+    "roundTowardZero", "sbv_to_int", "select", "setminus", "sign_extend", "sin", "store",
+    "subset", "tan", "to_fp", "to_fp_unsigned", "to_ieee_bv", "to_int", "to_real", "true",
+    "ubv_to_int", "union", "xor", "zero_extend", "foo", "f",
+)  # fmt: skip
+
+
+def _resolves_anywhere(name: str, args: tuple[str, ...]) -> bool:
+    """The pre-SG24 probe: every Int/Real combination of `args` (2^k parses)."""
+    choices = [("Int", "Real") if a in ("Int", "Real") else (a,) for a in args]
+    ref = _parse_context().ref()
+    for sorts in itertools.product(*choices):
+        use = formalizer._applied_use(name, sorts)
+        try:
+            z3.Z3_parse_smtlib2_string(ref, use, 0, None, None, 0, None, None)
+        except z3.Z3Exception as exc:
+            msg = exc.value.decode() if isinstance(exc.value, bytes) else str(exc.value)
+            if "unknown constant" not in msg:
+                return True
+        else:
+            return True
+    return False
+
+
+class _Parses:
+    """Counts `Z3_parse_smtlib2_string` calls."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.count = 0
+        real = z3.Z3_parse_smtlib2_string
+
+        def counting(*args: object) -> object:
+            self.count += 1
+            return real(*args)
+
+        monkeypatch.setattr(z3, "Z3_parse_smtlib2_string", counting)
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("Int",), {("Int",), ("Real",)}),
+        (("Real", "Bool"), {("Int", "Bool"), ("Real", "Bool")}),
+        (("Int", "Real", "Int"), set(itertools.product(("Int", "Real"), repeat=3))),
+        (("Bool", "U"), {("Bool", "U")}),
+    ],
+)
+def test_numeric_variants_are_every_combination_up_to_three_arguments(
+    args: tuple[str, ...], expected: set[tuple[str, ...]]
+) -> None:
+    variants = list(formalizer._numeric_variants(list(args)))
+    assert len(variants) == len(set(variants))
+    assert set(variants) == expected
+
+
+@pytest.mark.parametrize("k", [4, 8, 16, 64])
+def test_numeric_variants_are_linear_in_the_arity(k: int) -> None:
+    variants = list(formalizer._numeric_variants(["Int", "Bool"] * k))
+    assert len(variants) == len(set(variants)) == 2 * k + 2
+    assert all(v[1::2] == ("Bool",) * k for v in variants)
+    assert {("Int", "Bool") * k, ("Real", "Bool") * k} <= set(variants)
+
+
+@pytest.mark.parametrize("k", [8, 64])
+def test_a_wide_function_is_probed_with_a_bounded_number_of_parses(
+    monkeypatch: pytest.MonkeyPatch, k: int
+) -> None:
+    # AUDIT-18 #1: a 16-argument function took 2^16 parses (21 s on the event loop).
+    formalizer._applied_builtin.cache_clear()
+    parses = _Parses(monkeypatch)
+    decl = f"(declare-fun wide ({' '.join(['Int', 'Real', 'Bool'] * k)}) Bool)"
+    assert "wide" in Vocabulary().merged(decl).declarations
+    assert parses.count <= 2 * (2 * k) + 2 + 2  # the applied variants and the two bare probes
+
+
+async def test_a_step_with_a_64_argument_function_formalizes() -> None:
+    formalizer._applied_builtin.cache_clear()
+    decl = f"(declare-fun wide ({' '.join(['Int'] * 64)}) Bool)"
+    (err,) = await _formalize_all([(decl, f"(wide {' '.join(['0'] * 64)})")])
+    assert err is None
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "(declare-fun equals (Int Real Int Real Int Real Int Real) Bool)",
+        "(declare-fun equiv (Bool Bool Bool Bool Bool Bool) Bool)",
+        "(declare-fun if_then_else (Bool Real Int) Real)",
+        "(declare-fun bvadd (Int Int Int Int Int) Int)",
+    ],
+)
+def test_the_bounded_probe_still_refuses_builtins_at_any_width(
+    monkeypatch: pytest.MonkeyPatch, decl: str
+) -> None:
+    monkeypatch.setattr(formalizer, "_is_z3_builtin", lambda _name: False)
+    formalizer._applied_builtin.cache_clear()
+    with pytest.raises(FormalizationError, match="Z3 builtin"):
+        Vocabulary().merged(decl)
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    name=st.sampled_from(_APPLIED_BUILTINS),
+    args=st.lists(st.sampled_from(("Int", "Real", "Bool")), min_size=1, max_size=6),
+)
+@example(name="equals", args=["Int", "Real", "Int", "Real"])
+@example(name="if_then_else", args=["Bool", "Int", "Real"])
+@example(name="foo", args=["Int", "Int", "Int", "Int"])
+def test_the_bounded_probe_agrees_with_every_combination(name: str, args: list[str]) -> None:
+    # Same soundness: the 2k + 2 variants refuse exactly what all 2^k combinations refuse.
+    decl = f"(declare-fun {name} ({' '.join(args)}) Bool)"
+    assert formalizer._applied_builtin(decl, ()) == _resolves_anywhere(name, tuple(args))
+
+
+def test_the_probe_cache_ignores_sorts_the_declaration_does_not_mention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AUDIT-18 #1: each new `declare-sort` re-ran every later probe.
+    formalizer._applied_builtin.cache_clear()
+    decl = "(declare-fun g (U Int Int Int) Bool)"
+    base = Vocabulary().merged("(declare-sort U 0)")
+    base.merged(decl)
+    wider = base.merged("(declare-sort V 0)\n(declare-sort W 0)")
+    parses = _Parses(monkeypatch)
+    wider.merged(decl)
+    assert parses.count == 0
+
+
+def test_a_declared_sort_still_reaches_the_applied_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `equals` resolves on two U arguments only with U declared in the probe.
+    monkeypatch.setattr(formalizer, "_is_z3_builtin", lambda _name: False)
+    formalizer._applied_builtin.cache_clear()
+    vocab = Vocabulary().merged("(declare-sort V 0)\n(declare-sort U 0)")
+    with pytest.raises(FormalizationError, match="Z3 builtin"):
+        vocab.merged("(declare-fun equals (U U) Bool)")
+
+
+# --- SG24: names are tokenized as Z3 lexes them (AUDIT-20 #4, AUDIT-17 #5) ------
+
+
+@pytest.mark.parametrize(
+    ("text", "tokens"),
+    [
+        ("(! p:named false)", {"!", "p", ":named", "false"}),
+        ("(let ((k#b1)) (= (bvor k#b0) #b1))", {"let", "k", "#b1", "=", "bvor", "#b0"}),
+        ("(bvnot#b1)", {"bvnot", "#b1"}),
+        ("(f#xA0g)", {"f", "#xA0", "g"}),
+        ("(f 1a 2.5x 3.)", {"f", "1", "a", "2.5", "x", "3."}),
+        ("(and b::x)", {"and", "b", ":", ":x"}),
+        ('(= s "a b:c")', {"=", "s", '"a b:c"'}),
+        ("(- x1 +y.z?)", {"-", "x1", "+y.z?"}),
+        ("k'", {"k", "'"}),
+    ],
+)
+def test_tokens_split_where_z3_splits(text: str, tokens: set[str]) -> None:
+    assert formalizer._tokens(text) == tokens
+
+
+def test_z3_ends_a_symbol_at_colon_and_hash() -> None:
+    # The tokenizer's premise: `k#b1` is `k` and `#b1`; `x:y` is `x` and the keyword `:y`.
+    smt = "(declare-fun f (Int (_ BitVec 1)) Bool)(declare-const k Int)(assert (f k#b1))"
+    assert str(z3.parse_smt2_string(smt, ctx=z3.Context())[0]) == "f(k, 1)"
+    with pytest.raises(z3.Z3Exception, match="keyword"):
+        z3.parse_smt2_string("(declare-const x Bool)(assert (and x:y))", ctx=z3.Context())
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        "(! p:named false)",
+        "(! p:named pi)",
+        "(and q (! p:named n))",
+        "(! q:weight 1)",
+        "(forall ((x Int)) (! (> x 0):pattern((+ x 1))))",
+    ],
+)
+async def test_glued_annotations_are_rejected(assertion: str) -> None:
+    # AUDIT-20 #4: with no space before the keyword.
+    (err,) = await _formalize_all([("(declare-const p Bool)\n(declare-const q Bool)", assertion)])
+    assert err is not None and "annotation" in err
+
+
+@pytest.mark.parametrize(
+    "first", ["(let ((k#b1)) (= (bvor k#b0) #b1))", "(let ((k#xA)) (= k #xA))"]
+)
+async def test_a_binder_glued_to_a_literal_counts_as_used(
+    monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    # AUDIT-17 #5.
+    monkeypatch.setattr(formalizer, "_is_z3_builtin", lambda _name: False)
+    monkeypatch.setattr(formalizer, "_applied_builtin", lambda *_: False)
+    errors = await _formalize_all([("", first), ("(declare-const k Bool)", "k")])
+    assert errors[0] is None
+    assert errors[1] is not None and "meaning of an earlier step" in errors[1]
+
+
+async def test_a_builtin_glued_to_its_argument_counts_as_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `(bvnot#b1)` uses `bvnot`; with both probes out, the earlier-use rule must see it.
+    monkeypatch.setattr(formalizer, "_is_z3_builtin", lambda _name: False)
+    monkeypatch.setattr(formalizer, "_applied_builtin", lambda *_: False)
+    errors = await _formalize_all(
+        [("", "(= (bvnot#b1) #b0)"), ("(declare-fun bvnot ((_ BitVec 1)) (_ BitVec 1))", "true")]
+    )
+    assert errors[0] is None
+    assert errors[1] is not None and "meaning of an earlier step" in errors[1]
