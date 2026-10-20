@@ -17,6 +17,7 @@ from typing import Final
 
 import pytest
 
+from autolab.verification.formalizer import FormalizationError
 from scripts.audit_load_4 import timed_check
 from scripts.audit_load_5 import int_function
 from scripts.audit_load_6 import (
@@ -39,16 +40,16 @@ _PARSE_SHARE: Final = 64
 """A probe linear in the declaration parses a few dozen times its text; today ~17 000x."""
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #1")
 def test_probing_a_wide_declaration_parses_text_linear_in_it() -> None:
     # One 4 KB reply line declares a 1024-argument Int function. SG24 made the number of
     # probe parses linear (2k + 2), but each probe declares and applies all k arguments,
     # so the probe hands Z3 72 MB and blocks the event loop for 11-13 s (52 s at 2048
-    # arguments, 8 KB). Stops counting once the budget is spent.
+    # arguments, 8 KB). Stops counting once the budget is spent, and then returns
+    # normally; SG28 refuses the line (MAX_ARITY) within the budget.
     decl = int_function(_WIDE)
     budget = _PARSE_SHARE * len(decl)
-    parsed = chars_parsed_to_merge(decl, budget)
-    assert parsed <= budget, f"parsed more than {budget} chars for a {len(decl)}-char line"
+    with pytest.raises(FormalizationError, match="arguments; at most"):
+        chars_parsed_to_merge(decl, budget)
 
 
 # --- #2 (high): long pools pay one GIL hand-off per premise -------------------------------
