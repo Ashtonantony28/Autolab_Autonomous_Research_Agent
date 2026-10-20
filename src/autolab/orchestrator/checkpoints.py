@@ -11,6 +11,8 @@ return control to the caller, who inspects `hitl_pending` and resumes with
     reason) as `feedback`.
   - `abort` ends the run.
 
+An optional `HITLObserver` sees each resolution and where it sends the run.
+
 LangGraph ships its own `MemorySaver` for in-process runs — we use that
 here and keep our `Checkpointer` protocol (Phase 1, ADR-0004) as the
 *external* checkpoint for state we want to persist across processes.
@@ -18,9 +20,13 @@ here and keep our `Checkpointer` protocol (Phase 1, ADR-0004) as the
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END
@@ -59,10 +65,25 @@ MergedPolicy = Callable[[dict[str, Any], AutoLabState], Awaitable[str | None]]
 """An agent's policy check on its withheld state update (`hitl_payload`)."""
 
 
+@dataclass(frozen=True)
+class HITLOutcome:
+    """One human resolution of `request`, and the `Command` the `hitl` node returns for it."""
+
+    request: HITLRequest | None
+    resolution: HITLResolution
+    command: Command[Any]
+    started_at: datetime
+    latency_ms: float
+
+
+HITLObserver = Callable[[HITLOutcome, AutoLabState, RunnableConfig], Awaitable[None]]
+"""Sees every `HITLOutcome` before the `hitl` node returns it."""
+
+
 class HITLNode(Protocol):
     """The `hitl` LangGraph node."""
 
-    async def __call__(self, state: AutoLabState) -> Command[Any]: ...
+    async def __call__(self, state: AutoLabState, config: RunnableConfig) -> Command[Any]: ...
 
 
 def merged_policy(trigger: HITLTrigger[Any], key: str) -> MergedPolicy:
@@ -77,58 +98,72 @@ def merged_policy(trigger: HITLTrigger[Any], key: str) -> MergedPolicy:
     return check
 
 
-def make_hitl_node(policies: Mapping[str, MergedPolicy] | None = None) -> HITLNode:
+def make_hitl_node(
+    policies: Mapping[str, MergedPolicy], *, observer: HITLObserver | None = None
+) -> HITLNode:
     """Build the `hitl` node.
 
     `approve` on a `verification` request first runs the agent's entry in
     `policies` (AUDIT-5 #3): if it fires, the node pauses again with a `policy`
-    request instead of merging the payload.
+    request instead of merging the payload. `observer` sees every resolution.
     """
-    checks = dict(policies or {})
+    checks = dict(policies)
 
-    async def hitl(state: AutoLabState) -> Command[Any]:
+    async def hitl(state: AutoLabState, config: RunnableConfig) -> Command[Any]:
         pending = state.get("hitl_pending")
-        agent = pending.agent if pending else ""
         resolution = HITLResolution.model_validate(
             interrupt(
                 {
-                    "agent": agent,
+                    "agent": pending.agent if pending else "",
                     "reason": pending.reason if pending else "",
                     "payload": dict(pending.payload) if pending else {},
                 }
             )
         )
-        cleared: dict[str, Any] = {
-            "hitl_pending": None,
-            "hitl_payload": None,
-            "current_agent": "hitl",
-            "retry_count": 0,
-            "feedback": "",
-        }
-        if resolution.action == "approve":
-            merged = state.get("hitl_payload") or {}
-            policy = checks.get(agent)
-            if pending and pending.payload.get("trigger") == "verification" and policy:
-                reason = await policy(merged, state)
-                if reason is not None:
-                    request = HITLRequest(
-                        agent=agent, reason=reason, payload={**pending.payload, "trigger": "policy"}
-                    )
-                    return Command(
-                        goto="hitl",
-                        update={**cleared, "hitl_pending": request, "hitl_payload": merged},
-                    )
-            return Command(goto=NEXT_NODE.get(agent, END), update={**merged, **cleared})
-        if resolution.action == "retry" and agent in NEXT_NODE:
-            note = resolution.note or (pending.reason if pending else "")
-            return Command(goto=agent, update={**cleared, "feedback": note})
-        return Command(goto=END, update=cleared)
+        started = datetime.now(tz=UTC)
+        t0 = time.perf_counter()
+        command = await _resolve(state, resolution, checks)
+        if observer is not None:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            await observer(
+                HITLOutcome(pending, resolution, command, started, latency_ms), state, config
+            )
+        return command
 
     return hitl
 
 
-hitl_node: Final[HITLNode] = make_hitl_node()
-"""The `hitl` node with no policy re-checks."""
+async def _resolve(
+    state: AutoLabState, resolution: HITLResolution, checks: Mapping[str, MergedPolicy]
+) -> Command[Any]:
+    """Route one human resolution of the state's `hitl_pending` request."""
+    pending = state.get("hitl_pending")
+    agent = pending.agent if pending else ""
+    cleared: dict[str, Any] = {
+        "hitl_pending": None,
+        "hitl_payload": None,
+        "current_agent": "hitl",
+        "retry_count": 0,
+        "feedback": "",
+    }
+    if resolution.action == "approve":
+        merged = state.get("hitl_payload") or {}
+        policy = checks.get(agent)
+        if pending and pending.payload.get("trigger") == "verification" and policy:
+            reason = await policy(merged, state)
+            if reason is not None:
+                request = HITLRequest(
+                    agent=agent, reason=reason, payload={**pending.payload, "trigger": "policy"}
+                )
+                return Command(
+                    goto="hitl",
+                    update={**cleared, "hitl_pending": request, "hitl_payload": merged},
+                )
+        return Command(goto=NEXT_NODE.get(agent, END), update={**merged, **cleared})
+    if resolution.action == "retry" and agent in NEXT_NODE:
+        note = resolution.note or (pending.reason if pending else "")
+        return Command(goto=agent, update={**cleared, "feedback": note})
+    return Command(goto=END, update=cleared)
 
 
 def cost_trigger(max_cost_usd: float, max_duration_min: float) -> HITLTrigger[ExperimentDesign]:
@@ -196,10 +231,11 @@ def new_in_process_saver() -> MemorySaver:
 
 
 __all__ = [
+    "HITLObserver",
+    "HITLOutcome",
     "contradiction_trace",
     "contradiction_trigger",
     "cost_trigger",
-    "hitl_node",
     "make_hitl_node",
     "merged_policy",
     "new_in_process_saver",

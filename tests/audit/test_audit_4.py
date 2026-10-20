@@ -20,7 +20,7 @@ from autolab.config import PASS_THRESHOLD
 from autolab.orchestrator.checkpoints import (
     contradiction_trace,
     contradiction_trigger,
-    hitl_node,
+    make_hitl_node,
     new_in_process_saver,
 )
 from autolab.state.models import HITLRequest, HITLResolution, Hypothesis
@@ -191,7 +191,7 @@ async def test_contradiction_trigger_ignores_non_contradiction_failures() -> Non
 
 
 # --------------------------------------------------------------------------
-# M16: hitl_node no longer resets `retry_count`.
+# M16: the hitl node no longer resets `retry_count`.
 # --------------------------------------------------------------------------
 
 
@@ -218,14 +218,14 @@ async def test_human_retry_restores_the_automatic_retry_budget() -> None:
 
 
 # --------------------------------------------------------------------------
-# M21: hitl_node `retry` no longer checks the agent is a graph node.
+# M21: the hitl node `retry` no longer checks the agent is a graph node.
 # --------------------------------------------------------------------------
 
 
 async def test_hitl_retry_for_unknown_agent_ends_the_run() -> None:
     """A retry for a request whose agent is not a node ends the run (kills M21)."""
     graph: StateGraph[AutoLabState, AutoLabState, AutoLabState] = StateGraph(AutoLabState)
-    graph.add_node("hitl", hitl_node, destinations=(END,))
+    graph.add_node("hitl", make_hitl_node({}), destinations=(END,))
     graph.add_edge(START, "hitl")
     app: Any = graph.compile(checkpointer=new_in_process_saver())
     config = {"configurable": {"thread_id": str(uuid4())}}
