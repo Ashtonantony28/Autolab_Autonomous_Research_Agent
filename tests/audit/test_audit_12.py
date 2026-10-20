@@ -332,7 +332,6 @@ async def test_design_concluding_the_bound_claim_cannot_hide_its_protocol_cost()
 _WAIT_S = 10.0
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-12 #2")
 async def test_cancel_between_the_two_z3_checks_still_stops_the_second(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

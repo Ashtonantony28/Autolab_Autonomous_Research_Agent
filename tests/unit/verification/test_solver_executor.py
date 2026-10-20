@@ -285,8 +285,11 @@ def z3_spy(monkeypatch: pytest.MonkeyPatch) -> _Z3Spy:
     def check(self: z3.Solver, *args: object) -> object:
         with lock:
             spy.checks += 1
-            if spy.checks == 2:  # premise consistency first, then the entailment check
-                spy.entailing.set()
+            entailing = spy.checks == 2  # premise consistency first, then the entailment check
+        if entailing:
+            spy.entailing.set()
+            # The first interrupt lands before the check starts, where Z3 drops it.
+            assert spy.interrupted.wait(_WAIT_S)
         return real_check(self, *args)
 
     def interrupt(self: z3.Context) -> None:
@@ -298,21 +301,43 @@ def z3_spy(monkeypatch: pytest.MonkeyPatch) -> _Z3Spy:
     return spy
 
 
-def _undecidable_check() -> solver_mod.SolverOutcome:
-    solver = Z3Solver(timeout_seconds=_HANG_S)
-    return solver.check_entailment([SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES))
+class _Undecidable:
+    """An entailment check only an interrupt ends before `_HANG_S`; records how it ended."""
+
+    def __init__(self) -> None:
+        self.outcome: solver_mod.SolverOutcome | None = None
+        self.elapsed_s = 0.0
+        self.done = threading.Event()
+
+    def __call__(self) -> solver_mod.SolverOutcome:
+        solver = Z3Solver(timeout_seconds=_HANG_S)
+        started = time.perf_counter()
+        try:
+            self.outcome = solver.check_entailment(
+                [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
+            )
+            return self.outcome
+        finally:
+            self.elapsed_s = time.perf_counter() - started
+            self.done.set()
 
 
 async def test_cancelling_a_caller_interrupts_its_z3_context(
     make_executor: ExecutorFactory, z3_spy: _Z3Spy
 ) -> None:
     executor = make_executor(1)
-    task = asyncio.create_task(executor.run(_undecidable_check))
+    check = _Undecidable()
+    task = asyncio.create_task(executor.run(check))
+    # The spy signals just before `Solver.check()` starts, where Z3 drops an interrupt.
     assert await asyncio.to_thread(z3_spy.entailing.wait, _WAIT_S)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert await asyncio.to_thread(z3_spy.interrupted.wait, _WAIT_S)
+    assert await asyncio.to_thread(check.done.wait, _WAIT_S)
+    assert z3_spy.interrupted.is_set()
+    assert check.outcome is not None
+    assert check.outcome.details == "interrupted"
+    assert check.elapsed_s < _WAIT_S
     assert (await executor.run(lambda: "free"))[0] == "free"
 
 
@@ -320,12 +345,83 @@ async def test_shutdown_interrupts_the_running_z3_context(
     make_executor: ExecutorFactory, z3_spy: _Z3Spy
 ) -> None:
     executor = make_executor(1)
-    task = asyncio.create_task(executor.run(_undecidable_check))
+    check = _Undecidable()
+    task = asyncio.create_task(executor.run(check))
     assert await asyncio.to_thread(z3_spy.entailing.wait, _WAIT_S)
     await asyncio.to_thread(executor.shutdown)
     assert z3_spy.interrupted.is_set()
     outcome, _ = await task
-    assert (outcome.verdict, outcome.reason) == ("UNGROUNDED", "timeout")
+    assert (outcome.verdict, outcome.reason, outcome.details) == (
+        "UNGROUNDED",
+        "timeout",
+        "interrupted",
+    )
+    assert check.elapsed_s < _WAIT_S
+
+
+async def test_cancel_during_a_check_returns_it_promptly(make_executor: ExecutorFactory) -> None:
+    executor = make_executor(1)
+    check = _Undecidable()
+    task = asyncio.create_task(executor.run(check))
+    await asyncio.sleep(0.2)  # well inside the entailment check; no spy widens a window
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(check.done.wait, _WAIT_S)
+    assert check.outcome is not None
+    assert check.outcome.details == "interrupted"
+
+
+async def test_interrupt_never_reaches_a_later_check(make_executor: ExecutorFactory) -> None:
+    executor = make_executor(1)
+    check = _Undecidable()
+    task = asyncio.create_task(executor.run(check))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(check.done.wait, _WAIT_S)
+    trace, fake = build(chain(4, cite=True))
+    result = await Verifier(fake, solver_executor=executor).verify(trace)
+    assert result.consistency_score == 1.0
+
+
+async def test_a_parse_cut_short_by_a_cancel_is_not_a_formalization_failure(
+    make_executor: ExecutorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def cancelled_parse(self: z3.Solver, s: str) -> None:
+        solver_mod._worker.interrupt.request()
+        raise z3.Z3Exception("canceled")
+
+    monkeypatch.setattr(z3.Solver, "from_string", cancelled_parse)
+    executor = make_executor(1)
+    decls = "(declare-const p Bool)"
+    check = partial(Z3Solver().check_entailment, [SmtFormula(decls, "p")], SmtFormula(decls, "p"))
+    outcome, _ = await executor.run(check)
+    assert outcome.details == "interrupted"
+
+
+def test_each_check_starts_from_default_global_parameters() -> None:
+    decls = "(declare-const p Bool)\n(declare-const q Bool)"
+    z3.set_param("rlimit", 1)  # what a `(set-option :rlimit 1)` parsed anywhere would leave
+    try:
+        out = Z3Solver().check_entailment(
+            [SmtFormula(decls, "p"), SmtFormula(decls, "(=> p q)")], SmtFormula(decls, "q")
+        )
+    finally:
+        z3.reset_params()
+    assert out.verdict == "VALID"
+
+
+def test_counter_model_does_not_use_the_shared_printer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def printer(*_: object) -> None:
+        raise AssertionError("z3printer used")
+
+    monkeypatch.setattr(z3.z3printer.PP, "__call__", printer)
+    decls = "(declare-const p Bool)\n(declare-const q Bool)"
+    out = Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "q"))
+    assert out.verdict == "INVALID"
+    assert "define-fun q" in out.counter_model
 
 
 async def test_run_time_excludes_waiting_for_a_worker(

@@ -34,7 +34,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG16 | Circularity in the second payload pass (AUDIT-9 #3) | SG15 | `verification/vericot.py` (payload proof only), `tests/unit/verification/test_payload_proof.py` | done (PR pending) |
 | SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
 | SG18 | Trace and persist HITL outcomes (AUDIT-11 #1, #3, #7) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*`, `cli.py` (abort message) | done (PR pending) |
-| SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | todo |
+| SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -322,6 +322,14 @@ Round 3 (AUDIT-9..12, fresh agents, base `7b8c452`) found 1 critical and 7 high 
   - **Tests.** The cancel and shutdown tests assert that the interrupted check returns promptly.
   - **Flip:** AUDIT-10 #1, AUDIT-12 #2.
   - **Verify:** `uv run pytest tests/audit/test_audit_10.py tests/audit/test_audit_12.py tests/unit/verification -q` · `uv run python -m scripts.bench_verifier --runs 20`.
+
+  **Result (2026-10-20):** Files changed: `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_2.py` (the starvation test installs an 8-worker default pool), the AUDIT-10 #1, #5 and AUDIT-12 #2 markers, and the Resolution lines in AUDIT-10.md and AUDIT-12.md. `vericot.py` and `test_latency.py` are untouched; no latency bound moved. Tests added: 5 (cancel well inside a check returns `interrupted`; a cancelled check leaves the next verify all VALID; a parse cut short by a cancel is not `formalization_failed`; a check under a global `rlimit 1` is still VALID; counter-models skip z3py's printer). The cancel and shutdown tests now hold the check in Z3's drop window and assert `interrupted`. Flipped unchanged: AUDIT-10 #1, AUDIT-10 #5 (folded in), AUDIT-12 #2. Verify: lint and mypy clean; full suite 909 passed, 13 skipped, 27 xfailed; the SG19 set (`test_audit_{2,6,10,12}`, `tests/unit/verification`) 422 passed, 10 xfailed; bench step p95 7.74 ms (8.06–8.58 in earlier runs; the base branch gave 8.18–8.44 ms on this machine); error injection 34/34, precision 100%, 26/26 valid admitted; `solver.py` coverage 98%. AUDIT-10 #1 load (`audit_load_3`, quiet 4-CPU machine), before → after: 10 × 100-step verifies 13.00 s, step p95 315.9 ms → 2.74 s, 5.8 ms; 50 × 100 48.1 s, 266.7 ms → 13.9 s, 6.0 ms; 30 × 40 13.66 s, 310.6 ms → 3.16 s, 5.9 ms. As built:
+  - `SOLVER_WORKERS = min(2, cpu)`. Most of the gain comes from asserting the document with one `Solver.from_string` call; the old per-assertion `add` loop made a GIL hand-off per call. The negated claim is `(= claim! (not C))`, checked as an assumption. On the new path 3–4 workers are slightly faster in wall time (2.0–2.4 s for 10 × 100), but their p95 is 1.2–2.3× one worker's, against at most 1.27× for 2.
+  - `_Interrupt` re-sends a requested interrupt every 5 ms from a short-lived thread until the check detaches. A request before attach refuses the check. `unknown` after a request is `interrupted`.
+  - `z3.reset_params()` runs before each fresh context, which is when Z3 reads global parameters.
+  - `counter_model` is `model.sexpr()`.
+
+  Open: the context is still created per check (AUDIT-10 #4). Reusing it would also keep any global parameters it was created with. AUDIT-10 #2 and #3 are unchanged. `reset_params()` also clears parameters a host sets on purpose.
 
 Medium and low round-3 findings stay in the AUDIT files. One of them, AUDIT-11 #4, needs the owner's call: should the contradiction trigger read hypotheses from earlier runs? After SG15–SG19, audit round 4 re-runs all four audits.
 

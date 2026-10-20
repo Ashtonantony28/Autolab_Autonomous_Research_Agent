@@ -29,7 +29,6 @@ _MB_PER_IDLE_THREAD: Final = 2.0
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-10 #1")
 async def test_the_default_solver_pool_does_not_inflate_solver_ms_under_concurrency() -> None:
     # 12 concurrent 30-step verifies, once on a 1-worker pool and once on the default
     # pool (8 workers on 4 CPUs). Every z3py call drops and re-takes the GIL, so the
@@ -79,7 +78,6 @@ def test_a_trivial_check_is_not_dominated_by_creating_a_context() -> None:
 # --- #5 (low): counter-models go through z3's shared printer on every worker ----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-10 #5")
 async def test_counter_models_are_never_printed_on_two_threads_at_once() -> None:
     # z3's pretty-printer keeps its state in module globals. 16 INVALID checks on 8
     # workers put 8 threads inside it at once; the strings are discarded by the verifier.
