@@ -20,8 +20,10 @@ asyncio's default executor (AUDIT-2 #1); each of its threads waits on one
 worker. A check still running after `_SLICE_S` gives its slot to the next
 caller and runs on as one of at most `slow_workers` slow checks: hard runs
 cannot starve easy ones (AUDIT-14 #2). With no slow room left, its slot still
-admits a caller whose last check was short (AUDIT-18 #4). The pool starts a
-thread for every admitted check that finds none idle (AUDIT-18 #2).
+admits a caller whose last check was short (AUDIT-18 #4), and only a slot can
+lend (AUDIT-24 #3). A run is hard by its check's run time (AUDIT-24 #2), and a
+caller passed over `workers` times is served next (AUDIT-22 #4). The pool starts
+a thread for every admitted check that finds none idle (AUDIT-18 #2).
 
 Inputs are SMT-LIB 2 strings, parsed by Z3 in one call so the boundary
 between LLM-produced text and Z3's AST is explicit. Z3's simplex on a long pool
@@ -34,6 +36,7 @@ hand-offs. The claim `true` needs no entailment check (AUDIT-18 #7).
 from __future__ import annotations
 
 import asyncio
+import itertools
 import math
 import os
 import queue
@@ -137,8 +140,8 @@ together do not outnumber the CPUs (AUDIT-18 #5)."""
 _SLICE_S: Final[float] = 0.05
 """How long a Z3 check holds its slot before it runs on as a slow check."""
 _HARD_SLICES: Final[int] = 4
-"""A caller whose last check ran this many slices loses its priority and lent places;
-an easy check slowed by load stays well under it (AUDIT-18 #4)."""
+"""A caller whose last check ran this many slices of time loses its priority and lent
+places; an easy check slowed by load stays well under it (AUDIT-18 #4, AUDIT-24 #2)."""
 _SETUP_SHARE: Final[float] = 0.5
 """Z3 sets up the entailment check, without polling its limit, in up to this share of
 the time the consistency check took; with less time left the check is not started."""
@@ -157,6 +160,11 @@ _IDLE_WORKERS: Final[int] = max(2, 2 * SOLVER_WORKERS + SOLVER_SLOW_WORKERS)
 """Worker processes kept idle: every slot, slow check and lent place of the default pool."""
 
 T = TypeVar("T")
+
+
+def _clock() -> float:
+    """The clock a check's run time is measured by, on its pool thread."""
+    return time.perf_counter()
 
 
 @dataclass(frozen=True)
@@ -427,13 +435,21 @@ class _Interrupt:
     """Lets the event loop stop the check running on one pool thread.
 
     The attached target is the check's worker; `request` kills it, so the check
-    stops wherever it is.
+    stops wherever it is. The pool thread records when the call started and ended.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._target: _Stoppable | None = None
         self._requested = False
+        self.started: float | None = None
+        self.ended: float | None = None
+
+    def ran_s(self) -> float:
+        """How long the call has run, or ran; 0 before it starts."""
+        if self.started is None:
+            return 0.0
+        return (_clock() if self.ended is None else self.ended) - self.started
 
     def attached(self) -> bool:
         """Whether a target is attached, that is, a check is in progress."""
@@ -564,13 +580,24 @@ class _Pool:
             return True
 
 
+class _Waiter:
+    __slots__ = ("future", "passed", "short")
+
+    def __init__(self, future: asyncio.Future[bool], short: bool) -> None:
+        self.future = future
+        self.short = short
+        self.passed = 0
+
+
 class _Slots:
     """Admission for one event loop: `workers` slots, granted in FIFO order, callers
-    whose last check ended within its slice first.
+    whose last check was short first.
 
-    A slot whose Z3 check is stuck (past `_SLICE_S` with no slow room) also lends
-    a place to one caller whose last check ended within its slice, so easy runs
-    keep moving however many hard runs there are (AUDIT-18 #4).
+    A caller that later arrivals have overtaken for `workers` slots is served next,
+    so every caller waits a bounded number of grants (AUDIT-22 #4). A slot whose Z3
+    check is stuck (past `_SLICE_S` with no slow room) also lends a place to one
+    caller whose last check was short, so easy runs keep moving however
+    many hard runs there are (AUDIT-18 #4); a lent place never lends (AUDIT-24 #3).
     """
 
     def __init__(self, workers: int) -> None:
@@ -578,21 +605,20 @@ class _Slots:
         self.held = 0
         self.stuck = 0
         self.lent = 0
-        self._waiters: deque[tuple[asyncio.Future[bool], bool]] = deque()
+        self._waiters: deque[_Waiter] = deque()
 
     async def acquire(self, short: bool) -> bool:
         """Wait for a place; True if a stuck slot lent it."""
         lent = self._grant(short)
         if lent is not None:
             return lent
-        waiter: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        entry = (waiter, short)
+        entry = _Waiter(asyncio.get_running_loop().create_future(), short)
         self._waiters.append(entry)
         try:
-            return await waiter
+            return await entry.future
         except asyncio.CancelledError:
-            if waiter.done() and not waiter.cancelled():
-                self.release(waiter.result())
+            if entry.future.done() and not entry.future.cancelled():
+                self.release(entry.future.result())
             else:
                 self._waiters.remove(entry)
             raise
@@ -604,9 +630,13 @@ class _Slots:
             self.held -= 1
         self._wake()
 
-    def stick(self) -> None:
+    def stick(self, lent: bool) -> bool:
+        """Count a slot's check as stuck, lending a place; False, counting nothing, if lent."""
+        if lent:
+            return False
         self.stuck += 1
         self._wake()
+        return True
 
     def unstick(self) -> None:
         self.stuck -= 1
@@ -620,16 +650,25 @@ class _Slots:
             return True
         return None
 
+    def _rank(self, entry: _Waiter) -> int:
+        return 0 if entry.passed >= self.workers else 1 if entry.short else 2
+
     def _wake(self) -> None:
-        # Short callers first: a free slot goes to a hard run only when no easy one waits.
-        for entry in sorted(self._waiters, key=lambda e: not e[1]):
-            waiter, short = entry
-            if waiter.done():  # cancelled; its caller removes it
-                continue
-            lent = self._grant(short)
-            if lent is not None:
-                self._waiters.remove(entry)
-                waiter.set_result(lent)
+        while True:
+            for entry in sorted(self._waiters, key=self._rank):
+                if entry.future.done():  # cancelled; its caller removes it
+                    continue
+                lent = self._grant(entry.short)
+                if lent is not None:
+                    break
+            else:
+                return
+            index = self._waiters.index(entry)
+            del self._waiters[index]
+            entry.future.set_result(lent)
+            if not lent:
+                for ahead in itertools.islice(self._waiters, index):
+                    ahead.passed += 1
 
 
 class SolverExecutor:
@@ -670,24 +709,21 @@ class SolverExecutor:
             short = task in self._short
         lent = await slots.acquire(short)
         slow = stuck = False
-        slices = 0
+        interrupt = _Interrupt()
         try:
             if lent:
                 self._pool.resize(1)
-            interrupt = _Interrupt()
             job = self._pool.submit(self._call, fn, interrupt)
             future = asyncio.wrap_future(job)
             try:
                 while not slow and not (await asyncio.wait((future,), timeout=_SLICE_S))[0]:
-                    slices += 1
                     slow = self._to_slow(interrupt)
                     if slow:
                         if stuck:
                             slots.unstick()
                         slots.release(lent)
                     elif not (stuck or lent) and interrupt.attached():
-                        stuck = True
-                        slots.stick()
+                        stuck = slots.stick(lent)
                 return await future
             except asyncio.CancelledError:
                 future.cancel()
@@ -706,7 +742,7 @@ class SolverExecutor:
                 self._pool.resize(-1)
             if task is not None:
                 with self._lock:
-                    if slices >= _HARD_SLICES:
+                    if interrupt.ran_s() >= _HARD_SLICES * _SLICE_S:
                         self._short.discard(task)
                     else:
                         self._short.add(task)
@@ -754,13 +790,15 @@ class SolverExecutor:
             if self._closed:
                 interrupt.request()
         _worker.interrupt = interrupt
-        started = time.perf_counter()
+        interrupt.started = started = _clock()
         try:
-            return fn(), (time.perf_counter() - started) * _MS_PER_S
+            result = fn()
         finally:
+            interrupt.ended = ended = _clock()
             _worker.interrupt = None
             with self._lock:
                 self._running.discard(interrupt)
+        return result, (ended - started) * _MS_PER_S
 
 
 _default_executor: SolverExecutor | None = None

@@ -120,7 +120,6 @@ _DURATION_S: Final = 2.0
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-22 #4")
 async def test_a_new_runs_first_check_is_not_starved_by_short_callers() -> None:
     # 2 slots, 3 runs making back-to-back 20 ms checks for 2 s. A new run's first check
     # is not "short" (its task has no last check), and `_Slots._wake` serves every short
