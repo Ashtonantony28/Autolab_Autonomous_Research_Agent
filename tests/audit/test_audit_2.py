@@ -311,7 +311,7 @@ async def test_both_checks_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(z3.Solver, "check", slow_first)
     started = time.perf_counter()
-    out = Z3Solver(timeout_seconds=timeout_s).check_entailment(
+    out = Z3Solver(timeout_seconds=timeout_s)._check_here(
         [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
     elapsed = time.perf_counter() - started

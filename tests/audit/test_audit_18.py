@@ -205,7 +205,7 @@ def test_a_premise_check_finishes_when_its_entailment_step_needs_no_time(
     monkeypatch.setattr(solver_mod, "time", Clock)
     monkeypatch.setattr(z3.Solver, "check", check)
     premises, claim = bool_chain(10, claim="true")
-    outcome = Z3Solver(timeout_s).check_entailment(premises, claim)
+    outcome = Z3Solver(timeout_s)._check_here(premises, claim)
     assert outcome.verdict == "VALID", outcome.details
 
 

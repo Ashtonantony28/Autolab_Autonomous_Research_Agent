@@ -44,7 +44,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | done (PR pending) |
 | SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | done (PR pending) |
 | SG28 | Formalizer probe cost linear in arity (AUDIT-22 #1) | audit round 6 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | open |
+| SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | done (PR pending) |
 | SG30 | Slot fairness by elapsed time with aging (AUDIT-22 #4, AUDIT-24 #2, #3) | SG29 | `verification/solver.py` scheduling only, `tests/unit/verification/test_solver_scheduling.py` | open |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.

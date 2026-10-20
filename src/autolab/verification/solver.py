@@ -8,33 +8,36 @@ INVALID with reason `premises_inconsistent`. Then Z3 is asked about
 (INVALID); if `unknown` (timeout or undecidable), we conservatively return
 UNGROUNDED.
 
-Checks run on `SolverExecutor`, a bounded thread pool separate from asyncio's
-default executor (AUDIT-2 #1). z3py drops the GIL around every C call, so
-checks on several threads convoy on it; the default pool is small (AUDIT-10 #1).
-A check still in Z3 after `_SLICE_S` waits on Z3, not on the GIL, so it gives
-its slot to the next caller and runs on as one of at most `slow_workers` slow
-checks: hard runs cannot starve easy ones (AUDIT-14 #2). With no slow room
-left, its slot still admits a caller whose last check was short (AUDIT-18 #4).
-The pool starts a thread for every admitted check that finds none idle
-(AUDIT-18 #2). Cancelling a caller interrupts its Z3 check, including one that
-has not started yet (AUDIT-12 #2).
+Every check runs in a persistent worker process (`solver_workers`, ADR 0009):
+the parent sends the SMT-LIB document and the timeout, and `_solve` decides it
+there in a fresh `z3.Context`. A check still running `_KILL_GRACE_SHARE` past
+its timeout, or whose caller is cancelled, is ended by killing its worker, so
+timeouts and cancels hold for any formula shape, and solving never holds the
+parent's GIL (AUDIT-22 #2, #3). A killed check is never VALID.
+
+Checks are scheduled by `SolverExecutor`, a bounded thread pool separate from
+asyncio's default executor (AUDIT-2 #1); each of its threads waits on one
+worker. A check still running after `_SLICE_S` gives its slot to the next
+caller and runs on as one of at most `slow_workers` slow checks: hard runs
+cannot starve easy ones (AUDIT-14 #2). With no slow room left, its slot still
+admits a caller whose last check was short (AUDIT-18 #4). The pool starts a
+thread for every admitted check that finds none idle (AUDIT-18 #2).
 
 Inputs are SMT-LIB 2 strings, parsed by Z3 in one call so the boundary
-between LLM-produced text and Z3's AST is explicit. Given a long pool at once,
-Z3's simplex runs for seconds without stopping for its timeout or interrupts,
-so a pool of more than `_LOAD_ABOVE` premises is asserted one formula at a
-time, each after a check that keeps the simplex feasible (AUDIT-18 #3). The
-claim `true` needs no entailment check (AUDIT-18 #7). Every check runs in a
-fresh `z3.Context`, created from default global parameters, so checks are
-safe to run on worker threads, and all checks share one `timeout_seconds`
-deadline.
+between LLM-produced text and Z3's AST is explicit. Z3's simplex on a long pool
+of Real bounds is many times slower in one call, so such a pool of more than
+`_LOAD_ABOVE` premises is asserted one formula at a time, each after a check
+that keeps the simplex feasible (AUDIT-18 #3); in a worker that costs no GIL
+hand-offs. The claim `true` needs no entailment check (AUDIT-18 #7).
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import queue
+import re
 import threading
 import time
 import weakref
@@ -42,29 +45,91 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Final, TypeVar
+from typing import Any, Final, Protocol, TypeVar
 
 import z3
 
 from autolab.config import SOLVER_TIMEOUT_S
 from autolab.state.models import StepReason, Verdict
+from autolab.verification import solver_workers
 
 _MS_PER_S: Final[int] = 1000
 
+_CGROUP_V2: Final[tuple[str, ...]] = ("/sys/fs/cgroup/cpu.max",)
+_CGROUP_V1: Final[tuple[tuple[str, str], ...]] = tuple(
+    (f"/sys/fs/cgroup/{d}/cpu.cfs_quota_us", f"/sys/fs/cgroup/{d}/cpu.cfs_period_us")
+    for d in ("cpu", "cpu,cpuacct")
+)
+
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _quota(quota: str, period: str) -> int | None:
+    """CPUs a quota allows, rounded up; None for no quota."""
+    try:
+        q, p = int(quota), int(period)
+    except ValueError:
+        return None
+    return math.ceil(q / p) if q > 0 and p > 0 else None
+
+
+def _own_cgroup_files() -> tuple[list[str], list[tuple[str, str]]]:
+    """This process's own cgroup quota files, for hosts without a cgroup namespace."""
+    v2: list[str] = []
+    v1: list[tuple[str, str]] = []
+    for line in (_read("/proc/self/cgroup") or "").splitlines():
+        _, controllers, path = [*line.split(":", 2), "", ""][:3]
+        if path in ("", "/"):
+            continue
+        if not controllers:
+            v2.append(f"/sys/fs/cgroup{path}/cpu.max")
+        elif "cpu" in controllers.split(","):
+            base = f"/sys/fs/cgroup/{controllers}{path}"
+            v1.append((f"{base}/cpu.cfs_quota_us", f"{base}/cpu.cfs_period_us"))
+    return v2, v1
+
+
+def _cgroup_cpus() -> int | None:
+    """CPUs the cgroup CPU quota allows (v2 `cpu.max`, v1 cfs quota/period), if any."""
+    own_v2, own_v1 = _own_cgroup_files()
+    found: list[int] = []
+    for path in (*_CGROUP_V2, *own_v2):
+        text = _read(path)
+        if text is not None:
+            quota, _, period = text.strip().partition(" ")
+            if (cpus := _quota(quota, period or "100000")) is not None:
+                found.append(cpus)
+    for quota_path, period_path in (*_CGROUP_V1, *own_v1):
+        quota_text, period_text = _read(quota_path), _read(period_path)
+        if quota_text is None or period_text is None:
+            continue
+        if (cpus := _quota(quota_text.strip(), period_text.strip())) is not None:
+            found.append(cpus)
+    return min(found) if found else None
+
 
 def _available_cpus() -> int:
-    """CPUs this process may run on: its affinity where known, not the host's count."""
+    """CPUs this process may use: its affinity and its cgroup quota (AUDIT-22 #6)."""
     process_cpu_count: Callable[[], int | None] | None = getattr(os, "process_cpu_count", None)
     if process_cpu_count is not None:
-        return process_cpu_count() or 1
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count() or 1  # pragma: no cover - platforms without affinity
+        cpus = process_cpu_count() or 1
+    elif hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:  # pragma: no cover - platforms without affinity
+        cpus = os.cpu_count() or 1
+    quota = _cgroup_cpus()
+    return max(1, min(cpus, quota)) if quota is not None else cpus
 
 
 _CPUS: Final[int] = _available_cpus()
 SOLVER_WORKERS: Final[int] = min(2, _CPUS)
-"""Default size of the Z3 pool; more threads only contend for the GIL (AUDIT-10 #1)."""
+"""Default size of the Z3 pool (AUDIT-10 #1)."""
 SOLVER_SLOW_WORKERS: Final[int] = max(0, _CPUS - SOLVER_WORKERS)
 """Default number of long checks that may run beside the pool's own slots (AUDIT-14 #2).
 Long checks are CPU-bound and timeouts are wall-clock, so slots and slow checks
@@ -80,11 +145,16 @@ the time the consistency check took; with less time left the check is not starte
 _NEGATED_CLAIM: Final[str] = "claim!"
 """Not a plain identifier, so no formalized step can declare it."""
 _LOAD_ABOVE: Final[int] = 100
-"""Pools of more premises are loaded one formula at a time; smaller ones in one call."""
+"""Real pools of more premises are loaded one formula at a time; others in one call."""
+_REAL: Final[re.Pattern[str]] = re.compile(r"\bReal\b")
 _RESET_SHARE: Final[float] = 0.9
 """While loading, the timeout is set again once less than this share of it is left."""
-_REARM_S: Final[float] = 0.005
-"""How often a requested interrupt is re-sent: Z3 drops one sent outside `Solver.check()`."""
+_KILL_GRACE_SHARE: Final[float] = 0.1
+"""A worker still running this share of its timeout past it is killed."""
+_KILL_GRACE_MIN_S: Final[float] = 0.01
+"""The least grace, so a short check is not killed for scheduling noise."""
+_IDLE_WORKERS: Final[int] = max(2, 2 * SOLVER_WORKERS + SOLVER_SLOW_WORKERS)
+"""Worker processes kept idle: every slot, slow check and lent place of the default pool."""
 
 T = TypeVar("T")
 
@@ -113,6 +183,10 @@ class SolverOutcome:
     counter_model: str = ""
 
 
+class SolverWorkerError(RuntimeError):
+    """A check raised in its worker process; the message is the worker's error."""
+
+
 @dataclass
 class Z3Solver:
     """Stateless Z3-backed entailment checker; safe to call from any thread."""
@@ -124,103 +198,158 @@ class Z3Solver:
         premises: list[SmtFormula],
         claim: SmtFormula,
     ) -> SolverOutcome:
-        """Return whether `claim` is entailed by `premises`.
+        """Return whether `claim` is entailed by `premises`, decided in a worker process.
 
         Conventions:
           - No premises → UNGROUNDED.
           - premises alone unsat → INVALID (`premises_inconsistent`).
           - premises and not claim is unsat → VALID.
           - premises and not claim is sat   → INVALID.
-          - Any solver error / unknown / timeout → UNGROUNDED.
+          - Any solver error / unknown / timeout / killed worker → UNGROUNDED.
+
+        Raises:
+            SolverWorkerError: the check raised in its worker.
         """
         if not premises:
-            return SolverOutcome(
-                verdict="UNGROUNDED", reason="no_premises", details="no premises to entail from"
-            )
-
-        deadline = time.monotonic() + self.timeout_seconds
-        z3.reset_params()  # the context below starts from default parameters (AUDIT-9 #2)
-        ctx = z3.Context()
+            return _NO_PREMISES
+        args = self._args(premises, claim)
         interrupt: _Interrupt = getattr(_worker, "interrupt", None) or _Interrupt()
-        if not interrupt.attach(ctx):
+        if interrupt.requested():
             return _INTERRUPTED
+        pool = _workers()
+        setup = time.perf_counter()
+        worker = pool.acquire()
+        if not interrupt.attach(worker):
+            pool.release(worker)
+            return _INTERRUPTED
+        booted = worker.ready()
+        checking = time.perf_counter()
         try:
-            return self._check(premises, claim, ctx, deadline, interrupt)
-        finally:
+            budget_s = self.timeout_seconds + _grace_s(self.timeout_seconds)
+            reply = worker.call(args, budget_s) if booted else None
+        except BaseException:  # e.g. a per-test timeout's signal: the worker is mid-check
             interrupt.detach()
+            pool.discard(worker)
+            raise
+        checked = time.perf_counter()
+        interrupt.detach()
+        if reply is None or interrupt.requested():
+            pool.discard(worker)
+        else:
+            pool.release(worker)
+        # Starting, booting and replacing workers is not the check's own time (`solver_ms`).
+        _worker.overhead_s = (
+            getattr(_worker, "overhead_s", 0.0)
+            + (checking - setup)
+            + (time.perf_counter() - checked)
+        )
+        if reply is None:
+            return _INTERRUPTED if interrupt.requested() else _KILLED
+        ok, value = reply
+        if not ok:
+            raise SolverWorkerError(value)
+        outcome: SolverOutcome = value
+        return outcome
 
-    def _check(
-        self,
-        premises: list[SmtFormula],
-        claim: SmtFormula,
-        ctx: z3.Context,
-        deadline: float,
-        interrupt: _Interrupt,
-    ) -> SolverOutcome:
-        solver = z3.Solver(ctx=ctx)
-        smt2 = _build_smt2(premises, claim)
-        loading: z3.AstVector | None = None
-        try:
-            if len(premises) > _LOAD_ABOVE:
-                loading = z3.parse_smt2_string(smt2, ctx=ctx)
-            else:
-                # One C call; asserting the parsed AstVector item by item costs a GIL
-                # hand-off per call (AUDIT-10 #1).
-                solver.from_string(smt2)
-        except z3.Z3Exception as exc:
-            if interrupt.requested():
-                return _INTERRUPTED
-            return SolverOutcome(
-                verdict="UNGROUNDED",
-                reason="formalization_failed",
-                details=f"SMT parse error: {exc}",
-            )
-        consistency = z3.sat if loading is None else _load(solver, loading, deadline, interrupt)
-        started = time.monotonic()
-        if consistency == z3.sat:
-            solver.set("timeout", _remaining_ms(deadline))
-            consistency = solver.check()
-        took = time.monotonic() - started
-        if consistency == z3.unsat:
-            return SolverOutcome(
-                verdict="INVALID",
-                reason="premises_inconsistent",
-                details="premises are mutually unsatisfiable",
-            )
-        details = f"premise consistency check returned {consistency}"
-        if consistency == z3.sat and claim.assertion.strip() == "true":
-            # Anything entails `true`: no entailment check, so no guard (AUDIT-18 #7).
+    def _check_here(self, premises: list[SmtFormula], claim: SmtFormula) -> SolverOutcome:
+        """`check_entailment` decided in this process, as its worker decides it (tests)."""
+        if not premises:
+            return _NO_PREMISES
+        return _solve(*self._args(premises, claim))
+
+    def _args(self, premises: list[SmtFormula], claim: SmtFormula) -> tuple[str, int, bool, float]:
+        return (
+            _build_smt2(premises, claim),
+            len(premises),
+            claim.assertion.strip() == "true",
+            self.timeout_seconds,
+        )
+
+
+_NO_PREMISES: Final = SolverOutcome(
+    verdict="UNGROUNDED", reason="no_premises", details="no premises to entail from"
+)
+_INTERRUPTED: Final = SolverOutcome(verdict="UNGROUNDED", reason="timeout", details="interrupted")
+_KILLED: Final = SolverOutcome(
+    verdict="UNGROUNDED", reason="timeout", details="worker killed past the timeout"
+)
+
+
+def _grace_s(timeout_s: float) -> float:
+    """How long past its timeout a check's worker may run before it is killed."""
+    return max(_KILL_GRACE_MIN_S, _KILL_GRACE_SHARE * timeout_s)
+
+
+def _solve(smt2: str, premises: int, true_claim: bool, timeout_s: float) -> SolverOutcome:
+    """Decide `smt2` (`premises` assertions, then the negated claim's definition).
+
+    Runs in a worker process. Every check gets a fresh context from default global
+    parameters (AUDIT-9 #2), and both checks share one `timeout_s` deadline.
+    """
+    deadline = time.monotonic() + timeout_s
+    z3.reset_params()
+    ctx = z3.Context()
+    solver = z3.Solver(ctx=ctx)
+    loading: z3.AstVector | None = None
+    try:
+        if _loaded(smt2, premises):
+            loading = z3.parse_smt2_string(smt2, ctx=ctx)
+        else:
+            solver.from_string(smt2)
+    except z3.Z3Exception as exc:
+        return SolverOutcome(
+            verdict="UNGROUNDED",
+            reason="formalization_failed",
+            details=f"SMT parse error: {exc}",
+        )
+    consistency = z3.sat if loading is None else _load(solver, loading, deadline)
+    started = time.monotonic()
+    if consistency == z3.sat:
+        solver.set("timeout", _remaining_ms(deadline))
+        consistency = solver.check()
+    took = time.monotonic() - started
+    if consistency == z3.unsat:
+        return SolverOutcome(
+            verdict="INVALID",
+            reason="premises_inconsistent",
+            details="premises are mutually unsatisfiable",
+        )
+    details = f"premise consistency check returned {consistency}"
+    if consistency == z3.sat and true_claim:
+        # Anything entails `true`: no entailment check, so no guard (AUDIT-18 #7).
+        return SolverOutcome(verdict="VALID", reason="entailed", details="premises entail claim")
+    if consistency == z3.sat and deadline - time.monotonic() < _SETUP_SHARE * took:
+        # Z3 sets the entailment check up without polling its limit (AUDIT-14 #1).
+        details = "too little time left for the entailment check"
+    elif consistency == z3.sat:
+        # Asserted, not assumed: Z3 checks LIA under an assumption in a phase that
+        # ignores both the timeout and interrupts (AUDIT-14 #1).
+        solver.add(z3.Bool(_NEGATED_CLAIM, ctx))
+        solver.set("timeout", _remaining_ms(deadline))
+        result = solver.check()
+        if result == z3.unsat:
             return SolverOutcome(
                 verdict="VALID", reason="entailed", details="premises entail claim"
             )
-        if consistency == z3.sat and deadline - time.monotonic() < _SETUP_SHARE * took:
-            # Z3 sets the entailment check up without polling its limit (AUDIT-14 #1).
-            details = "too little time left for the entailment check"
-        elif consistency == z3.sat:
-            # Asserted, not assumed: Z3 checks LIA under an assumption in a phase that
-            # ignores both the timeout and interrupts (AUDIT-14 #1).
-            solver.add(z3.Bool(_NEGATED_CLAIM, ctx))
-            solver.set("timeout", _remaining_ms(deadline))
-            result = solver.check()
-            if result == z3.unsat:
-                return SolverOutcome(
-                    verdict="VALID", reason="entailed", details="premises entail claim"
-                )
-            if result == z3.sat:
-                return SolverOutcome(
-                    verdict="INVALID",
-                    reason="not_entailed",
-                    details="premises do not entail claim",
-                    # `sexpr` is formatted in C; z3py's printer keeps global state (AUDIT-10 #5).
-                    counter_model=solver.model().sexpr(),
-                )
-            details = f"solver returned {result}"
-        if interrupt.requested():
-            return _INTERRUPTED
-        return SolverOutcome(verdict="UNGROUNDED", reason="timeout", details=details)
+        if result == z3.sat:
+            return SolverOutcome(
+                verdict="INVALID",
+                reason="not_entailed",
+                details="premises do not entail claim",
+                # `sexpr` is formatted in C; z3py's printer keeps global state (AUDIT-10 #5).
+                counter_model=solver.model().sexpr(),
+            )
+        details = f"solver returned {result}"
+    return SolverOutcome(verdict="UNGROUNDED", reason="timeout", details=details)
 
 
-_INTERRUPTED: Final = SolverOutcome(verdict="UNGROUNDED", reason="timeout", details="interrupted")
+def _loaded(smt2: str, premises: int) -> bool:
+    """Whether `_solve` loads the pool one formula at a time: long pools over Reals.
+
+    Other pools are cheapest in one call (AUDIT-22 #2); a pool loaded either way
+    reaches the same verdict, and the worker's deadline bounds both.
+    """
+    return premises > _LOAD_ABOVE and _REAL.search(smt2) is not None
 
 
 def _remaining_ms(deadline: float) -> int:
@@ -228,17 +357,15 @@ def _remaining_ms(deadline: float) -> int:
     return max(1, int((deadline - time.monotonic()) * _MS_PER_S))
 
 
-def _load(
-    solver: z3.Solver, assertions: z3.AstVector, deadline: float, interrupt: _Interrupt
-) -> z3.CheckSatResult:
+def _load(solver: z3.Solver, assertions: z3.AstVector, deadline: float) -> z3.CheckSatResult:
     """Assert `assertions` one at a time, checking before each but the first.
 
-    One new bound at a time keeps every simplex run short, and the deadline and
-    interrupt are polled between them (AUDIT-18 #3). The checks go through the
-    C API: they only keep the simplex feasible, and the caller's `Solver.check()`
-    is the consistency check.
-    Returns unsat once a prefix is unsat, unknown once the deadline passes or an
-    interrupt is requested, else sat (all asserted, consistency not yet decided).
+    One new bound at a time keeps every simplex run short, and the deadline is
+    polled between them (AUDIT-18 #3). The checks go through the C API: they
+    only keep the simplex feasible, and the caller's `Solver.check()` is the
+    consistency check.
+    Returns unsat once a prefix is unsat, unknown once the deadline passes, else
+    sat (all asserted, consistency not yet decided).
     """
     ref, handle, vector = solver.ctx.ref(), solver.solver, assertions.vector
     limit = 0
@@ -250,7 +377,7 @@ def _load(
                 solver.set("timeout", limit)
             if z3.Z3_solver_check(ref, handle) == z3.Z3_L_FALSE:
                 return z3.unsat
-            if interrupt.requested() or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 return z3.unknown
         z3.Z3_solver_assert(ref, handle, z3.Z3_ast_vector_get(ref, vector, i))
     return z3.sat
@@ -286,58 +413,68 @@ def _wrap_assert(body: str) -> str:
     return f"(assert {body.strip()})"
 
 
-class _Interrupt:
-    """Lets the event loop stop the Z3 check running on one worker thread.
+_workers_lock = threading.Lock()
+_shared_workers: solver_workers.Workers | None = None
 
-    Z3 ignores `Context.interrupt()` while no `Solver.check()` runs, so once
-    requested the interrupt is re-sent every `_REARM_S` until the check ends.
+
+def _workers() -> solver_workers.Workers:
+    """The process-wide worker processes, created on first use."""
+    global _shared_workers
+    with _workers_lock:
+        if _shared_workers is None:
+            _shared_workers = solver_workers.register(
+                solver_workers.Workers(
+                    _solve, _IDLE_WORKERS, preload=("__main__", solver_workers.__name__, __name__)
+                )
+            )
+        return _shared_workers
+
+
+class _Stoppable(Protocol):
+    def interrupt(self) -> None: ...
+
+
+class _Interrupt:
+    """Lets the event loop stop the check running on one pool thread.
+
+    The attached target is the check's worker; `request` kills it, so the check
+    stops wherever it is.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._ctx: z3.Context | None = None
+        self._target: _Stoppable | None = None
         self._requested = False
-        self._detached = threading.Event()
 
     def attached(self) -> bool:
-        """Whether a Z3 context is attached, that is, a check is in progress."""
-        return self._ctx is not None
+        """Whether a target is attached, that is, a check is in progress."""
+        return self._target is not None
 
     def requested(self) -> bool:
         """Whether an interrupt has been requested."""
         return self._requested
 
     def request(self) -> None:
-        """Interrupt the attached context until it is detached, or refuse the next attach."""
+        """Stop the attached target, or refuse the next attach."""
         with self._lock:
             if self._requested:
                 return
             self._requested = True
-            if self._ctx is None:
-                return
-            self._ctx.interrupt()
-        threading.Thread(target=self._rearm, name="z3-interrupt", daemon=True).start()
+            if self._target is not None:
+                self._target.interrupt()
 
-    def attach(self, ctx: z3.Context) -> bool:
-        """Attach `ctx`; False, attaching nothing, if an interrupt was already requested."""
+    def attach(self, target: _Stoppable) -> bool:
+        """Attach `target`; False, attaching nothing, if an interrupt was already requested."""
         with self._lock:
             if self._requested:
                 return False
-            self._ctx = ctx
-            self._detached.clear()
+            self._target = target
             return True
 
     def detach(self) -> None:
-        """Detach the context; no interrupt reaches it afterwards."""
+        """Detach the target; no interrupt reaches it afterwards."""
         with self._lock:
-            self._ctx = None
-        self._detached.set()
-
-    def _rearm(self) -> None:
-        while not self._detached.wait(_REARM_S):
-            with self._lock:
-                if self._ctx is not None:
-                    self._ctx.interrupt()
+            self._target = None
 
 
 _worker = threading.local()
@@ -514,7 +651,7 @@ class SolverExecutor:
     `_SLICE_S` frees its slot while fewer than `slow_workers` checks have done
     so; otherwise its slot lends a place to callers whose last check was short.
     The pool starts a thread for each such check. Cancelling a caller
-    interrupts its check.
+    kills its check's worker.
     """
 
     def __init__(
@@ -531,6 +668,10 @@ class SolverExecutor:
         )
         self._running: set[_Interrupt] = set()
         self._short: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+        # Worker processes start off the caller's thread and before the first check.
+        threading.Thread(
+            target=_workers().prestart, args=(workers + slow_workers,), daemon=True
+        ).start()
 
     async def run(self, fn: Callable[[], T]) -> tuple[T, float]:
         """Run `fn` on the pool; return its result and its run time in ms, queueing excluded."""
@@ -545,7 +686,8 @@ class SolverExecutor:
             if lent:
                 self._pool.resize(1)
             interrupt = _Interrupt()
-            future = asyncio.wrap_future(self._pool.submit(self._call, fn, interrupt))
+            job = self._pool.submit(self._call, fn, interrupt)
+            future = asyncio.wrap_future(job)
             try:
                 while not slow and not (await asyncio.wait((future,), timeout=_SLICE_S))[0]:
                     slices += 1
@@ -564,9 +706,9 @@ class SolverExecutor:
                 raise
         finally:
             if slow:
-                with self._lock:
-                    self._slow -= 1
-                self._pool.resize(-1)
+                # Given back when the check has ended (its worker is gone if it was
+                # killed), not when its caller stops waiting (AUDIT-22 #5).
+                job.add_done_callback(self._end_slow)
             else:
                 if stuck:
                     slots.unstick()
@@ -589,6 +731,11 @@ class SolverExecutor:
             # A thread for the next caller, so it does not wait for this check.
             self._pool.resize(1)
             return True
+
+    def _end_slow(self, _: Future[Any]) -> None:
+        with self._lock:
+            self._slow -= 1
+        self._pool.resize(-1)
 
     def shutdown(self) -> None:
         """Interrupt running and queued checks and join the worker threads.
@@ -618,9 +765,11 @@ class SolverExecutor:
             if self._closed:
                 interrupt.request()
         _worker.interrupt = interrupt
+        _worker.overhead_s = 0.0
         started = time.perf_counter()
         try:
-            return fn(), (time.perf_counter() - started) * _MS_PER_S
+            result = fn()
+            return result, (time.perf_counter() - started - _worker.overhead_s) * _MS_PER_S
         finally:
             _worker.interrupt = None
             with self._lock:
@@ -647,6 +796,7 @@ def shutdown_default_executor() -> None:
         executor, _default_executor = _default_executor, None
     if executor is not None:
         executor.shutdown()
+    _workers().close()
 
 
 __all__ = [
@@ -655,6 +805,7 @@ __all__ = [
     "SmtFormula",
     "SolverExecutor",
     "SolverOutcome",
+    "SolverWorkerError",
     "Z3Solver",
     "default_executor",
     "shutdown_default_executor",
