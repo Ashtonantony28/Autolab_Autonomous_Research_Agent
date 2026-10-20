@@ -1,10 +1,10 @@
-"""Design Agent: happy path, missing hypothesis, and the payload-field binding (SG12)."""
+"""Design Agent: happy path, payload-field binding (SG12) and protocol figures (SG17)."""
 
 from __future__ import annotations
 
 import pytest
 
-from autolab.agents.common import design_claim, design_facts
+from autolab.agents.common import design_claim, design_facts, protocol_figures
 from autolab.agents.design import (
     DesignAgent,
     build_design_prompt,
@@ -239,3 +239,86 @@ async def test_design_trace_stating_other_values_is_premises_inconsistent(stated
     assert verdict.step_verdicts[0].reason == "premises_inconsistent"
     assert update["hitl_pending"].payload["trigger"] == "verification"
     assert "current_experiment" not in update
+
+
+# SG17 (AUDIT-12 #1): the protocol may not state its own cost or duration.
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        "Incubate the plate for 240 minutes using 500 USD of reagent",
+        "spend $500 on reagent",
+        "reagent costs USD 1,200",
+        "reagent costs 30 EUR",
+        "budget of 12.5 dollars",
+        "£40 of antibody",
+        "incubate for 2h",
+        "shake 30 s then read",
+        "wait 90 sec",
+        "incubate 15 min",
+        "culture for 3 days",
+        "spin 1.5 hrs",
+    ],
+)
+def test_protocol_figures_flags_currency_and_durations(protocol: str) -> None:
+    assert protocol_figures(protocol)
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        "incubate at 37 C",
+        "add A to B at 25C",
+        "dilute to 10 mM in 5 mL PBS",
+        "read absorbance at 600 nm in a 96-well plate",
+        "run 3 steps of the sweep at pH 7.4",
+        "image at 40x, 2 ms exposure, 1 Hz",
+        "liquid handler crystal sweep",
+    ],
+)
+def test_protocol_figures_allows_non_cost_non_duration_numbers(protocol: str) -> None:
+    assert protocol_figures(protocol) == ()
+
+
+def test_design_prompt_tells_the_model_to_keep_figures_out_of_the_protocol() -> None:
+    assert "estimated_cost_usd" in build_design_prompt(HYPOTHESIS)
+
+
+async def test_design_whose_protocol_states_figures_is_escalated_not_admitted() -> None:
+    priced = DESIGN.model_copy(update={"protocol": "incubate 240 minutes with $500 of reagent"})
+    fake = FakeLLMClient()
+    fake.register("design.experiment", build_design_prompt(HYPOTHESIS), priced.model_dump_json())
+    register_trivial_trace(
+        fake,
+        agent="design",
+        trace_purpose="design.trace",
+        trace_prompt=build_design_trace_prompt(HYPOTHESIS, priced),
+        conclusion=design_claim(priced),
+        facts=design_facts(priced),
+    )
+
+    update = await DesignAgent(verifier=Verifier(fake), llm=fake)(
+        {**empty_state("Q?"), "hypotheses": [HYPOTHESIS]}
+    )
+
+    assert update["confidence"] == 1.0
+    assert "current_experiment" not in update
+    pending = update["hitl_pending"]
+    assert pending.payload["trigger"] == "verification"
+    assert "240 minutes" in pending.reason and "$500" in pending.reason
+    assert content(update["hitl_payload"]["current_experiment"]) == content(priced)
+
+
+def test_parameter_symbols_are_injective() -> None:
+    names = ["temp-C", "temp C", "temp_C", "temp.C"]
+    design = SWEEP.model_copy(
+        update={
+            "parameters": tuple(
+                ExperimentParameter(name=n, value=float(i)) for i, n in enumerate(names)
+            )
+        }
+    )
+    decls = [f.declarations for f in design_facts(design)[2:]]
+    assert len(set(decls)) == len(names)
+    assert decls[2] == "(declare-const param_temp_C Real)"

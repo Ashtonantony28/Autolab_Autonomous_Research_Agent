@@ -11,6 +11,7 @@ from autolab.agents.common import (
     design_claim,
     design_facts,
     parse_trace,
+    protocol_figures,
     with_feedback,
 )
 from autolab.state.models import ExperimentDesign, Hypothesis, VerificationContext
@@ -24,7 +25,9 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
 
     Cost, duration and numeric parameters become code-built `context.facts`, and
     the trace must conclude `design_claim(design)`, so the fields that drive the
-    cost/duration pause and the simulator are verified, not trusted.
+    cost/duration pause and the simulator are verified, not trusted. A protocol
+    whose text states its own cost or duration (`protocol_figures`) is never
+    admitted: those figures could disagree with the bound fields unseen.
     """
 
     name = "design"
@@ -53,13 +56,39 @@ class DesignAgent(BaseAgent[ExperimentDesign]):
         )
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
+    async def __call__(self, state: AutoLabState) -> dict[str, Any]:
+        """Run the base template, then reject a protocol that states cost or duration."""
+        update = await super().__call__(state)
+        design = update.get("current_experiment") or (update.get("hitl_payload") or {}).get(
+            "current_experiment"
+        )
+        figures = protocol_figures(design.protocol) if design is not None else ()
+        if design is None or not figures:
+            return update
+        reason = (
+            f"protocol states cost or duration figures {list(figures)}; "
+            "these belong only in estimated_cost_usd / estimated_duration_minutes"
+        )
+        pending = self._request(
+            "verification", reason, update["verification_history"][-1].summary, design
+        )
+        rest = {k: v for k, v in update.items() if k != "current_experiment"}
+        return {**rest, "hitl_pending": pending, "hitl_payload": self._merge_payload(design)}
+
     def _merge_payload(self, payload: ExperimentDesign) -> dict[str, Any]:
         return {"current_experiment": payload}
 
 
+PROTOCOL_FIGURES_RULE = (
+    "Do not state any cost (currency amount) or duration (time) figure in the protocol text; "
+    "put them only in estimated_cost_usd and estimated_duration_minutes."
+)
+
+
 def build_design_prompt(hypothesis: Hypothesis) -> str:
     return (
-        "Design a single experiment to test the following Hypothesis.\n\n"
+        "Design a single experiment to test the following Hypothesis.\n"
+        f"{PROTOCOL_FIGURES_RULE}\n\n"
         f"hypothesis_statement: {hypothesis.statement}"
     )
 

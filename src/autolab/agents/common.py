@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, create_model
 
@@ -96,6 +97,27 @@ def design_claim(design: ExperimentDesign) -> str:
     return f"design protocol: {design.protocol}; {', '.join(values)}"
 
 
+_NUMBER: Final = r"\d+(?:[.,]\d+)*"
+_PROTOCOL_FIGURE: Final = re.compile(
+    rf"(?:[$€£¥]\s*{_NUMBER})"
+    rf"|(?:\b(?:USD|EUR|GBP|JPY|CHF|CAD|AUD|CNY)\s*{_NUMBER})"
+    rf"|(?:{_NUMBER}\s*(?:USD|EUR|GBP|JPY|CHF|CAD|AUD|CNY|dollars?|euros?|pounds?)\b)"
+    rf"|(?:{_NUMBER}\s*(?:s|secs?|seconds?|min|mins|minutes?|h|hrs?|hours?|days?)\b)",
+    re.IGNORECASE,
+)
+
+
+def protocol_figures(protocol: str) -> tuple[str, ...]:
+    """Currency amounts and durations stated in a protocol's text.
+
+    The protocol may not state its own cost or duration: those live only in the
+    bound `estimated_cost_usd` / `estimated_duration_minutes` fields. This is a
+    rejection check, not parsing into state (CLAUDE.md §9): a match only blocks
+    admission, and no value is read back from the text.
+    """
+    return tuple(m.group(0) for m in _PROTOCOL_FIGURE.finditer(protocol))
+
+
 def design_facts(design: ExperimentDesign) -> tuple[FormalizedStep, ...]:
     """Code-built Real facts for the Design's cost, duration and numeric parameters.
 
@@ -118,7 +140,10 @@ def _numeric(value: ParameterValue) -> bool:
 
 
 def _param_symbol(name: str) -> str:
-    return "param_" + re.sub(r"\W", "_", name)
+    sym = re.sub(r"\W", "_", name)
+    if sym == name:
+        return f"param_{sym}"
+    return f"paramx_{sym}_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
 
 
 def _real_fact(sym: str, value: float) -> FormalizedStep:
@@ -154,6 +179,7 @@ __all__ = [
     "design_facts",
     "measurement_facts",
     "parse_trace",
+    "protocol_figures",
     "result_claim",
     "with_feedback",
 ]
