@@ -206,6 +206,21 @@ async def test_slots_are_granted_in_order() -> None:
     assert await waiting[1] is False
 
 
+async def test_a_free_slot_goes_to_a_short_caller_first() -> None:
+    # A hard run re-queues as soon as its check ends; a slot it frees must not go to
+    # the next hard run while an easy one waits (AUDIT-18 #4).
+    slots = _Slots(1)
+    assert await slots.acquire(short=False) is False
+    hard = asyncio.create_task(slots.acquire(short=False))
+    easy = asyncio.create_task(slots.acquire(short=True))
+    await asyncio.sleep(0)
+    slots.release(lent=False)
+    assert await easy is False
+    assert not hard.done()
+    slots.release(lent=False)
+    assert await hard is False
+
+
 async def test_a_stuck_slot_lends_one_place_to_a_short_caller_only() -> None:
     slots = _Slots(1)
     assert await slots.acquire(short=False) is False

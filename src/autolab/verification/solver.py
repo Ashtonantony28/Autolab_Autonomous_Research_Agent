@@ -388,7 +388,8 @@ class _Pool:
 
 
 class _Slots:
-    """Admission for one event loop: `workers` slots, granted in FIFO order.
+    """Admission for one event loop: `workers` slots, granted in FIFO order, callers
+    whose last check ended within its slice first.
 
     A slot whose Z3 check is stuck (past `_SLICE_S` with no slow room) also lends
     a place to one caller whose last check ended within its slice, so easy runs
@@ -443,7 +444,8 @@ class _Slots:
         return None
 
     def _wake(self) -> None:
-        for entry in list(self._waiters):
+        # Short callers first: a free slot goes to a hard run only when no easy one waits.
+        for entry in sorted(self._waiters, key=lambda e: not e[1]):
             waiter, short = entry
             if waiter.done():  # cancelled; its caller removes it
                 continue
