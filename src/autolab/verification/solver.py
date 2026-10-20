@@ -11,8 +11,10 @@ UNGROUNDED.
 Checks run on `SolverExecutor`, a bounded thread pool separate from asyncio's
 default executor (AUDIT-2 #1). z3py drops the GIL around every C call, so
 checks on several threads convoy on it; the default pool is small (AUDIT-10 #1).
-Cancelling a caller interrupts its Z3 check, including one that has not
-started yet (AUDIT-12 #2).
+A check still in Z3 after `_SLICE_S` waits on Z3, not on the GIL, so it gives
+its slot to the next caller and runs on as one of at most `slow_workers` slow
+checks: hard runs cannot starve easy ones (AUDIT-14 #2). Cancelling a caller
+interrupts its Z3 check, including one that has not started yet (AUDIT-12 #2).
 
 Inputs are SMT-LIB 2 strings, parsed by `Solver.from_string` so the
 boundary between LLM-produced text and Z3's AST is explicit. Every check
@@ -41,6 +43,13 @@ from autolab.state.models import StepReason, Verdict
 _MS_PER_S: Final[int] = 1000
 SOLVER_WORKERS: Final[int] = min(2, os.cpu_count() or 1)
 """Default size of the Z3 pool; more threads only contend for the GIL (AUDIT-10 #1)."""
+SOLVER_SLOW_WORKERS: Final[int] = min(32, (os.cpu_count() or 1) + 4)
+"""Default number of long checks that may run beside the pool's own slots (AUDIT-14 #2)."""
+_SLICE_S: Final[float] = 0.05
+"""How long a Z3 check holds its slot before it runs on as a slow check."""
+_SETUP_SHARE: Final[float] = 0.5
+"""Z3 sets up the entailment check, without polling its limit, in up to this share of
+the time the consistency check took; with less time left the check is not started."""
 _NEGATED_CLAIM: Final[str] = "claim!"
 """Not a plain identifier, so no formalized step can declare it."""
 _REARM_S: Final[float] = 0.005
@@ -131,7 +140,9 @@ class Z3Solver:
                 details=f"SMT parse error: {exc}",
             )
         solver.set("timeout", _remaining_ms(deadline))
+        started = time.monotonic()
         consistency = solver.check()
+        took = time.monotonic() - started
         if consistency == z3.unsat:
             return SolverOutcome(
                 verdict="INVALID",
@@ -139,9 +150,15 @@ class Z3Solver:
                 details="premises are mutually unsatisfiable",
             )
         details = f"premise consistency check returned {consistency}"
-        if consistency == z3.sat:
+        if consistency == z3.sat and deadline - time.monotonic() < _SETUP_SHARE * took:
+            # Z3 sets the entailment check up without polling its limit (AUDIT-14 #1).
+            details = "too little time left for the entailment check"
+        elif consistency == z3.sat:
+            # Asserted, not assumed: Z3 checks LIA under an assumption in a phase that
+            # ignores both the timeout and interrupts (AUDIT-14 #1).
+            solver.add(z3.Bool(_NEGATED_CLAIM, ctx))
             solver.set("timeout", _remaining_ms(deadline))
-            result = solver.check(z3.Bool(_NEGATED_CLAIM, ctx))
+            result = solver.check()
             if result == z3.unsat:
                 return SolverOutcome(
                     verdict="VALID", reason="entailed", details="premises entail claim"
@@ -171,10 +188,10 @@ def _remaining_ms(deadline: float) -> int:
 def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:
     """Compose a single SMT-LIB 2 document from premises + negated claim.
 
-    The negated claim is named by `_NEGATED_CLAIM`, so it holds only when
-    checked as an assumption. Declarations are deduplicated line-by-line so
-    identical declares across premises don't conflict. Order is preserved
-    (first occurrence wins).
+    The negated claim is named by `_NEGATED_CLAIM`, so it holds only once the
+    entailment check asserts that name. Declarations are deduplicated
+    line-by-line so identical declares across premises don't conflict. Order
+    is preserved (first occurrence wins).
     """
     seen: set[str] = set()
     decls: list[str] = []
@@ -195,10 +212,7 @@ def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:
 
 
 def _wrap_assert(body: str) -> str:
-    body = body.strip()
-    if body.startswith("(assert"):
-        return body
-    return f"(assert {body})"
+    return f"(assert {body.strip()})"
 
 
 class _Interrupt:
@@ -213,6 +227,10 @@ class _Interrupt:
         self._ctx: z3.Context | None = None
         self._requested = False
         self._detached = threading.Event()
+
+    def attached(self) -> bool:
+        """Whether a Z3 context is attached, that is, a check is in progress."""
+        return self._ctx is not None
 
     def requested(self) -> bool:
         """Whether an interrupt has been requested."""
@@ -257,13 +275,20 @@ _worker = threading.local()
 class SolverExecutor:
     """A bounded thread pool for Z3 checks, separate from asyncio's default executor.
 
-    At most `workers` checks are submitted at once; other callers wait as
-    coroutines on a per-loop semaphore. Cancelling a caller interrupts its check.
+    At most `workers` checks hold a slot at once; other callers wait as
+    coroutines on a per-loop semaphore. A Z3 check still running after
+    `_SLICE_S` frees its slot while fewer than `slow_workers` checks have done
+    so; the pool may then start a thread for the next caller. Cancelling a
+    caller interrupts its check.
     """
 
-    def __init__(self, workers: int = SOLVER_WORKERS) -> None:
+    def __init__(
+        self, workers: int = SOLVER_WORKERS, slow_workers: int = SOLVER_SLOW_WORKERS
+    ) -> None:
         self.workers = workers
+        self.slow_workers = slow_workers
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="z3")
+        self._slow = 0
         self._lock = threading.Lock()
         self._slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
             weakref.WeakKeyDictionary()
@@ -272,14 +297,39 @@ class SolverExecutor:
 
     async def run(self, fn: Callable[[], T]) -> tuple[T, float]:
         """Run `fn` on the pool; return its result and its run time in ms, queueing excluded."""
-        async with self._slot():
+        slot = self._slot()
+        await slot.acquire()
+        slow = False
+        try:
             interrupt = _Interrupt()
             future = asyncio.wrap_future(self._pool.submit(self._call, fn, interrupt))
             try:
+                while not slow and not (await asyncio.wait((future,), timeout=_SLICE_S))[0]:
+                    slow = self._to_slow(interrupt)
+                if slow:
+                    slot.release()
                 return await future
             except asyncio.CancelledError:
+                future.cancel()
                 interrupt.request()
                 raise
+        finally:
+            if slow:
+                with self._lock:
+                    self._slow -= 1
+                    self._pool._max_workers -= 1
+            else:
+                slot.release()
+
+    def _to_slow(self, interrupt: _Interrupt) -> bool:
+        """Count a running Z3 check as slow if there is room; False leaves it in its slot."""
+        with self._lock:
+            if self._slow >= self.slow_workers or not interrupt.attached():
+                return False
+            self._slow += 1
+            # Room for one more thread, so the next caller does not wait for this check.
+            self._pool._max_workers += 1
+            return True
 
     def shutdown(self) -> None:
         """Interrupt running checks, drop queued ones and join the worker threads."""
@@ -333,6 +383,7 @@ def shutdown_default_executor() -> None:
 
 
 __all__ = [
+    "SOLVER_SLOW_WORKERS",
     "SOLVER_WORKERS",
     "SmtFormula",
     "SolverExecutor",

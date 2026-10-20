@@ -549,7 +549,6 @@ async def test_hitl_event_keeps_the_outcomes_timing() -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-16 #2")
 def test_z3_spy_signals_only_after_the_interrupt_is_sent(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
