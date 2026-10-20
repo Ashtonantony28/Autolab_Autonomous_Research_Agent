@@ -19,10 +19,10 @@ at all, so a rejected step never leaks symbols into later prompts.
 from __future__ import annotations
 
 import functools
-import itertools
 import json
 import re
 import threading
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -71,7 +71,10 @@ class Vocabulary:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             if not _IDENTIFIER.fullmatch(name):
                 raise FormalizationError(f"declared name {name!r} is not a plain identifier")
-            sorts = tuple(d for d in out.values() if d.startswith("(declare-sort"))
+            mentioned = _tokens(stripped)
+            sorts = tuple(
+                d for n, d in out.items() if d.startswith("(declare-sort") and n in mentioned
+            )
             if _is_z3_builtin(name) or _applied_builtin(stripped, sorts):
                 raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
             existing = out.get(name)
@@ -253,7 +256,7 @@ def _is_z3_builtin(name: str) -> bool:
     return False
 
 
-_COERCIBLE: Final[dict[str, tuple[str, ...]]] = {"Int": ("Int", "Real"), "Real": ("Real", "Int")}
+_NUMERIC: Final = frozenset({"Int", "Real"})
 
 
 @functools.lru_cache(maxsize=4096)
@@ -263,6 +266,7 @@ def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
     Z3 resolves a user function only at its declared arity, with Int and Real
     coerced, so probing those argument sorts covers every use the declaration
     could take over (AUDIT-13 #1). An unknown sort is left to the parse check.
+    `sort_decls` holds the `declare-sort` lines `decl` mentions.
     """
     tokens = decl[1:-1].replace("(", " ( ").replace(")", " ) ").split()
     head, name = tokens[0], tokens[1]
@@ -270,16 +274,12 @@ def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
         arity = int(tokens[2]) if len(tokens) > 2 and tokens[2].isdigit() else 0
         if arity == 0:
             return False
-        uses = [f"(declare-const x ({name}{' Int' * arity}))"]
+        uses: Iterable[str] = [f"(declare-const x ({name}{' Int' * arity}))"]
     else:
         args = _sexprs(tokens[3:]) if head == "declare-fun" and tokens[2] == "(" else []
         if not args:
             return False
-        uses = []
-        for sorts in itertools.product(*(_COERCIBLE.get(a, (a,)) for a in args)):
-            consts = "".join(f"(declare-const a{i} {s})" for i, s in enumerate(sorts))
-            app = f"({name} {' '.join(f'a{i}' for i in range(len(sorts)))})"
-            uses.append(f"{consts}(assert (= {app} {app}))")
+        uses = (_applied_use(name, sorts) for sorts in _numeric_variants(args))
     ctx = _parse_context()
     for use in uses:
         try:
@@ -293,6 +293,31 @@ def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
         else:
             return True
     return False
+
+
+def _numeric_variants(args: list[str]) -> Iterator[tuple[str, ...]]:
+    """`args` with its Int/Real positions all Int, all Real, and each one flipped from either.
+
+    2k + 2 variants for k numeric arguments, not all 2^k (AUDIT-18 #1). Z3
+    resolves each builtin it knows the same on these as on every combination
+    (checked over every libz3 identifier that resolves with arguments).
+    """
+    numeric = [i for i, a in enumerate(args) if a in _NUMERIC]
+    seen: set[tuple[str, ...]] = set()
+    for base, other in (("Int", "Real"), ("Real", "Int")):
+        uniform = [base if a in _NUMERIC else a for a in args]
+        for flip in (None, *numeric):
+            variant = tuple(other if i == flip else a for i, a in enumerate(uniform))
+            if variant not in seen:
+                seen.add(variant)
+                yield variant
+
+
+def _applied_use(name: str, sorts: tuple[str, ...]) -> str:
+    """An assertion applying `name` to constants of `sorts`."""
+    consts = "".join(f"(declare-const a{i} {s})" for i, s in enumerate(sorts))
+    app = f"({name} {' '.join(f'a{i}' for i in range(len(sorts)))})"
+    return f"{consts}(assert (= {app} {app}))"
 
 
 def _sexprs(tokens: list[str]) -> list[str]:
@@ -311,11 +336,17 @@ def _sexprs(tokens: list[str]) -> list[str]:
 
 
 def _tokens(text: str) -> set[str]:
-    """Every symbol, keyword and literal token in `text`."""
+    """Every symbol, keyword and literal token in `text`, split as Z3's lexer splits it."""
     return {m.group(1) for m in _TERM_TOKEN.finditer(text)} - {"(", ")"}
 
 
-_TERM_TOKEN: Final = re.compile(r'\s*("(?:[^"]|"")*"|[()]|[^\s()"]+)')
+_SYMBOL_CHARS: Final = r"A-Za-z0-9~!@$%^&*_\-+=<>.?/,"
+# As Z3 reads them: `:` starts a keyword and `#` a bit-vector literal, so both end
+# a symbol (AUDIT-20 #4, AUDIT-17 #5); a numeral ends at its last digit.
+_TERM_TOKEN: Final = re.compile(
+    r'\s*("(?:[^"]|"")*"|[()]|#b[01]*|#x[0-9A-Fa-f]*|[0-9]+(?:\.[0-9]*)?'
+    rf"|:?[{_SYMBOL_CHARS}]+|[^\s()\"])"
+)
 
 
 def _is_single_term(text: str) -> bool:

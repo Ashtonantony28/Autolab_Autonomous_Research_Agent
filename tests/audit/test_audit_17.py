@@ -211,7 +211,6 @@ async def test_binder_named_like_a_later_declaration_fails_the_later_step() -> N
         await _formalize_two("(let ((k #b1)) (= (bvor k #b0) #b1))")
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #5")
 async def test_binder_glued_to_a_literal_still_counts_as_used() -> None:
     # Today: both steps formalize; `k` never enters the used set.
     with pytest.raises(FormalizationError, match="earlier step"):
