@@ -32,7 +32,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | done (PR pending) |
 | SG15 | Formalizer input hardening (AUDIT-9 #1, #2, AUDIT-12 #3) | audit round 3 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 | SG16 | Circularity in the second payload pass (AUDIT-9 #3) | SG15 | `verification/vericot.py` (payload proof only), `tests/unit/verification/test_payload_proof.py` | todo |
-| SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | todo |
+| SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
 | SG18 | Trace and persist HITL outcomes (AUDIT-11 #1) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*` | todo |
 | SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | todo |
 
@@ -309,6 +309,8 @@ Round 3 (AUDIT-9..12, fresh agents, base `7b8c452`) found 1 critical and 7 high 
   - This is the default chosen here. The alternative, extracting the figures from the text and comparing them with the fields, is NL parsing (CLAUDE.md §9).
   - **Flip:** AUDIT-12 #1.
   - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/audit/test_audit_12.py tests/unit/agents -q` · `uv run python -m scripts.run_benchmark`.
+
+  **Result (2026-10-20):** Files changed: `agents/common.py` (`protocol_figures`, injective `_param_symbol`), `agents/design.py` (`__call__` rejects a protocol with figures as a `verification` HITL request and withholds the design; `PROTOCOL_FIGURES_RULE` in the Design prompt), `tests/unit/agents/test_design.py`, the AUDIT-12 #1 and AUDIT-11 #6 markers, and the Resolution lines in AUDIT-12.md #1, AUDIT-11.md #6 and AUDIT-5.md #2. No fixture or benchmark protocol tripped the check, so none was reworded. Tests added: 23 cases (12 rejected and 7 allowed protocols, the prompt rule, an escalated priced design at confidence 1.0, injective parameter symbols). Flipped unchanged: AUDIT-12 #1, AUDIT-11 #6 (folded in). Verify: lint and mypy clean; full suite 821 passed, 13 skipped, 44 xfailed; the SG17 verify set 121 passed, 9 xfailed; benchmark pauses once per scenario on its policy trigger (duration 120 min; cost $15; cost $25) and completes at confidence 1.0; error injection 34/34, precision 100%, 26/26 valid admitted. Limits: figures in words ("four hours") pass; identical parameter names still share a symbol.
 - **SG18 Trace and persist HITL outcomes.** The `hitl` node is wrapped like the agent nodes. Every human decision and every re-pause is traced, and an approved Analysis report reaches the store (AUDIT-11 #1, high). **Flip:** AUDIT-11 #1. **Verify:** `uv run pytest tests/audit/test_audit_11.py tests/integration/monitoring tests/integration/test_resume.py -q`.
 - **SG19 Solver pool throughput and reliable interrupts.**
   - **Pool size.** The default pool size is chosen from measurement, so 10 concurrent 100-step verifies keep step p95 within budget (AUDIT-10 #1, high).

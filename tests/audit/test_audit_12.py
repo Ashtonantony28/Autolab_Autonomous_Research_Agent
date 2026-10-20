@@ -276,7 +276,6 @@ def test_thread_id_is_flushed_before_the_graph_runs(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-12 #1")
 async def test_design_concluding_the_bound_claim_cannot_hide_its_protocol_cost() -> None:
     protocol = "Incubate the plate for 240 minutes using 500 USD of reagent"
     reply: dict[str, Any] = {
@@ -315,7 +314,7 @@ async def test_design_concluding_the_bound_claim_cannot_hide_its_protocol_cost()
 
     update = await agent(state)
 
-    # Today: confidence 1.0, no pause, and the design is merged.
+    # Before SG17: confidence 1.0, no pause, and the design was merged.
     assert update["hitl_pending"] is not None
     assert "current_experiment" not in update
 

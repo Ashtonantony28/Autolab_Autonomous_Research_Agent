@@ -226,7 +226,6 @@ async def test_a_printed_thread_id_is_resumable(
 # --- #6 (low): distinct design parameters can share one fact symbol ----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-11 #6")
 def test_distinct_parameters_get_distinct_fact_symbols() -> None:
     design = ExperimentDesign(
         hypothesis_id=HYPOTHESIS.id,
@@ -240,7 +239,7 @@ def test_distinct_parameters_get_distinct_fact_symbols() -> None:
     )
     facts = design_facts(design)
 
-    # Today: both become `param_temp_C`, so the facts assert 4.0 and 37.0 for one
+    # Before SG17: both became `param_temp_C`, so the facts asserted 4.0 and 37.0 for one
     # symbol and every step of an honest trace is `premises_inconsistent`.
     assert len({f.declarations for f in facts}) == len(facts)
 
