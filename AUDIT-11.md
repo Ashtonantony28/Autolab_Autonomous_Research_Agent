@@ -104,6 +104,8 @@
 
 **Fix.** Make the symbol injective, for example by appending a short hash or the parameter index on a collision. Alternatively, reject duplicate sanitized names in `DESIGN_REPLY` validation, so the reply is retried.
 
+**Resolution (SG17).** A name that is already a plain identifier keeps `param_<name>`. Any other name becomes `paramx_<sanitized>_<sha256[:12]>`, so it cannot collide with a plain name (different prefix) or with another sanitized name, barring a hash collision. The repro is flipped unchanged. Two parameters with the identical name still share a symbol.
+
 ## 7. Low: `hitl_node` is a dead, policy-free export
 
 **Impact.**
