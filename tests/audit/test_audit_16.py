@@ -68,7 +68,6 @@ _HANG_S: Final = 20.0
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-16 #1")
 @pytest.mark.parametrize(
     "protocol",
     ["incubate for a 240-minute period", "a 12-hour soak", "culture for 2 weeks", "5k USD"],
@@ -77,7 +76,6 @@ def test_protocol_figures_flags_hyphenated_durations_and_weeks(protocol: str) ->
     assert protocol_figures(protocol)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-16 #1")
 async def test_hyphenated_duration_in_the_protocol_cannot_skip_the_duration_pause() -> None:
     protocol = "Incubate the plate for a 240-minute period"
     reply: dict[str, Any] = {
