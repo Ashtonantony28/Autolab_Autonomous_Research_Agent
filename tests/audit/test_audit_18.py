@@ -82,7 +82,6 @@ async def test_formalizing_a_wide_function_makes_a_bounded_number_of_parses(
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #2")
 async def test_an_easy_check_never_queues_behind_a_check_that_gave_up_its_slot() -> None:
     # One stale idle permit (the worker had not marked itself idle when the next job was
     # submitted; forced here, natural under load) makes the pool skip the thread
@@ -134,7 +133,6 @@ def test_a_real_premise_pool_costs_no_more_than_its_int_twin() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #4")
 async def test_hard_runs_above_the_slow_cap_do_not_starve_an_easy_verify() -> None:
     # 1 worker, room for 1 slow check, 3 hard runs whose checks run to a 0.5 s timeout.
     # The check that cannot go slow keeps the slot until a slow check ends, so every
@@ -148,7 +146,6 @@ async def test_hard_runs_above_the_slow_cap_do_not_starve_an_easy_verify() -> No
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #5")
 def test_concurrent_checks_reach_the_verdict_they_reach_alone() -> None:
     # A child pinned to one CPU while os.cpu_count() says 4, as in a 1-CPU container on a
     # 4-CPU host: 2 workers, 8 slow. One lia_chain(1600) check decides `not_entailed` in
