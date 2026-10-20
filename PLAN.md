@@ -30,6 +30,11 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (PR pending) |
 | SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | done (PR pending) |
 | SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | done (PR pending) |
+| SG15 | Formalizer input hardening (AUDIT-9 #1, #2, AUDIT-12 #3) | audit round 3 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | todo |
+| SG16 | Circularity in the second payload pass (AUDIT-9 #3) | SG15 | `verification/vericot.py` (payload proof only), `tests/unit/verification/test_payload_proof.py` | todo |
+| SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | todo |
+| SG18 | Trace and persist HITL outcomes (AUDIT-11 #1) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*` | todo |
+| SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -276,6 +281,33 @@ Round 2 (AUDIT-5..8, fresh agents, base `8a1c1de`) found 2 critical and 3 high f
 
 Medium and low round-2 findings stay in the AUDIT files for a later pass. After SG11–SG14, audit round 3 re-runs all four audits with fresh agents. SG5 live acceptance still waits on an `ANTHROPIC_API_KEY`.
 
+### Audit round 3 → SG15–SG19
+
+Round 3 (AUDIT-9..12, fresh agents, base `7b8c452`) found 1 critical and 7 high findings. Repros are strict xfails in `tests/audit/test_audit_{9..12}.py`. A sub-goal is done when its listed xfails pass as plain tests and `make lint typecheck test` is green. SG15 runs alongside SG17, then SG16 alongside SG18, then SG19.
+
+- **SG15 Formalizer input hardening.**
+  - **Declared names.** A declared name must be a plain identifier (`[A-Za-z_][A-Za-z0-9_]*`, not quoted with `|…|`). It must also be absent from Z3's builtin namespace, which covers string, sequence, bit-vector, floating-point, set and transcendental operators. This is checked by asking Z3 whether the name already parses, not only by the hand-written list (AUDIT-9 #1, critical).
+  - **Assertions.** `assertion` must be exactly one balanced term: no SMT commands, no trailing forms, no `(set-option …)` (AUDIT-9 #2, high). Each check starts from default Z3 global parameters.
+  - **Reserved-name tests.** The tests that pin reserved names list them explicitly, so deleting a name from `RESERVED_SYMBOLS` fails a test (AUDIT-12 #3, high).
+  - **Flip:** AUDIT-9 #1 ×2, #2 ×2; the AUDIT-12 #3 kill tests stay green.
+  - **Verify:** `uv run pytest tests/audit/test_audit_9.py tests/audit/test_audit_12.py tests/unit/verification -q` · `uv run python -m scripts.error_injection` · `uv run python -m scripts.bench_verifier --runs 20`.
+- **SG16 Circularity in the second payload pass.** A premise that was INVALID in pass one is never assumed in pass two. A premise whose circularity check is inconclusive fails closed (AUDIT-9 #3, high). **Flip:** AUDIT-9 #3. **Verify:** `uv run pytest tests/audit/test_audit_1.py tests/audit/test_audit_9.py tests/unit/verification -q` · error injection.
+- **SG17 Protocol figures bound to Design fields.**
+  - The protocol text may not state its own cost or duration figures. Those live only in the structured fields, which are bound by `design_facts`.
+  - A protocol that states a currency amount or a duration is rejected, and the Design agent escalates (AUDIT-12 #1, high; reopens AUDIT-5 #2).
+  - This is the default chosen here. The alternative, extracting the figures from the text and comparing them with the fields, is NL parsing (CLAUDE.md §9).
+  - **Flip:** AUDIT-12 #1.
+  - **Verify:** `uv run pytest tests/audit/test_audit_5.py tests/audit/test_audit_12.py tests/unit/agents -q` · `uv run python -m scripts.run_benchmark`.
+- **SG18 Trace and persist HITL outcomes.** The `hitl` node is wrapped like the agent nodes. Every human decision and every re-pause is traced, and an approved Analysis report reaches the store (AUDIT-11 #1, high). **Flip:** AUDIT-11 #1. **Verify:** `uv run pytest tests/audit/test_audit_11.py tests/integration/monitoring tests/integration/test_resume.py -q`.
+- **SG19 Solver pool throughput and reliable interrupts.**
+  - **Pool size.** The default pool size is chosen from measurement, so 10 concurrent 100-step verifies keep step p95 within budget (AUDIT-10 #1, high).
+  - **Interrupts.** An interrupt that arrives before `Solver.check()` starts is not lost: it is re-checked right before each check (AUDIT-12 #2, high).
+  - **Tests.** The cancel and shutdown tests assert that the interrupted check returns promptly.
+  - **Flip:** AUDIT-10 #1, AUDIT-12 #2.
+  - **Verify:** `uv run pytest tests/audit/test_audit_10.py tests/audit/test_audit_12.py tests/unit/verification -q` · `uv run python -m scripts.bench_verifier --runs 20`.
+
+Medium and low round-3 findings stay in the AUDIT files. One of them, AUDIT-11 #4, needs the owner's call: should the contradiction trigger read hypotheses from earlier runs? After SG15–SG19, audit round 4 re-runs all four audits.
+
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -287,9 +319,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-3 | API/SDK consistency: `LLMClient`, models, agents, CLI and docs agree; no dead interfaces |
 | AUDIT-4 | Test coverage: untested branches, weak assertions, fakes that test nothing |
 | AUDIT-5..8 | Round 2 of the same four focuses, on SG7–SG10 |
+| AUDIT-9..12 | Round 3, on SG11–SG14 |
 
 ## Log
 
+- 2026-10-20: audit round 3 done (1 critical, 7 high); SG15–SG19 added. AUDIT-5 #2 reopened by AUDIT-12 #1.
 - 2026-10-19: audit round 2 done (2 critical, 3 high); SG11–SG14 added.
 - 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
 - 2026-10-19: plan approved by Ashton; SG0 built.
