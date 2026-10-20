@@ -12,13 +12,10 @@ routes the graph accordingly:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
 
 from autolab.agents.base import AgentDecision
+from autolab.config import PASS_THRESHOLD, RETRY_THRESHOLD
 from autolab.state.models import VerificationResult
-
-PASS_THRESHOLD: Final[float] = 0.7
-RETRY_THRESHOLD: Final[float] = 0.4
 
 
 @dataclass

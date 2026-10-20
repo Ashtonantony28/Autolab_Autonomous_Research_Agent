@@ -80,6 +80,7 @@ def _loads(blob: str) -> AutoLabState:
     locally to keep the protocol module light.
     """
     from autolab.state.models import (
+        AnalysisReport,
         ExperimentDesign,
         ExperimentResult,
         HITLRequest,
@@ -107,13 +108,23 @@ def _loads(blob: str) -> AutoLabState:
         state["verification_history"] = [
             VerificationResult.model_validate(v) for v in data["verification_history"]
         ]
+    if "analysis_reports" in data:
+        state["analysis_reports"] = [
+            AnalysisReport.model_validate(a) for a in data["analysis_reports"]
+        ]
     if "hitl_pending" in data:
         hp = data["hitl_pending"]
         state["hitl_pending"] = HITLRequest.model_validate(hp) if hp else None
+    if "hitl_payload" in data:
+        state["hitl_payload"] = data["hitl_payload"]
     if "current_agent" in data:
         state["current_agent"] = data["current_agent"]
     if "confidence" in data:
         state["confidence"] = data["confidence"]
+    if "retry_count" in data:
+        state["retry_count"] = data["retry_count"]
+    if "feedback" in data:
+        state["feedback"] = data["feedback"]
     return state
 
 

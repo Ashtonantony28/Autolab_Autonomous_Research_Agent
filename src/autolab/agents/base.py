@@ -20,11 +20,12 @@ from typing import Any, Final, Generic, TypeVar
 
 from pydantic import BaseModel
 
+from autolab.config import PASS_THRESHOLD
 from autolab.state.models import HITLRequest, ReasoningTrace
 from autolab.state.schema import AutoLabState
 from autolab.verification.vericot import Verifier
 
-HITL_THRESHOLD: Final[float] = 0.7
+HITL_THRESHOLD: Final[float] = PASS_THRESHOLD
 
 
 class AgentDecision(StrEnum):
