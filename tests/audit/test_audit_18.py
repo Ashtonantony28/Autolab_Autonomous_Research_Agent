@@ -106,8 +106,8 @@ def _real_premise_check() -> tuple[list[SmtFormula], SmtFormula, float]:
 
 @pytest.mark.perf
 def test_a_real_premise_check_returns_within_its_timeout() -> None:
-    # 999 chained `>` premises: Z3's consistency check never polls its limit, so a
-    # timeout at a fifth of the check's run time is overrun ~5x. Over Int it holds.
+    # 999 chained `>` premises: one simplex run never polls its limit, so before SG27 a
+    # timeout at a fifth of the check's run time was overrun ~5x.
     premises, claim, alone_s = _real_premise_check()
     timeout_s = alone_s / _SHARE
     reason, wall_s = timed_check(premises, claim, timeout_s)
@@ -117,8 +117,8 @@ def test_a_real_premise_check_returns_within_its_timeout() -> None:
 
 @pytest.mark.perf
 async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> None:
-    # Same check, cancelled a tenth of the way in: the re-send thread interrupts every
-    # 5 ms, and the worker stays busy until the consistency check ends by itself.
+    # Same check, cancelled a tenth of the way in: before SG27 the worker stayed busy
+    # until the consistency check ended by itself, whatever the interrupts.
     premises, claim, alone_s = _real_premise_check()
     freed_s, sent, _ = await cancel_release_s(premises, claim, after_s=alone_s / (2 * _SHARE))
     assert freed_s < alone_s / _SHARE, f"freed after {freed_s:.2f} s, {sent} interrupts"
@@ -126,8 +126,7 @@ async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> No
 
 @pytest.mark.perf
 def test_a_real_premise_pool_costs_no_more_than_its_int_twin() -> None:
-    # The premise check re-checks all 999 earlier premises from scratch. Over Int it
-    # takes ~0.2 s; over Real ~2.1 s (9-11x).
+    # Before SG27 the premise check over Real cost 9-11x its Int twin.
     real_ms, int_ms = real_int_ratio(_REAL_POOL)
     assert real_ms <= 4 * int_ms, f"Real {real_ms:.0f} ms, Int {int_ms:.0f} ms"
 
