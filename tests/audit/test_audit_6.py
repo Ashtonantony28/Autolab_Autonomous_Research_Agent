@@ -55,7 +55,7 @@ _WAIT_S: Final = 60.0
 """Upper bound on waiting for a repro's precondition; reached only if the setup hangs."""
 
 _LOCK_HOLD_S: Final = 5.5
-"""Longer than the 5 s SQLite busy timeout the store's driver uses by default."""
+"""Longer than the 5 s SQLite busy timeout the store's driver used by default."""
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -75,7 +75,6 @@ def test_verifies_on_several_threads_do_not_crash_the_interpreter() -> None:
 # --- #2 (medium): SQLite store fails a run instead of waiting for a writer ----
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #2")
 async def test_store_append_waits_out_a_concurrent_writer(tmp_path: Path) -> None:
     path = tmp_path / "s.db"
     store = await StateStore.create(f"sqlite+aiosqlite:///{path}")

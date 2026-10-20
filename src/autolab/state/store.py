@@ -22,8 +22,10 @@ from typing import Any, Final, TypeVar
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, ForeignKey, String, select
+from sqlalchemy import JSON, DateTime, ForeignKey, String, event, select
 from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine import make_url
+from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,6 +33,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import ConnectionPoolEntry
 
 from autolab.monitoring.events import TraceEvent
 from autolab.state.models import (
@@ -43,6 +46,9 @@ from autolab.state.models import (
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+SQLITE_BUSY_TIMEOUT_S: Final[float] = 30.0
+"""How long a SQLite writer waits for another writer's lock before failing."""
 
 
 class Base(DeclarativeBase):
@@ -139,6 +145,25 @@ def upsert_statement(
     )
 
 
+def _create_engine(url: str, *, echo: bool) -> AsyncEngine:
+    """An engine whose SQLite writers wait out each other's locks instead of failing."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return create_async_engine(url, echo=echo, future=True)
+    engine = create_async_engine(
+        url, echo=echo, future=True, connect_args={"timeout": SQLITE_BUSY_TIMEOUT_S}
+    )
+    if parsed.database not in (None, "", ":memory:"):
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _wal(dbapi_conn: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+    return engine
+
+
 class StateStore:
     """Thin async wrapper around an `AsyncEngine` for AutoLab state.
 
@@ -154,7 +179,7 @@ class StateStore:
     @classmethod
     async def create(cls, url: str, *, echo: bool = False) -> StateStore:
         """Create a store and ensure the schema is initialized."""
-        engine = create_async_engine(url, echo=echo, future=True)
+        engine = _create_engine(url, echo=echo)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         return cls(engine)
