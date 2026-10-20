@@ -13,7 +13,9 @@ at all, so a rejected step never leaks symbols into later prompts.
 
 from __future__ import annotations
 
+import functools
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Final
@@ -48,7 +50,8 @@ class Vocabulary:
 
         Raises:
             FormalizationError: on an unrecognized or conflicting declaration,
-                or one that names an SMT-LIB builtin or reserved word (AUDIT-5 #1).
+                or one that names an SMT-LIB reserved word (AUDIT-5 #1), a Z3
+                builtin, or anything but a plain identifier (AUDIT-9 #1).
         """
         out = dict(self.declarations)
         for line in new_decls.splitlines():
@@ -60,6 +63,10 @@ class Vocabulary:
                 raise FormalizationError(f"unrecognized declaration: {stripped!r}")
             if name in RESERVED_SYMBOLS:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
+            if not _IDENTIFIER.fullmatch(name):
+                raise FormalizationError(f"declared name {name!r} is not a plain identifier")
+            if _is_z3_builtin(name):
+                raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
             existing = out.get(name)
             if existing is not None and existing != stripped:
                 raise FormalizationError(
@@ -91,8 +98,8 @@ class Formalizer:
         Raises:
             FormalizationError: if the LLM refuses or returns no structured
                 output, if its output fails schema validation (including an
-                empty assertion), conflicts with the vocabulary,
-                or does not parse as SMT-LIB.
+                empty assertion), conflicts with the vocabulary, has an
+                assertion that is not exactly one term, or does not parse as SMT-LIB.
         """
         prompt = prompt_for(step, self.vocabulary)
         try:
@@ -103,6 +110,8 @@ class Formalizer:
             # A refusal or empty structured output (AUDIT-3 #2): this step fails, not the run.
             raise FormalizationError(f"LLM gave no structured output: {exc}") from exc
 
+        if not _is_single_term(out.assertion):
+            raise FormalizationError(f"assertion of step {step.index} is not exactly one term")
         candidate = self.vocabulary.merged(out.declarations)
         full_decls = candidate.smt()
         try:
@@ -152,8 +161,21 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
 
 _DECL_HEADS = frozenset({"declare-const", "declare-fun", "declare-sort"})
 
+_SMT_COMMANDS: Final[frozenset[str]] = frozenset(
+    {
+        "assert", "check-sat", "check-sat-assuming", "declare-const", "declare-datatype",
+        "declare-datatypes", "declare-fun", "declare-sort", "define-fun", "define-fun-rec",
+        "define-funs-rec", "define-sort", "echo", "exit", "get-assertions",
+        "get-assignment", "get-info", "get-model", "get-option", "get-proof",
+        "get-unsat-assumptions", "get-unsat-core", "get-value", "pop", "push",
+        "reset", "reset-assertions", "set-info", "set-logic", "set-option",
+    }
+)  # fmt: skip
+
 # SMT-LIB core, Ints/Reals/Arrays theory symbols, sorts, syntax keywords and
-# commands, plus common Z3 extensions. Z3 lets a declaration shadow most of them.
+# commands, plus common Z3 extensions. Z3 lets a declaration shadow most of them;
+# `_is_z3_builtin` covers the rest, but the parser reports some of these (`ite`,
+# `let`, sorts) as unknown constants, so this list stays.
 RESERVED_SYMBOLS: Final[frozenset[str]] = frozenset(
     {
         # Core
@@ -169,18 +191,67 @@ RESERVED_SYMBOLS: Final[frozenset[str]] = frozenset(
         # Syntax keywords
         "!", "_", "as", "let", "forall", "exists", "match", "par",
         "NUMERAL", "DECIMAL", "STRING", "BINARY", "HEXADECIMAL",
-        # Commands
-        "assert", "check-sat", "check-sat-assuming", "declare-const", "declare-datatype",
-        "declare-datatypes", "declare-fun", "declare-sort", "define-fun", "define-fun-rec",
-        "define-funs-rec", "define-sort", "echo", "exit", "get-assertions",
-        "get-assignment", "get-info", "get-model", "get-option", "get-proof",
-        "get-unsat-assumptions", "get-unsat-core", "get-value", "pop", "push",
-        "reset", "reset-assertions", "set-info", "set-logic", "set-option",
         # Z3 extensions
         "rem", "^", "iff", "implies", "if", "divisible", "pi", "euler", "root-obj",
         "const", "lambda",
     }
+    | _SMT_COMMANDS
 )  # fmt: skip
+
+_IDENTIFIER: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_z3_builtin(name: str) -> bool:
+    """True if Z3 already knows `name` as a term or a sort with no declaration (AUDIT-9 #1).
+
+    Uses the low-level parser in this thread's context; any error other than
+    "unknown constant/sort <name>" means the parser resolved the name.
+    """
+    ctx = _parse_context()
+    probes = (
+        (f"(assert (= {name} {name}))", f"unknown constant {name}"),
+        (f"(declare-const x {name})", f"unknown sort '{name}'"),
+    )
+    for smt, unknown in probes:
+        try:
+            z3.Z3_parse_smtlib2_string(ctx.ref(), smt, 0, None, None, 0, None, None)
+        except z3.Z3Exception as exc:
+            msg = exc.value.decode() if isinstance(exc.value, bytes) else str(exc.value)
+            if unknown not in msg:
+                return True
+        else:
+            return True
+    return False
+
+
+_TERM_TOKEN: Final = re.compile(r'\s*("(?:[^"]|"")*"|[()]|[^\s()"]+)')
+
+
+def _is_single_term(text: str) -> bool:
+    """True if `text` is exactly one atom or balanced S-expression with no SMT command.
+
+    So the assertion cannot close its `(assert ...)` and run commands such as
+    `declare-fun` or `set-option` (AUDIT-9 #2). Quoted symbols and comments are refused.
+    """
+    if any(c in text for c in "|;"):
+        return False
+    pos, end, depth, done, prev = 0, len(text.rstrip()), 0, False, ""
+    while pos < end:
+        m = _TERM_TOKEN.match(text, pos)
+        if m is None or done:
+            return False
+        tok, pos = m.group(1), m.end()
+        if tok == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif tok == "(":
+            depth += 1
+        elif prev == "(" and tok in _SMT_COMMANDS:
+            return False
+        done, prev = depth == 0, tok
+    return done
 
 
 def _decl_name(decl: str) -> str | None:

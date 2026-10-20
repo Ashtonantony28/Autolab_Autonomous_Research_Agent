@@ -11,7 +11,6 @@ from pydantic import BaseModel
 
 from autolab.state.models import ClaimType, FormalizedStep, ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import (
-    RESERVED_SYMBOLS,
     FormalizationError,
     Formalizer,
     Vocabulary,
@@ -122,7 +121,7 @@ async def test_formalizer_rejects_invalid_smt() -> None:
     fake.register(
         "formalize",
         prompt_for(step, Vocabulary()),
-        json.dumps({"declarations": "(declare-const p Bool)", "assertion": "(this is broken"}),
+        json.dumps({"declarations": "(declare-const p Bool)", "assertion": "(this is broken)"}),
     )
     with pytest.raises(FormalizationError, match="invalid SMT"):
         await Formalizer(fake).formalize(step)
@@ -164,7 +163,7 @@ async def test_unparseable_step_leaves_vocabulary_unchanged() -> None:
     fake.register(
         "formalize",
         prompt_for(step, Vocabulary()),
-        json.dumps({"declarations": "(declare-const q Bool)", "assertion": "(and q"}),
+        json.dumps({"declarations": "(declare-const q Bool)", "assertion": "(and q r)"}),
     )
     f = Formalizer(fake)
     with pytest.raises(FormalizationError, match="invalid SMT"):
@@ -278,7 +277,28 @@ async def test_refusal_becomes_formalization_error() -> None:
         await Formalizer(_RefusingLLM()).formalize(_step(0))
 
 
-@pytest.mark.parametrize("name", sorted(RESERVED_SYMBOLS))
+# Written out rather than read from `RESERVED_SYMBOLS`, so deleting a name from the set
+# fails its case here (AUDIT-12 #3).
+RESERVED_NAMES = (
+    "true", "false", "not", "=>", "and", "or", "xor", "=", "distinct", "ite",
+    "+", "-", "*", "/", "div", "mod", "abs", "<", "<=", ">", ">=",
+    "to_real", "to_int", "is_int", "select", "store",
+    "Bool", "Int", "Real", "Array", "String", "Seq", "RegLan", "BitVec",
+    "FloatingPoint", "RoundingMode",
+    "!", "_", "as", "let", "forall", "exists", "match", "par",
+    "NUMERAL", "DECIMAL", "STRING", "BINARY", "HEXADECIMAL",
+    "assert", "check-sat", "check-sat-assuming", "declare-const", "declare-datatype",
+    "declare-datatypes", "declare-fun", "declare-sort", "define-fun", "define-fun-rec",
+    "define-funs-rec", "define-sort", "echo", "exit", "get-assertions",
+    "get-assignment", "get-info", "get-model", "get-option", "get-proof",
+    "get-unsat-assumptions", "get-unsat-core", "get-value", "pop", "push",
+    "reset", "reset-assertions", "set-info", "set-logic", "set-option",
+    "rem", "^", "iff", "implies", "if", "divisible", "pi", "euler", "root-obj",
+    "const", "lambda",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
 def test_merge_rejects_reserved_symbols(name: str) -> None:
     # AUDIT-5 #1: a declaration must not shadow an SMT-LIB builtin.
     v = Vocabulary({"p": "(declare-const p Bool)"})
@@ -287,9 +307,98 @@ def test_merge_rejects_reserved_symbols(name: str) -> None:
     assert set(v.declarations) == {"p"}
 
 
-@pytest.mark.parametrize("name", ["gt", "not_ready", "and_gate", "Truth", "x-1", "absorbance"])
+@pytest.mark.parametrize(
+    "name",
+    ["gt", "not_ready", "and_gate", "Truth", "x_1", "_tmp", "absorbance", "sinus", "str_len"],
+)
 def test_merge_accepts_user_symbols_near_reserved_words(name: str) -> None:
     assert name in Vocabulary().merged(f"(declare-fun {name} (Real) Bool)").declarations
+
+
+@pytest.mark.parametrize("name", ["str.len", "x-1", "a.b", "~", "^0", "/0", "as-array", "k'"])
+def test_merge_rejects_names_that_are_not_plain_identifiers(name: str) -> None:
+    # AUDIT-9 #1: dotted and punctuated Z3 builtins never reach the builtin probe.
+    with pytest.raises(FormalizationError, match="not a plain identifier"):
+        Vocabulary().merged(f"(declare-fun {name} (Real) Real)")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sin", "cos", "asin", "atan", "sinh", "subset", "union", "intersection",
+        "setminus", "complement", "map", "default", "bvult", "bvadd", "bvneg", "bv2int",
+        "int2bv", "ubv_to_int", "fp", "to_fp", "RNE", "Float32", "Unicode", "char",
+        "pbeq", "pble", "pbge", "div0", "mod0",
+    ],
+)  # fmt: skip
+def test_merge_rejects_z3_builtins_found_by_asking_z3(name: str) -> None:
+    # AUDIT-9 #1: none of these is on the hand-written list.
+    assert name not in RESERVED_NAMES
+    with pytest.raises(FormalizationError, match="Z3 builtin"):
+        Vocabulary().merged(f"(declare-fun {name} (Real) Real)")
+
+
+def test_builtin_probe_ignores_earlier_declarations() -> None:
+    z3.parse_smt2_string("(declare-const later Bool)", ctx=_parse_context())
+    assert "later" in Vocabulary().merged("(declare-const later Bool)").declarations
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        "a) (assert b",
+        "p) (declare-fun = (Real Real) Bool) (assert true",
+        "p) (set-option :rlimit 1) (assert p",
+        "p) (reset-assertions) (assert p",
+        "(not (set-option :rlimit 1))",
+        "p q",
+        "(p) q",
+        "(and p",
+        "p)",
+        ") (assert p",
+        "|p|",
+        "p ; comment",
+        '"unterminated',
+    ],
+)
+async def test_assertion_must_be_exactly_one_term(
+    assertion: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AUDIT-9 #2: rejected before any parse, so no command runs, not even `set-option`.
+    parses: list[str] = []
+    monkeypatch.setattr(z3, "parse_smt2_string", lambda s, **_: parses.append(s))
+    step = _step(0)
+    fake = FakeLLMClient()
+    fake.register(
+        "formalize",
+        prompt_for(step, Vocabulary()),
+        json.dumps({"declarations": "(declare-const p Bool)", "assertion": assertion}),
+    )
+    f = Formalizer(fake)
+    with pytest.raises(FormalizationError, match="not exactly one term"):
+        await f.formalize(step)
+    assert parses == []
+    assert f.vocabulary.declarations == {}
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    ["p", "  (not p)\n", '(= s "a) (assert true")', '(= s "say ""hi""")', "(! p :named n)"],
+)
+async def test_single_term_assertions_are_accepted(assertion: str) -> None:
+    step = _step(0)
+    fake = FakeLLMClient()
+    fake.register(
+        "formalize",
+        prompt_for(step, Vocabulary()),
+        json.dumps(
+            {
+                "declarations": "(declare-const p Bool)\n(declare-const s String)",
+                "assertion": assertion,
+            }
+        ),
+    )
+    assert (await Formalizer(fake).formalize(step)).assertion == assertion.strip()
 
 
 async def test_reserved_declaration_makes_the_step_formalization_failed() -> None:
