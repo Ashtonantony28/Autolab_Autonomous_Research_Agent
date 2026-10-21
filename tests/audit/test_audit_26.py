@@ -74,7 +74,6 @@ def test_worker_boots_do_not_rerun_the_main_scripts_imports() -> None:
     assert main_imports_per_boot(3) <= 2
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #5")
 def test_an_unguarded_main_is_not_reported_as_a_solver_timeout() -> None:
     verdict, reason, details, _ = unguarded_outcome()
     assert verdict == "VALID" or reason != "timeout", details

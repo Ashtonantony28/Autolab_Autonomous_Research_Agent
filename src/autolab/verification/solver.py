@@ -156,6 +156,9 @@ _KILL_GRACE_SHARE: Final[float] = 0.1
 """A worker still running this share of its timeout past it is killed."""
 _KILL_GRACE_MIN_S: Final[float] = 0.01
 """The least grace, so a short check is not killed for scheduling noise."""
+TIMEOUT_MAX_S: Final[float] = 1e6
+"""Longer timeouts are clamped to this: with its grace it stays within the 2^31 ms a
+wait on the worker's pipe and Z3's `timeout` accept (AUDIT-27 #2)."""
 _IDLE_WORKERS: Final[int] = max(2, 2 * SOLVER_WORKERS + SOLVER_SLOW_WORKERS)
 """Worker processes kept idle: every slot, slow check and lent place of the default pool."""
 
@@ -214,6 +217,7 @@ class Z3Solver:
           - premises and not claim is unsat → VALID.
           - premises and not claim is sat   → INVALID.
           - Any solver error / unknown / timeout / killed worker → UNGROUNDED.
+          - A worker lost before its budget ran out → UNGROUNDED (`worker_died`).
 
         Raises:
             SolverWorkerError: the check raised in its worker.
@@ -230,11 +234,10 @@ class Z3Solver:
         if not interrupt.attach(worker):
             pool.release(worker)
             return _INTERRUPTED
-        booted = worker.ready()
-        checking = time.perf_counter()
         try:
-            budget_s = self.timeout_seconds + _grace_s(self.timeout_seconds)
-            reply = worker.call(args, budget_s) if booted else None
+            booted = worker.ready()
+            checking = time.perf_counter()
+            reply = worker.call(args, args[-1] + _grace_s(args[-1])) if booted else None
         except BaseException:  # e.g. a per-test timeout's signal: the worker is mid-check
             interrupt.detach()
             pool.discard(worker)
@@ -252,7 +255,9 @@ class Z3Solver:
             + (time.perf_counter() - checked)
         )
         if reply is None:
-            return _INTERRUPTED if interrupt.requested() else _KILLED
+            if interrupt.requested():
+                return _INTERRUPTED
+            return _lost(worker) if worker.fault else _KILLED
         ok, value = reply
         if not ok:
             raise SolverWorkerError(value)
@@ -270,7 +275,7 @@ class Z3Solver:
             _build_smt2(premises, claim),
             len(premises),
             claim.assertion.strip() == "true",
-            self.timeout_seconds,
+            min(self.timeout_seconds, TIMEOUT_MAX_S),
         )
 
 
@@ -281,6 +286,15 @@ _INTERRUPTED: Final = SolverOutcome(verdict="UNGROUNDED", reason="timeout", deta
 _KILLED: Final = SolverOutcome(
     verdict="UNGROUNDED", reason="timeout", details="worker killed past the timeout"
 )
+
+
+def _lost(worker: solver_workers.Worker) -> SolverOutcome:
+    """A check whose worker was lost before its budget ran out (AUDIT-25 #2, AUDIT-27 #1)."""
+    details = f"worker {worker.fault}"
+    code = worker.process.exitcode
+    if worker.fault == solver_workers.DIED and code is not None:
+        details += f" (signal {-code})" if code < 0 else f" (exit code {code})"
+    return SolverOutcome(verdict="UNGROUNDED", reason="worker_died", details=details)
 
 
 def _grace_s(timeout_s: float) -> float:

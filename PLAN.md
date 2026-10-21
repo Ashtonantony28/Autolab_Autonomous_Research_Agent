@@ -46,7 +46,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG28 | Formalizer probe cost linear in arity (AUDIT-22 #1) | audit round 6 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 | SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | done (PR pending) |
 | SG30 | Slot fairness by elapsed time with aging (AUDIT-22 #4, AUDIT-24 #2, #3) | SG29 | `verification/solver.py` scheduling only, `tests/unit/verification/test_solver_scheduling.py` | done (PR pending) |
-| SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | open |
+| SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (PR pending) |
 | SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | open |
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 
