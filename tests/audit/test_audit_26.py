@@ -36,7 +36,6 @@ async def test_a_new_tasks_first_check_does_not_queue_behind_every_hard_run() ->
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #2")
 def test_probing_a_reply_of_many_declarations_costs_a_few_parses_of_it() -> None:
     # 100 declarations at MAX_ARITY: ~15 KB, well under the client's max_tokens.
     decls = wide_reply(100)
@@ -56,7 +55,6 @@ def _merge_or_refuse_s(decls: str) -> float:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #2")
 def test_probing_a_nested_sort_is_linear_in_its_depth() -> None:
     half = min(_merge_or_refuse_s(deep_sort_decl(400)) for _ in range(2))
     full = min(_merge_or_refuse_s(deep_sort_decl(800)) for _ in range(2))
