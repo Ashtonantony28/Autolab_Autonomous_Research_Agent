@@ -106,32 +106,69 @@ async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> No
     assert all(_SLOW_S * 1000 * 0.9 <= ms < (_SLOW_S + _SLACK_S) * 1000 for ms in slow)
 
 
-async def test_solver_ms_excludes_worker_start_up(
-    make_executor: ExecutorFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ready, stop = solver_workers.Worker.ready, solver_workers.Worker.stop
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
 
-    def slow_boot(worker: solver_workers.Worker) -> bool:
-        if not worker._ready:
-            time.sleep(_SLACK_S)
-        return ready(worker)
+    def __call__(self) -> float:
+        return self.now
 
-    def slow_stop(worker: solver_workers.Worker) -> None:
-        time.sleep(_SLACK_S)
-        stop(worker)
 
-    monkeypatch.setattr(solver_workers.Worker, "ready", slow_boot)
-    monkeypatch.setattr(solver_workers.Worker, "stop", slow_stop)
-    executor = make_executor(1)
-    quick = partial(
-        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, POSITIVE)
-    )
+def test_solver_ms_excludes_worker_start_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fresh pool, so the check starts and boots its worker; no grace, so the worker
+    # is killed and replaced. On a fake clock starting costs 1000 s, booting 100 s,
+    # the call 1 s and stopping 10 s: only the call's second is `solver_ms` (AUDIT-28 #5).
+    clock = _FakeClock()
+    monkeypatch.setattr(solver_mod, "time", SimpleNamespace(perf_counter=clock))
+    monkeypatch.setattr(solver_mod, "_clock", clock)
+    monkeypatch.setattr(solver_mod, "_grace_s", lambda timeout_s: -timeout_s)
+    pool = solver_workers.Workers(solver_mod._solve, idle_max=1)
+    monkeypatch.setattr(solver_mod, "_workers", lambda: pool)
+    worker_type = solver_workers.Worker
+    booted: list[bool] = []
+    used: list[solver_workers.Worker] = []
+    real_start, real_ready = pool._start, worker_type.ready
+    real_call, real_stop = worker_type.call, worker_type.stop
+
+    def start() -> solver_workers.Worker:
+        clock.now += 1000.0
+        return real_start()
+
+    def ready(worker: solver_workers.Worker) -> bool:
+        booted.append(worker._ready)
+        clock.now += 0.0 if worker._ready else 100.0
+        return real_ready(worker)
+
+    def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        used.append(worker)
+        clock.now += 1.0
+        return real_call(worker, args, budget_s)
+
+    def stop(worker: solver_workers.Worker) -> None:
+        clock.now += 10.0
+        real_stop(worker)
+
+    monkeypatch.setattr(pool, "_start", start)
+    monkeypatch.setattr(worker_type, "ready", ready)
+    monkeypatch.setattr(worker_type, "call", call)
+    monkeypatch.setattr(worker_type, "stop", stop)
+    executor = SolverExecutor(1, 0)
     hard = partial(
-        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
+        Z3Solver(_HANG_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
-    (_, quick_ms), (_, hard_ms) = [await executor.run(check) for check in (quick, hard)]
-    assert quick_ms < _SLACK_S * 1000  # booting the worker is not counted
-    assert hard_ms < (_SLOW_S + _SLACK_S) * 1000  # nor is replacing the timed-out one
+    try:
+        outcome, ms = executor._call(hard, solver_mod._Interrupt())
+        spent = clock.now
+        (replacement,) = pool._idle
+        replaced = replacement is not used[0] and replacement.alive() and not used[0].alive()
+    finally:
+        executor.shutdown()
+        pool.close()
+    assert outcome == solver_mod._KILLED
+    assert booted[0] is False  # the check started and booted its worker
+    assert replaced
+    assert spent == 1000 + 100 + 1 + 10 + 1000  # its kill and replacement ran
+    assert ms == pytest.approx(1000.0)
 
 
 @pytest.mark.perf
@@ -474,7 +511,8 @@ def test_a_check_whose_worker_dies_is_never_valid(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(solver_workers.Worker, "call", dying)
     decls = "(declare-const p Bool)"
     out = Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
-    assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
+    # Not a timeout: the worker died (SIGKILL) well inside its budget (AUDIT-25 #2).
+    assert out == solver_mod.SolverOutcome("UNGROUNDED", "worker_died", "worker died (signal 9)")
 
 
 def test_a_check_that_raises_in_its_worker_raises_in_the_caller(

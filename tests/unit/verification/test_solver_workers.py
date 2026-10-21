@@ -8,6 +8,7 @@ cleanup, and sizing from the cgroup CPU quota.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import operator
 import os
 import subprocess
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Final
 
@@ -144,6 +146,195 @@ def test_workers_come_from_a_forkserver() -> None:
         assert worker.process.daemon
     finally:
         solver_mod._workers().release(worker)
+
+
+# --- replies matched to their request, and why a call returned none (SG31) -----------
+
+
+def _piped_worker() -> tuple[solver_workers.Worker, Connection]:
+    """A booted `Worker` whose other end of the pipe the test plays."""
+    parent, child = multiprocessing.Pipe()
+    worker = solver_workers.Worker.__new__(solver_workers.Worker)
+    worker.conn, worker._ready, worker._seq, worker.fault = parent, True, 0, ""
+    return worker, child
+
+
+@pytest.mark.parametrize(
+    "message",
+    [(0, (True, 1.0)), (2, (True, 1.0)), (True, 1.0), (1, "VALID"), (1, (1, 2, 3)), None],
+    ids=["earlier", "later", "untagged", "not-a-reply", "malformed", "boot"],
+)
+def test_a_message_that_is_not_this_requests_reply_is_never_returned(message: object) -> None:
+    worker, other = _piped_worker()
+    other.send(message)
+    assert worker.call((1, 1), _WAIT_S) is None
+    assert worker.fault == solver_workers.OUT_OF_TURN
+    assert other.recv() == (1, (1, 1))
+
+
+def test_a_reply_that_echoes_its_request_is_returned() -> None:
+    worker, other = _piped_worker()
+    worker._seq = 6
+    other.send((7, (True, 1.0)))
+    assert worker.call((1, 1), _WAIT_S) == (True, 1.0)
+    assert worker.fault == ""
+
+
+def test_a_reply_left_in_the_pipe_never_answers_the_next_call(
+    pool: solver_workers.Workers,
+) -> None:
+    worker = pool.acquire()
+    assert worker.ready()
+    worker._send((6, 3))  # cut short: its reply arrives, unread
+    assert worker.conn.poll(_WAIT_S)
+    assert worker.call((1, 4), _WAIT_S) is None
+    assert worker.fault == solver_workers.OUT_OF_TURN
+    pool.discard(worker)
+
+
+def test_a_worker_that_never_starts_failed_to_start() -> None:
+    worker, other = _piped_worker()
+    worker._ready = False
+    other.close()
+    assert not worker.ready()
+    assert worker.call((1, 1), _WAIT_S) is None
+    assert worker.fault == solver_workers.FAILED_TO_START
+
+
+def test_a_worker_killed_mid_call_died_and_one_past_its_budget_has_no_fault() -> None:
+    sleeping = solver_workers.Workers(time.sleep, idle_max=1)
+    try:
+        worker = sleeping.acquire()
+        assert worker.call((_WAIT_S,), 0.0) is None
+        assert worker.fault == ""
+        sleeping.discard(worker)
+        worker = sleeping.acquire()
+        assert worker.call((0,), _WAIT_S) == (True, None)
+        threading.Timer(0.05, worker.process.kill).start()  # e.g. the OOM killer
+        assert worker.call((_WAIT_S,), _WAIT_S) is None
+        assert worker.fault == solver_workers.DIED
+        sleeping.discard(worker)
+    finally:
+        sleeping.close()
+
+
+@pytest.fixture
+def solver_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[solver_workers.Workers]:
+    """A private `_solve` pool of one idle place, used by every check in the test."""
+    workers = solver_workers.Workers(solver_mod._solve, idle_max=1)
+    monkeypatch.setattr(solver_mod, "_workers", lambda: workers)
+    yield workers
+    workers.close()
+
+
+_PQ: Final = "(declare-const p Bool)\n(declare-const q Bool)"
+_P_ENTAILS_P: Final = ([SmtFormula(_PQ, "p")], SmtFormula(_PQ, "p"))
+_P_ENTAILS_Q: Final = ([SmtFormula(_PQ, "p")], SmtFormula(_PQ, "q"))
+
+
+def test_a_stale_valid_reply_never_answers_a_later_check(
+    solver_pool: solver_workers.Workers,
+) -> None:
+    # A worker parked with the unread VALID of `p |- p`, as a release in place of a
+    # discard would leave it (AUDIT-28 #1): `p |- q` must not read it.
+    worker = solver_pool.acquire()
+    assert worker.ready()
+    worker._send(Z3Solver()._args(*_P_ENTAILS_P))
+    assert worker.conn.poll(_WAIT_S)
+    solver_pool.release(worker)
+    out = Z3Solver().check_entailment(*_P_ENTAILS_Q)
+    assert out == solver_mod.SolverOutcome(
+        "UNGROUNDED", "worker_died", "worker replied out of turn"
+    )
+    assert not worker.alive() and worker not in solver_pool._idle
+    assert Z3Solver().check_entailment(*_P_ENTAILS_Q).verdict == "INVALID"
+
+
+def test_a_cancel_while_a_worker_is_acquired_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, solver_pool: solver_workers.Workers
+) -> None:
+    interrupt = solver_mod._Interrupt()
+    monkeypatch.setattr(solver_mod._worker, "interrupt", interrupt, raising=False)
+    real_acquire = solver_pool.acquire
+    acquired: list[solver_workers.Worker] = []
+    calls: list[object] = []
+
+    def acquire() -> solver_workers.Worker:
+        acquired.append(real_acquire())
+        interrupt.request()  # lands after the early check, before `attach`
+        return acquired[-1]
+
+    def call(worker: solver_workers.Worker, args: tuple[object, ...], budget_s: float) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(solver_pool, "acquire", acquire)
+    monkeypatch.setattr(solver_workers.Worker, "call", call)
+    assert Z3Solver().check_entailment(*_P_ENTAILS_P) == solver_mod._INTERRUPTED
+    assert calls == []
+    assert not interrupt.attached()
+    assert acquired[0] in solver_pool._idle and acquired[0].alive()  # given back, unused
+
+
+class _Signal(BaseException):
+    """What a signal handler raises in the caller while a worker boots."""
+
+
+def test_an_error_while_a_worker_boots_discards_it(
+    monkeypatch: pytest.MonkeyPatch, solver_pool: solver_workers.Workers
+) -> None:
+    acquired: list[solver_workers.Worker] = []
+    real_acquire = solver_pool.acquire
+
+    def acquire() -> solver_workers.Worker:
+        acquired.append(real_acquire())
+        return acquired[-1]
+
+    monkeypatch.setattr(solver_pool, "acquire", acquire)
+
+    def ready(worker: solver_workers.Worker) -> bool:
+        raise _Signal
+
+    monkeypatch.setattr(solver_workers.Worker, "ready", ready)
+    with pytest.raises(_Signal):
+        Z3Solver().check_entailment(*_P_ENTAILS_P)
+    assert not acquired[0].alive() and acquired[0] not in solver_pool._idle
+    assert solver_pool.live() == 1  # its replacement
+
+
+def test_a_worker_that_fails_to_start_is_reported_so(
+    monkeypatch: pytest.MonkeyPatch, solver_pool: solver_workers.Workers
+) -> None:
+    def ready(worker: solver_workers.Worker) -> bool:
+        worker.fault = solver_workers.FAILED_TO_START
+        return False
+
+    calls: list[object] = []
+    monkeypatch.setattr(solver_workers.Worker, "ready", ready)
+    monkeypatch.setattr(solver_workers.Worker, "call", lambda *a: calls.append(a))
+    out = Z3Solver().check_entailment(*_P_ENTAILS_P)
+    assert out == solver_mod.SolverOutcome("UNGROUNDED", "worker_died", "worker failed to start")
+    assert calls == []
+
+
+@pytest.mark.parametrize("timeout_s", [2.25e6, 1e12, float("inf")])
+def test_a_huge_timeout_is_clamped_and_decided_as_here(
+    monkeypatch: pytest.MonkeyPatch, timeout_s: float
+) -> None:
+    budgets: list[float] = []
+    real_call = solver_workers.Worker.call
+
+    def call(worker: solver_workers.Worker, args: tuple[object, ...], budget_s: float) -> object:
+        budgets.append(budget_s)
+        return real_call(worker, args, budget_s)
+
+    monkeypatch.setattr(solver_workers.Worker, "call", call)
+    solver = Z3Solver(timeout_s)
+    here = solver._check_here(*_P_ENTAILS_P)
+    assert here.verdict == "VALID"
+    assert solver.check_entailment(*_P_ENTAILS_P) == here
+    cap = solver_mod.TIMEOUT_MAX_S
+    assert budgets == [cap + solver_mod._grace_s(cap)]
+    assert budgets[0] * 1000 < 2**31  # what `poll` accepts
 
 
 # --- the worker decides what `_solve` decides here ------------------------------------
