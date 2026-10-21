@@ -16,8 +16,10 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from multiprocessing import spawn
 from multiprocessing.connection import Connection
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Final
 
 import pytest
@@ -146,6 +148,51 @@ def test_workers_come_from_a_forkserver() -> None:
         assert worker.process.daemon
     finally:
         solver_mod._workers().release(worker)
+
+
+@pytest.mark.parametrize(
+    "main",
+    [
+        SimpleNamespace(__spec__=None, __file__="/srv/user_script.py"),
+        SimpleNamespace(__spec__=SimpleNamespace(name="user_pkg.run"), __file__="/srv/run.py"),
+    ],
+    ids=["path", "dash-m"],
+)
+def test_a_worker_is_prepared_without_the_main_module(
+    monkeypatch: pytest.MonkeyPatch, main: SimpleNamespace
+) -> None:
+    # AUDIT-26 #4, AUDIT-25 #1: a worker never re-runs the caller's main; other processes do.
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    keys = {"init_main_from_path", "init_main_from_name"}
+    assert not keys & spawn.get_preparation_data(solver_workers._NAME).keys()
+    assert keys & spawn.get_preparation_data("another").keys()
+
+
+_UNGUARDED_MODULE: Final = """
+import os, sys
+from autolab.verification.solver import SmtFormula, Z3Solver
+with open(sys.argv[1], "a") as log:
+    log.write(f"{os.getpid()}\\n")
+decls = "(declare-const p Bool)"
+out = Z3Solver().check_entailment([SmtFormula("", "p")], SmtFormula(decls, "p"))
+print(out.verdict, out.details)
+"""
+
+
+def test_an_unguarded_dash_m_main_runs_once_and_gets_valid(tmp_path: Path) -> None:
+    (tmp_path / "unguarded_main.py").write_text(_UNGUARDED_MODULE)
+    log = tmp_path / "body.log"
+    proc = subprocess.run(
+        [sys.executable, "-m", "unguarded_main", str(log)],
+        cwd=_ROOT,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(_ROOT)])},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    assert proc.stdout.startswith("VALID"), proc.stdout + proc.stderr
+    assert len(log.read_text().splitlines()) == 1
 
 
 # --- replies matched to their request, and why a call returned none (SG31) -----------

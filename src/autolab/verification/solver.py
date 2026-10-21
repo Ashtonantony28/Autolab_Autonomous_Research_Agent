@@ -22,8 +22,10 @@ caller and runs on as one of at most `slow_workers` slow checks: hard runs
 cannot starve easy ones (AUDIT-14 #2). With no slow room left, its slot still
 admits a caller whose last check was short (AUDIT-18 #4), and only a slot can
 lend (AUDIT-24 #3). A run is hard by its check's run time (AUDIT-24 #2), and a
-caller passed over `workers` times is served next (AUDIT-22 #4). The pool starts
-a thread for every admitted check that finds none idle (AUDIT-18 #2).
+caller passed over `workers` times is served next (AUDIT-22 #4). A caller with no
+check yet ranks as short, so it never queues behind every hard run, but is lent no
+place, as its check may be hard (AUDIT-26 #1). The pool starts a thread for every
+admitted check that finds none idle (AUDIT-18 #2).
 
 Inputs are SMT-LIB 2 strings, parsed by Z3 in one call so the boundary
 between LLM-produced text and Z3's AST is explicit. Z3's simplex on a long pool
@@ -446,7 +448,7 @@ def _workers() -> solver_workers.Workers:
         if _shared_workers is None:
             _shared_workers = solver_workers.register(
                 solver_workers.Workers(
-                    _solve, _IDLE_WORKERS, preload=("__main__", solver_workers.__name__, __name__)
+                    _solve, _IDLE_WORKERS, preload=(solver_workers.__name__, __name__)
                 )
             )
         return _shared_workers
@@ -606,17 +608,18 @@ class _Pool:
 
 
 class _Waiter:
-    __slots__ = ("future", "passed", "short")
+    __slots__ = ("future", "new", "passed", "short")
 
-    def __init__(self, future: asyncio.Future[bool], short: bool) -> None:
+    def __init__(self, future: asyncio.Future[bool], short: bool, new: bool) -> None:
         self.future = future
         self.short = short
+        self.new = new
         self.passed = 0
 
 
 class _Slots:
     """Admission for one event loop: `workers` slots, granted in FIFO order, callers
-    whose last check was short first.
+    whose last check was short, or who have none yet, first.
 
     A caller that later arrivals have overtaken for `workers` slots is served next,
     so every caller waits a bounded number of grants (AUDIT-22 #4). A slot whose Z3
@@ -632,12 +635,13 @@ class _Slots:
         self.lent = 0
         self._waiters: deque[_Waiter] = deque()
 
-    async def acquire(self, short: bool) -> bool:
-        """Wait for a place; True if a stuck slot lent it."""
+    async def acquire(self, short: bool, new: bool = False) -> bool:
+        """Wait for a place; True if a stuck slot lent it. A `new` caller (no check yet)
+        ranks with short ones but is lent no place: its check may be hard."""
         lent = self._grant(short)
         if lent is not None:
             return lent
-        entry = _Waiter(asyncio.get_running_loop().create_future(), short)
+        entry = _Waiter(asyncio.get_running_loop().create_future(), short, new)
         self._waiters.append(entry)
         try:
             return await entry.future
@@ -676,7 +680,7 @@ class _Slots:
         return None
 
     def _rank(self, entry: _Waiter) -> int:
-        return 0 if entry.passed >= self.workers else 1 if entry.short else 2
+        return 0 if entry.passed >= self.workers else 1 if entry.short or entry.new else 2
 
     def _wake(self) -> None:
         while True:
@@ -721,6 +725,7 @@ class SolverExecutor:
         )
         self._running: set[_Interrupt] = set()
         self._short: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+        self._hard: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
         # Worker processes start off the caller's thread and before the first check.
         threading.Thread(
             target=_workers().prestart, args=(workers + slow_workers,), daemon=True
@@ -732,7 +737,9 @@ class SolverExecutor:
         task = asyncio.current_task()
         with self._lock:
             short = task in self._short
-        lent = await slots.acquire(short)
+            # A task with no check yet has not shown it is hard (AUDIT-26 #1).
+            new = not short and task not in self._hard
+        lent = await slots.acquire(short, new)
         slow = stuck = False
         interrupt = _Interrupt()
         try:
@@ -769,8 +776,10 @@ class SolverExecutor:
                 with self._lock:
                     if interrupt.ran_s() >= _HARD_SLICES * _SLICE_S:
                         self._short.discard(task)
+                        self._hard.add(task)
                     else:
                         self._short.add(task)
+                        self._hard.discard(task)
 
     def _to_slow(self, interrupt: _Interrupt) -> bool:
         """Count a running Z3 check as slow if there is room; False leaves it in its slot."""
