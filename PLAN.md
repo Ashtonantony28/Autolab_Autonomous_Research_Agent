@@ -49,6 +49,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (PR pending) |
 | SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
+| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | open |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -449,6 +450,13 @@ Round 7 (AUDIT-25..28, fresh agents, base `7123eed`) found 0 critical and 3 high
 - **SG33 Probe budget per reply.** SG28 caps one declaration's arity, not a reply's total probe work: 100 declarations at the cap make 6 800 parses and block the loop 1.8–3.2 s, and nested sorts parse in quadratic time (AUDIT-26 #2, high). Bound total probe work and sort nesting depth per reply (`Final` constants, rejected with a reason the formalizer retry can use). **Flip:** AUDIT-26 #2 repros. **Verify:** `uv run pytest tests/audit/test_audit_22.py tests/audit/test_audit_26.py tests/unit/verification -q` · error injection · bench.
 
 Medium and low round-7 findings not folded in above stay in the AUDIT files. AUDIT-21 #1 / AUDIT-23 #1 (medium) is still open. AUDIT-10 #4 is now counted, not timed (AUDIT-28 #8).
+### Audit round 8 → SG34
+
+Round 8 (AUDIT-29..32, fresh agents, base `f09ea60`) found 0 critical and 1 high finding. Soundness held: no stale, out-of-turn or dead-worker reply came back VALID in stress runs, and SG33's budget only refuses. Repros are strict xfails in `tests/audit/test_audit_{29..32}.py`.
+
+- **SG34 Runs that start together; fork safety.** A newcomer still queues behind hard runs that started together: a 10-step easy verify beside 16 hard runs takes 20.3 s against 0.04 s alone, and in the orchestrator every node and retry runs in a fresh task, so this is the normal case (AUDIT-30 #1, high; AUDIT-32 #8). Bound a newcomer's wait by elapsed time behind hard checks, not arrival order among newcomers, keeping SG30/SG32's no-starvation guarantees. Also: a process forked after a `Verifier` is built must start its own workers and never reuse the parent's (AUDIT-29 #1, AUDIT-30 #2, medium, an SG32 regression found by two auditors). **Flip:** AUDIT-30 #1 ×2, #2, AUDIT-29 #1. **Verify:** `make lint typecheck test` · `make test` green 5 times under load · error injection (34/34, 26/26) · bench.
+
+Medium and low round-8 findings not folded in above stay in the AUDIT files, among them `worker_died` on a non-final step still passing the trace (AUDIT-31 #1), the unpinned forkserver preload and boot-timeout fault (AUDIT-32 #1, #2), probe charges for repeated vocabulary (AUDIT-29 #2) and merge cost growing with vocabulary size (AUDIT-30 #3). AUDIT-21 #1 / AUDIT-23 #1 (medium) is still open.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -465,9 +473,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-17..20 | Round 5, on SG20–SG23 |
 | AUDIT-21..24 | Round 6, on SG24–SG27 |
 | AUDIT-25..28 | Round 7, on SG28–SG30 |
+| AUDIT-29..32 | Round 8, on SG31–SG33 |
 
 ## Log
 
+- 2026-10-21: audit round 8 done (0 critical, 1 high); SG34 added. Soundness held; the high is newcomers queueing behind runs that started together.
 - 2026-10-21: audit round 7 done (0 critical, 3 high); SG31–SG33 added. No wrong trace admitted; the highs are a stale-reply guard, newcomer queueing and total probe work.
 - 2026-10-20: audit round 6 done (1 critical, 4 high); SG28–SG30 added. Soundness held; the remaining highs are solver timing and the probe cost, and SG29 moves checks into worker processes.
 - 2026-10-20: audit round 5 done (1 critical, 9 high); SG24–SG27 added. No wrong trace admitted by the verifier; the Design figure guard is replaced by an independent estimate (SG25).
