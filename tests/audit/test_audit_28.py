@@ -86,7 +86,7 @@ def _verdict_after_a_check_cut_short(monkeypatch: pytest.MonkeyPatch) -> str:
 
     def cut_short(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
         assert worker.ready()
-        worker.conn.send(args)
+        worker._send(args)
         assert worker.conn.poll(_WAIT_S)  # its reply is waiting, unread
         raise _CutShort
 
@@ -103,12 +103,12 @@ def test_a_check_cut_short_never_answers_the_next_one(
     assert _verdict_after_a_check_cut_short(monkeypatch) == "INVALID"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-28 #1")
 def test_a_check_cut_short_never_answers_the_next_one_under_w06(
     monkeypatch: pytest.MonkeyPatch, pool: solver_workers.Workers
 ) -> None:
+    # SG31: the reply's sequence number no longer matches, so the worker counts as lost.
     _mutant(monkeypatch, Z3Solver, "check_entailment", *_W06)
-    assert _verdict_after_a_check_cut_short(monkeypatch) == "INVALID"
+    assert _verdict_after_a_check_cut_short(monkeypatch) == "UNGROUNDED"
 
 
 # --------------------------------------------------------------------------
@@ -482,8 +482,8 @@ def _serve_here(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], int, boo
             assert parent.poll(_WAIT_S)
             replies.append(parent.recv())  # ready
             signal.raise_signal(signal.SIGINT)  # Ctrl-C reaches the whole process group
-            for args in ((6, 3), (1, 0)):
-                parent.send(args)
+            for request in ((1, (6, 3)), (2, (1, 0))):
+                parent.send(request)
                 if parent.poll(_WAIT_S):
                     replies.append(parent.recv())
         except (EOFError, OSError):  # the loop ended early (the mutants)
@@ -506,7 +506,11 @@ def _serve_here(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], int, boo
     return replies, len(died), interrupted
 
 
-_SERVED: Final = ([None, (True, 2.0), (False, "ZeroDivisionError: division by zero")], 1, False)
+_SERVED: Final = (
+    [None, (1, (True, 2.0)), (2, (False, "ZeroDivisionError: division by zero"))],
+    1,
+    False,
+)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT semantics")

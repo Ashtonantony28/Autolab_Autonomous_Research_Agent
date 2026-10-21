@@ -32,6 +32,9 @@ _PR_SET_PDEATHSIG: Final[int] = 1
 _FORKSERVER_INIT: Final[str] = "autolab.verification._forkserver_init"
 Reply = tuple[bool, Any]
 """(True, result) or (False, the error's text)."""
+DIED: Final[str] = "died"
+FAILED_TO_START: Final[str] = "failed to start"
+OUT_OF_TURN: Final[str] = "replied out of turn"
 
 
 def _die_with_parent() -> None:
@@ -44,18 +47,18 @@ def _die_with_parent() -> None:
 
 
 def _serve(conn: Connection, target: Callable[..., Any]) -> None:
-    """Worker main loop: reply to each call with `target(*args)` until the pipe closes."""
+    """Worker main loop: answer each `(seq, args)` with `(seq, reply)` until the pipe closes."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent handles Ctrl-C
     _die_with_parent()
     try:
         conn.send(None)  # ready
         while True:
-            args = conn.recv()
+            seq, args = conn.recv()
             try:
                 reply: Reply = (True, target(*args))
             except Exception as exc:  # handed to the caller, as a thread pool does
                 reply = (False, f"{type(exc).__name__}: {exc}")
-            conn.send(reply)
+            conn.send((seq, reply))
     except (EOFError, OSError):  # the parent closed the pipe or exited
         return
 
@@ -79,34 +82,52 @@ class Worker:
         self.process.start()
         child.close()
         self._ready = False
+        self._seq = 0
+        self.fault = ""
+        """Why the last call returned None (`DIED`, `FAILED_TO_START`, `OUT_OF_TURN`);
+        empty when it ran past its budget."""
 
     def ready(self) -> bool:
         """Wait until the worker has started; False if it died or took over `_BOOT_S`."""
         try:
             if not self._ready:
                 if not self.conn.poll(_BOOT_S):
+                    self.fault = FAILED_TO_START
                     return False
                 self.conn.recv()
                 self._ready = True
             return True
         except (EOFError, OSError):  # killed, or died
+            self.fault = FAILED_TO_START
             return False
 
     def call(self, args: tuple[Any, ...], budget_s: float) -> Reply | None:
-        """`target(*args)`'s reply, or None if the worker died or ran past `budget_s`.
+        """`target(*args)`'s reply, or None (see `fault`) if the worker failed to start,
+        died, answered another request, or ran past `budget_s`.
 
-        The budget starts once the worker is ready, so start-up never counts against it.
+        Each request carries a sequence number its reply must echo, so a reply left in
+        the pipe by an earlier call is never taken for this one's (AUDIT-28 #1). The
+        budget starts once the worker is ready, so start-up never counts against it.
         """
         try:
             if not self.ready():
                 return None
-            self.conn.send(args)
+            self._send(args)
             if not self.conn.poll(budget_s):
                 return None
-            reply: Reply = self.conn.recv()
-            return reply
-        except (EOFError, OSError):  # killed, or died
+            match self.conn.recv():
+                case (self._seq, (bool(), _) as reply):
+                    matched: Reply = reply
+                    return matched
+            self.fault = OUT_OF_TURN
             return None
+        except (EOFError, OSError):  # killed, or died
+            self.fault = DIED
+            return None
+
+    def _send(self, args: tuple[Any, ...]) -> None:
+        self._seq += 1
+        self.conn.send((self._seq, args))
 
     def interrupt(self) -> None:
         """Kill the process; a call in progress returns None."""

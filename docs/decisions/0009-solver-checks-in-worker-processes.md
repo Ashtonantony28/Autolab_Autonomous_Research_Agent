@@ -43,3 +43,10 @@ Three rounds of in-process fixes (SG19, SG22, SG27) did not bound Z3:
 - Each idle worker costs one process. The forkserver shares the preloaded pages.
 - The main module must be safe to import (`if __name__ == "__main__":`), as for any spawned process. The forkserver imports it once.
 - Monkeypatching z3 or `solver` in the caller no longer reaches a check. Tests that spy on Z3 call `Z3Solver._check_here`, which runs `_solve` in-process. `test_solver_workers.py` pins that the worker's target is `_solve`, and that worker and in-process outcomes match on every case and golden trace.
+
+## Amendment (SG31, 2026-10-21)
+
+- **Matched replies.** Each request carries a sequence number that its reply echoes. A reply with another number, or any other message, is not taken: the worker counts as lost and is discarded, so a reply left in the pipe by a check cut short can never answer a later one (AUDIT-28 #1). The `except BaseException: discard` stays as the first guard, and `worker.ready()` now runs inside it (AUDIT-25 #3).
+- **Lost workers.** A worker that dies, fails to start or replies out of turn before its budget runs out gives UNGROUNDED/`worker_died`, with details such as "worker died (signal 9)" or "worker failed to start". Only a worker still running past `timeout + grace` is "worker killed past the timeout" (AUDIT-25 #2, AUDIT-27 #1).
+- **No retry on a fresh worker.** A death fails closed, as a timeout does. A crash on a given formula (a Z3 abort, the OOM killer on a large pool) would likely recur and double the step's cost, and a worker that cannot start fails again at once. The verification monitor's retry or escalation already re-runs the step.
+- **Timeout cap.** A timeout above `TIMEOUT_MAX_S` (10^6 s) is clamped to it, so the wait on the pipe and Z3's `timeout` stay within 2^31 ms (AUDIT-27 #2).
