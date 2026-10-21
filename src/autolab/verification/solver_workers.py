@@ -6,9 +6,9 @@ interrupts, and every ctypes call retakes the parent's GIL (AUDIT-22 #2, #3). A
 without holding the GIL and ends a call past its budget, or on request, by
 killing the process. `Workers` keeps started processes for reuse, so start-up
 stays off the hot path. Processes come from a forkserver (spawn where there is
-none), never from a fork of this threaded process. As with any spawned process,
-the main module must be safe to import (`if __name__ == "__main__":`); the
-forkserver preloads it once.
+none), never from a fork of this threaded process. A worker needs nothing from
+the caller's main module, so it never re-runs it: no import cost per boot, and
+a main with no `if __name__ == "__main__":` guard runs once (AUDIT-26 #4, AUDIT-25 #1).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import signal
 import sys
 import threading
 from collections.abc import Callable, Sequence
+from multiprocessing import spawn
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from typing import Any, Final
@@ -29,7 +30,8 @@ _BOOT_S: Final[float] = 60.0
 """How long a new worker may take to start before it counts as lost."""
 _PR_SET_PDEATHSIG: Final[int] = 1
 
-_FORKSERVER_INIT: Final[str] = "autolab.verification._forkserver_init"
+_NAME: Final[str] = "z3-worker"
+_MAIN_KEYS: Final[tuple[str, ...]] = ("init_main_from_path", "init_main_from_name")
 Reply = tuple[bool, Any]
 """(True, result) or (False, the error's text)."""
 DIED: Final[str] = "died"
@@ -63,12 +65,24 @@ def _serve(conn: Connection, target: Callable[..., Any]) -> None:
         return
 
 
-def _main_imports() -> list[str]:
-    """The main module's name when it was run with `-m`: each worker re-runs it, and
-    with its imports preloaded in the forkserver that costs no more than its body."""
-    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
-    name = getattr(spec, "name", None)
-    return [name] if isinstance(name, str) and not name.endswith("__main__") else []
+_preparation_data = spawn.get_preparation_data
+
+
+def _without_main(name: str) -> dict[str, Any]:
+    """What a new process prepares from; a worker's leaves out the main module.
+
+    Multiprocessing re-runs the parent's main in every child as `__mp_main__`; the
+    forkserver never preloads a path-run main on CPython 3.11, so each boot paid its
+    imports again, and an unguarded main ran its body once per worker.
+    """
+    data: dict[str, Any] = _preparation_data(name)
+    if name == _NAME:
+        for key in _MAIN_KEYS:
+            data.pop(key, None)
+    return data
+
+
+spawn.get_preparation_data = _without_main
 
 
 class Worker:
@@ -77,7 +91,7 @@ class Worker:
     def __init__(self, ctx: BaseContext, target: Callable[..., Any]) -> None:
         self.conn, child = ctx.Pipe()
         self.process = ctx.Process(  # type: ignore[attr-defined]
-            target=_serve, args=(child, target), name="z3-worker", daemon=True
+            target=_serve, args=(child, target), name=_NAME, daemon=True
         )
         self.process.start()
         child.close()
@@ -164,7 +178,7 @@ class Workers:
                 ctx: BaseContext
                 if "forkserver" in multiprocessing.get_all_start_methods():
                     ctx = multiprocessing.get_context("forkserver")
-                    ctx.set_forkserver_preload([_FORKSERVER_INIT, *self._preload, *_main_imports()])
+                    ctx.set_forkserver_preload(self._preload)
                 else:  # pragma: no cover - platforms without a forkserver
                     ctx = multiprocessing.get_context("spawn")
                 self._ctx = ctx

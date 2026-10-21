@@ -82,7 +82,6 @@ def test_a_guarded_script_checks_once_and_gets_valid(tmp_path: Path) -> None:
     assert out.startswith("VALID")
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-25 #1")
 def test_an_unguarded_script_is_not_rerun_in_the_workers(tmp_path: Path) -> None:
     body, out = _run_script(tmp_path, guarded=False)
 

@@ -330,9 +330,27 @@ async def test_default_executor_is_lazy_and_replaceable() -> None:
     assert (await Verifier(fake).verify(trace)).consistency_score == 1.0
 
 
-@pytest.mark.perf
-async def test_judges_overlap_but_formalization_stays_ordered() -> None:
-    delay_s = 0.1
+def test_a_verifier_starts_the_default_workers_when_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AUDIT-26 #3: start-up overlaps the formalization instead of the first check.
+    shutdown_default_executor()
+    asked: list[int] = []
+    done = threading.Event()
+
+    def prestart(_: solver_workers.Workers, n: int) -> None:
+        asked.append(n)
+        done.set()
+
+    monkeypatch.setattr(solver_workers.Workers, "prestart", prestart)
+    Verifier(FakeLLMClient())
+    assert done.wait(_WAIT_S)
+    assert solver_mod._default_executor is not None
+    assert asked == [solver_mod.SOLVER_WORKERS + solver_mod.SOLVER_SLOW_WORKERS]
+
+
+async def _judged_verify(delay_s: float) -> tuple[float, list[str], int]:
+    """(wall s, formalize order, LLM calls) of a 6-step verify with `delay_s` per call."""
     trace, fake = build(chain(6, cite=True))
     order: list[str] = []
 
@@ -349,8 +367,20 @@ async def test_judges_overlap_but_formalization_stays_ordered() -> None:
     result = await Verifier(llm, check_faithfulness=True).verify(trace)
     wall = time.perf_counter() - started
     assert result.consistency_score == 1.0
+    return wall, order, llm.calls
+
+
+@pytest.mark.perf
+async def test_judges_overlap_but_formalization_stays_ordered() -> None:
+    # AUDIT-28 #3: calibrated on the same run with no latency, not on absolute seconds.
+    await _judged_verify(0.0)  # starts the worker processes
+    base = min([(await _judged_verify(0.0))[0] for _ in range(2)])
+    delay_s = max(0.1, 2 * base)
+    wall, order, calls = await _judged_verify(delay_s)
     assert order == [str(i) for i in range(6)]
-    assert wall < (6 + 2) * delay_s
+    overlapped = 6 + 1  # formalize in turn, the last judge after them
+    assert calls > overlapped + 2  # so the bound below tells overlap from none
+    assert wall - base < (overlapped + calls) / 2 * delay_s, (wall, base, delay_s, calls)
 
 
 @pytest.mark.perf
