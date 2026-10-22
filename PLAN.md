@@ -50,7 +50,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 | SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
-| SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
+| SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (PR pending); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -465,6 +465,11 @@ Round 9 (AUDIT-33..36, fresh agents, base `10ae977`) found 0 critical and 1 high
 - **SG35 Stopped newcomers keep their place; fork exit safety.** A newcomer stopped on a lent place to let a short caller in is re-queued at the hard rank with a new arrival number, so it goes to the back of the hard queue: a 150 ms check waited 18.7–20.5 s at the default timeout, against 5.4–8.5 s before SG34; the stop rule also counts worker boot time (AUDIT-34 #1, high). A stopped check must keep its arrival order and rank ahead of hard runs that arrived after it, and boot time must not count toward a stop. Keep Z3 checks within slots plus slow places so lent places do not oversubscribe the CPUs (AUDIT-34 #2). Restore the strength of the two retuned SG34 tests (AUDIT-34 #3, AUDIT-36 #9). Also: a forked child that exits normally SIGTERMs the parent's workers through multiprocessing's `_children`; the child must drop them (AUDIT-35 #1, AUDIT-36 #1, medium, found by two auditors), with a fork test that exits via `sys.exit`. **Flip:** AUDIT-34 #1 ×2, #2, #3, AUDIT-35 #1, AUDIT-36 #1. **Verify:** `make lint typecheck test` · `make test` green 5 times under load · error injection (34/34, 26/26) · bench.
 
 Medium and low round-9 findings not folded in above stay in the AUDIT files, among them fork during a worker start (AUDIT-33 #1, #2), unpinned at-fork lock resets and stop rules (AUDIT-36 #2, #6), `run` calling `fn` twice (AUDIT-35 #2) and the doubled xfail count from a leaked event loop (AUDIT-36 #8). AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1 (medium) are still open.
+### Audit round 10: no critical or high findings
+
+Round 10 (AUDIT-37..40, fresh agents, base `1e537af`) found 0 critical and 0 high findings, so the audit loop ends here. Soundness held: no stopped, kept or forked check returned a wrong verdict in stress runs. SG35 fixed AUDIT-34 #1 (a stopped 150 ms check waits 3.4–8.4 s, the pre-SG34 spread) and the fork-exit kill; all five flipped repros fail on `6c16dce`. Coverage on `verification/` is 97.7%.
+
+Open for the owner: AUDIT-34 #2 / AUDIT-38 #2 (lent places run 5.1–5.6 Z3 checks on 4 CPUs). SG35 found no CPU bound that keeps AUDIT-30 #1 and SG30's aging; AUDIT-38 prototyped pausing the lender's worker (SIGSTOP), which kept both at a mean of 3.9–4.0 but spends paused checks' wall-clock budget. Other medium findings stay in the AUDIT files: a newcomer that gave way waits the pre-SG34 time (AUDIT-38 #1), untested waiting-slot rule (AUDIT-40 #2), two load-sensitive tests (AUDIT-40 #5, #6), fork during a worker start (AUDIT-33 #1, #2, AUDIT-37 #1, AUDIT-38 #3, AUDIT-39 #2), AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -483,9 +488,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-25..28 | Round 7, on SG28–SG30 |
 | AUDIT-29..32 | Round 8, on SG31–SG33 |
 | AUDIT-33..36 | Round 9, on SG34 |
+| AUDIT-37..40 | Round 10, on SG35 |
 
 ## Log
 
+- 2026-10-22: audit round 10 done (0 critical, 0 high); the audit loop ends. Soundness held; CPU oversubscription from lent places (AUDIT-34 #2) waits on the owner.
 - 2026-10-22: audit round 9 done (0 critical, 1 high); SG35 added. Soundness held; the high is a stopped newcomer going to the back of the hard queue.
 - 2026-10-21: audit round 8 done (0 critical, 1 high); SG34 added. Soundness held; the high is newcomers queueing behind runs that started together.
 - 2026-10-21: audit round 7 done (0 critical, 3 high); SG31–SG33 added. No wrong trace admitted; the highs are a stale-reply guard, newcomer queueing and total probe work.
