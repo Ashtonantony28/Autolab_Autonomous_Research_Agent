@@ -237,31 +237,30 @@ class Z3Solver:
         if interrupt.requested():
             return _INTERRUPTED
         pool = _workers()
-        setup = time.perf_counter()
+        # Starting, booting and replacing workers is not the check's own time: not for
+        # `solver_ms`, hardness or a stop (AUDIT-34 #1).
+        interrupt.pause()
         worker = pool.acquire()
         if not interrupt.attach(worker):
             pool.release(worker)
+            interrupt.resume()
             return _INTERRUPTED
         try:
             booted = worker.ready()
-            checking = time.perf_counter()
+            interrupt.resume()
             reply = worker.call(args, args[-1] + _grace_s(args[-1])) if booted else None
         except BaseException:  # e.g. a per-test timeout's signal: the worker is mid-check
+            interrupt.pause()
             interrupt.detach()
             pool.discard(worker)
             raise
-        checked = time.perf_counter()
+        interrupt.pause()
         interrupt.detach()
         if reply is None or interrupt.requested():
             pool.discard(worker)
         else:
             pool.release(worker)
-        # Starting, booting and replacing workers is not the check's own time (`solver_ms`).
-        _worker.overhead_s = (
-            getattr(_worker, "overhead_s", 0.0)
-            + (checking - setup)
-            + (time.perf_counter() - checked)
-        )
+        interrupt.resume()
         if reply is None:
             if interrupt.requested():
                 return _INTERRUPTED
@@ -468,7 +467,8 @@ class _Interrupt:
     """Lets the event loop stop the check running on one pool thread.
 
     The attached target is the check's worker; `request` kills it, so the check
-    stops wherever it is. The pool thread records when the call started and ended.
+    stops wherever it is. The pool thread records when the call started and ended,
+    and the check how long it waited for its worker.
     """
 
     def __init__(self) -> None:
@@ -477,12 +477,31 @@ class _Interrupt:
         self._requested = False
         self.started: float | None = None
         self.ended: float | None = None
+        self._paused: float | None = None
+        self._overhead_s = 0.0
 
     def ran_s(self) -> float:
-        """How long the call has run, or ran; 0 before it starts."""
+        """How long the call has run, or ran, less its waits for a worker; 0 before it starts."""
         if self.started is None:
             return 0.0
-        return (_clock() if self.ended is None else self.ended) - self.started
+        now = _clock() if self.ended is None else self.ended
+        paused = 0.0 if self._paused is None else now - self._paused
+        return now - self.started - self._overhead_s - paused
+
+    def pause(self) -> None:
+        """Stop counting run time while the check starts, boots or replaces its worker."""
+        if self._paused is None:
+            self._paused = _clock()
+
+    def resume(self) -> None:
+        """Count run time again."""
+        if self._paused is not None:
+            self._overhead_s += _clock() - self._paused
+            self._paused = None
+
+    def paused(self) -> bool:
+        """Whether the check waits for a worker."""
+        return self._paused is not None
 
     def attached(self) -> bool:
         """Whether a target is attached, that is, a check is in progress."""
@@ -492,14 +511,16 @@ class _Interrupt:
         """Whether an interrupt has been requested."""
         return self._requested
 
-    def request(self) -> None:
-        """Stop the attached target, or refuse the next attach."""
+    def request(self) -> bool:
+        """Stop the attached target, or refuse the next attach; True if a target was stopped."""
         with self._lock:
             if self._requested:
-                return
+                return False
             self._requested = True
-            if self._target is not None:
-                self._target.interrupt()
+            if self._target is None:
+                return False
+            self._target.interrupt()
+            return True
 
     def attach(self, target: _Stoppable) -> bool:
         """Attach `target`; False, attaching nothing, if an interrupt was already requested."""
@@ -614,19 +635,25 @@ class _Pool:
 
 
 class _Waiter:
-    __slots__ = ("arrival", "future", "lent_past", "new", "passed", "short")
+    __slots__ = ("arrival", "future", "lend", "lent_past", "new", "passed", "short")
 
-    def __init__(self, future: asyncio.Future[bool], short: bool, new: bool, arrival: int) -> None:
+    def __init__(
+        self, future: asyncio.Future[bool], short: bool, new: bool, arrival: int, lend: bool
+    ) -> None:
         self.future = future
         self.short = short
         self.new = new
         self.arrival = arrival
+        self.lend = lend
         self.passed = 0
         self.lent_past = 0
 
+    def lendable(self) -> bool:
+        return self.short or (self.new and self.lend)
+
 
 class _Slots:
-    """Admission for one event loop: `workers` slots, granted in FIFO order, callers
+    """Admission for one event loop: `workers` slots, granted in arrival order, callers
     whose last check was short, or who have none yet, first.
 
     A caller that later arrivals have overtaken for `workers` slots is served next,
@@ -646,15 +673,28 @@ class _Slots:
         self._waiters: deque[_Waiter] = deque()
         self._arrivals = itertools.count()
 
-    async def acquire(self, short: bool, new: bool = False) -> bool:
+    def arrive(self) -> int:
+        """A caller's arrival number, kept when its check is stopped and queued again."""
+        return next(self._arrivals)
+
+    async def acquire(
+        self, short: bool, new: bool = False, arrival: int | None = None, lend: bool = True
+    ) -> bool:
         """Wait for a place; True if a stuck slot lent it. A `new` caller (no check yet)
-        may be lent one; its caller stops the check once it shows it is hard."""
-        lent = self._grant(short or new)
+        may be lent one unless `lend` is False; its caller stops the check once it shows
+        it is hard, or after a slice while a short caller waits. `arrival` (from `arrive`)
+        keeps a stopped caller's place in the queue."""
+        lent = self._grant(short, new and lend)
         if lent is not None:
             return lent
         loop = asyncio.get_running_loop()
-        entry = _Waiter(loop.create_future(), short, new, next(self._arrivals))
-        self._waiters.append(entry)
+        entry = _Waiter(
+            loop.create_future(), short, new, self.arrive() if arrival is None else arrival, lend
+        )
+        index = len(self._waiters)
+        while index and self._waiters[index - 1].arrival > entry.arrival:
+            index -= 1
+        self._waiters.insert(index, entry)
         try:
             return await entry.future
         except asyncio.CancelledError:
@@ -686,11 +726,11 @@ class _Slots:
         """Whether a caller whose last check was short waits."""
         return any(w.short and not w.future.done() for w in self._waiters)
 
-    def _grant(self, short: bool) -> bool | None:
+    def _grant(self, short: bool, new: bool = False) -> bool | None:
         if self.held < self.workers:
             self.held += 1
             return False
-        if short and self.lent < self.stuck:
+        if (short or new) and self.lent < self.stuck:
             self.lent += 1
             return True
         return None
@@ -713,7 +753,7 @@ class _Slots:
             for entry in order:
                 if entry.future.done():  # cancelled; its caller removes it
                     continue
-                lent = self._grant(entry.short or entry.new)
+                lent = self._grant(entry.short, entry.new and entry.lend)
                 if lent is not None:
                     break
             else:
@@ -724,7 +764,7 @@ class _Slots:
             for ahead in itertools.islice(self._waiters, index):
                 if not lent:
                     ahead.passed += 1
-                elif ahead.short or ahead.new:  # a lent place it could have taken
+                elif ahead.lendable():  # a lent place it could have taken
                     ahead.lent_past += 1
 
 
@@ -767,7 +807,10 @@ class SolverExecutor:
         self._hard: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
 
     async def run(self, fn: Callable[[], T]) -> tuple[T, float]:
-        """Run `fn` on the pool; return its result and its run time in ms, queueing excluded."""
+        """Run `fn` on the pool; return its result and its run time in ms, queueing excluded.
+
+        `fn` must be pure: a newcomer's call stopped on a lent place is made again.
+        """
         if self._pid != os.getpid():
             self._adopt()
         slots = self._slot()
@@ -776,8 +819,9 @@ class SolverExecutor:
             short = task in self._short
             # A task with no check yet has not shown it is hard (AUDIT-26 #1).
             new = not short and task not in self._hard
+        arrival, lend = slots.arrive(), True
         while True:
-            lent = await slots.acquire(short, new)
+            lent = await slots.acquire(short, new, arrival, lend)
             slow = stuck = stopped = False
             interrupt = _Interrupt()
             try:
@@ -793,12 +837,14 @@ class SolverExecutor:
                                 slots.unstick()
                             slots.release(lent)
                         elif lent and new and self._yields(interrupt, slots):
-                            # A newcomer's check on a lent place (AUDIT-30 #1).
-                            stopped = True
-                            interrupt.request()
+                            # A newcomer's check on a lent place (AUDIT-30 #1); kept if
+                            # it had already ended.
+                            stopped = interrupt.request()
                             break
                         elif not (stuck or lent) and interrupt.attached():
-                            stuck = slots.stick(lent)
+                            # Not while it waits for its worker: it would lend a CPU that
+                            # its own check takes once the worker is up.
+                            stuck = not interrupt.paused() and slots.stick(lent)
                     result = await future
                     if not stopped or self._closed:
                         return result
@@ -826,7 +872,9 @@ class SolverExecutor:
                         else:
                             self._short.add(task)
                             self._hard.discard(task)
-            short = new = False  # stopped: queued again for a slot only
+            # Stopped: queued again in its arrival order, for a slot only, and as hard only
+            # if it has shown it is (AUDIT-34 #1).
+            short, new, lend = False, not hard, False
 
     @staticmethod
     def _yields(interrupt: _Interrupt, slots: _Slots) -> bool:
@@ -880,17 +928,15 @@ class SolverExecutor:
             if self._closed:
                 interrupt.request()
         _worker.interrupt = interrupt
-        _worker.overhead_s = 0.0
-        interrupt.started = started = _clock()
+        interrupt.started = _clock()
         try:
             result = fn()
         finally:
-            # Worker start-up is not the check's own time, for `solver_ms` or hardness.
-            interrupt.ended = ended = _clock() - _worker.overhead_s
+            interrupt.ended = _clock()
             _worker.interrupt = None
             with self._lock:
                 self._running.discard(interrupt)
-        return result, (ended - started) * _MS_PER_S
+        return result, interrupt.ran_s() * _MS_PER_S
 
 
 _default_executor: SolverExecutor | None = None

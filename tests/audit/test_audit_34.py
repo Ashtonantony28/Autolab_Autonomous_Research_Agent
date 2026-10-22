@@ -112,7 +112,6 @@ async def _until(condition: Callable[[], bool]) -> None:
 # --- #1: a newcomer that gives way goes to the back of the hard queue ----------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-34 #1")
 async def test_a_newcomer_that_gives_way_to_a_short_caller_is_served_before_hard_runs(
     executors: list[SolverExecutor], clock: _FakeClock
 ) -> None:
@@ -158,7 +157,6 @@ async def test_a_newcomer_that_gives_way_to_a_short_caller_is_served_before_hard
     assert order[:3] == ["new", "short", "new"], order  # today: new, short, h1, h2, new
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-34 #1")
 async def test_a_newcomer_is_not_stopped_while_its_worker_starts(
     executors: list[SolverExecutor], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -212,7 +212,12 @@ def test_a_worker_killed_after_its_reply_is_replaced_under_w04(
 # (it is killed), stopping the worker 100 s.
 # --------------------------------------------------------------------------
 
-_W09: Final = ("        + (time.perf_counter() - checked)\n", "")
+# SG35 counts this time with `_Interrupt.pause`; W09 and W10 drop a pause.
+_W09: Final = (
+    "    interrupt.pause()\n    interrupt.detach()\n    if reply",
+    "    interrupt.detach()\n    if reply",
+)
+_W10: Final = ("    interrupt.pause()\n    worker = pool.acquire()", "    worker = pool.acquire()")
 
 
 class _Clock:
@@ -265,7 +270,7 @@ def test_solver_ms_excludes_starting_and_replacing_a_killed_worker(
 def test_solver_ms_excludes_starting_a_worker_under_w10(
     monkeypatch: pytest.MonkeyPatch, pool: solver_workers.Workers
 ) -> None:
-    _mutant(monkeypatch, Z3Solver, "check_entailment", "        + (checking - setup)\n", "")
+    _mutant(monkeypatch, Z3Solver, "check_entailment", *_W10)
     assert _ms_of_a_killed_check(monkeypatch, pool) == pytest.approx(1000.0)
 
 
