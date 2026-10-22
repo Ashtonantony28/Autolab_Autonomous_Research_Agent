@@ -275,7 +275,7 @@ def test_the_child_verifies_and_a_joined_worker_reads_its_signal(
 
 
 @fork_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-33 #3")
 def test_a_forked_child_leaves_the_owners_exit_statuses_alone(steal_run: dict[str, Any]) -> None:
-    # Today: 255; the child's first worker start read the owner's status message.
+    # Was 255: the child's first worker start read the owner's status message. SG35's
+    # child drops the owner's workers from multiprocessing's children, so it never polls them.
     assert steal_run["victim"] == -9, steal_run
