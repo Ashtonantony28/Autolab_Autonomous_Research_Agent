@@ -494,6 +494,88 @@ async def test_shutting_down_the_default_executor_stops_idle_workers() -> None:
     assert solver_mod._workers().live() == 0
 
 
+# --- a process forked after the pool started (AUDIT-29 #1, AUDIT-30 #2) ------------------
+
+_FORKING: Final = """
+import asyncio, json, os, time
+from multiprocessing import forkserver
+from autolab.verification import solver as solver_mod
+from autolab.verification.solver import SmtFormula, Z3Solver, default_executor
+
+D = "(declare-const p Bool)"
+
+def check():
+    async def main():
+        out, _ = await default_executor().run(
+            lambda: Z3Solver().check_entailment([SmtFormula(D, "p")], SmtFormula(D, "p"))
+        )
+        return out.verdict
+    return asyncio.run(main())
+
+def state():
+    return {"workers": sorted(w.process.pid for w in solver_mod._workers()._live),
+            "server": forkserver._forkserver._forkserver_pid}
+
+if __name__ == "__main__":
+    first = check()
+    pool = solver_mod._workers()
+    pool.prestart(2)
+    parent = state()
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            got = {"verdicts": [check() for _ in range(3)], **state()}
+            solver_mod.shutdown_default_executor()  # stops this process's workers only
+        except BaseException as exc:
+            got = {"error": repr(exc)}
+        os.write(write, json.dumps(got).encode())
+        os._exit(0)
+    os.close(write)
+    os.waitpid(pid, 0)
+    with os.fdopen(read) as f:
+        child = json.loads(f.read())
+    alive = all(w.alive() for w in pool._idle)
+    print(json.dumps({"first": first, "parent": parent, "child": child, "alive": alive,
+                      "after": check()}))
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork")
+def test_a_forked_child_starts_its_own_workers_and_leaves_the_parents_alone() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-c", _FORKING],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    child, parent = got["child"], got["parent"]
+    assert child.get("verdicts") == ["VALID"] * 3, child
+    assert child["workers"] and not set(child["workers"]) & set(parent["workers"])
+    assert child["server"] not in (None, parent["server"])
+    assert got["alive"] and got["first"] == got["after"] == "VALID"
+
+
+def test_a_pool_used_in_another_process_adopts_none_of_the_owners_workers(
+    pool: solver_workers.Workers, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool.prestart(2)
+    owned = list(pool._idle)
+    killed: list[solver_workers.Worker] = []
+    monkeypatch.setattr(solver_workers.Worker, "stop", killed.append)
+    monkeypatch.setattr(os, "getpid", lambda: -1)  # as in a forked child
+    pool.close()
+    assert (pool._idle, pool.live(), pool._ctx, killed) == ([], 0, None, [])
+    assert all(w.conn.closed for w in owned)  # this process's copies of the pipes only
+    monkeypatch.undo()
+    for worker in owned:
+        worker.process.kill()
+        worker.process.join()
+
+
 # --- sizing from the cgroup CPU quota (AUDIT-22 #6) -------------------------------------
 
 

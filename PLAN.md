@@ -49,7 +49,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (PR pending) |
 | SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | open |
+| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 

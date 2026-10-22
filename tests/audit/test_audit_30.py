@@ -22,7 +22,6 @@ from scripts.audit_load_8 import (
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-30 #1")
 async def test_a_newcomer_does_not_queue_behind_hard_runs_that_started_together() -> None:
     # The AUDIT-26 #1 load as round 7 wrote it: 2 slots + 2 slow places, 12 hard runs
     # started together, and an easy check in a new task 0.1 s later. Its wait should be
@@ -32,7 +31,6 @@ async def test_a_newcomer_does_not_queue_behind_hard_runs_that_started_together(
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-30 #1")
 async def test_a_newcomer_beside_runs_that_check_in_fresh_tasks_waits_one_hard_check() -> None:
     # Steady state, no start-up: 12 hard runs whose every check is made in a fresh task,
     # as each agent's verify is (LangGraph runs a node in a task of its own).
@@ -41,7 +39,6 @@ async def test_a_newcomer_beside_runs_that_check_in_fresh_tasks_waits_one_hard_c
     assert waited <= 1.5 * unit, f"waited {waited:.2f} s = {waited / unit:.1f} hard checks"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-30 #2")
 def test_a_process_forked_after_a_verifier_is_built_can_still_check() -> None:
     # A prefork server (or multiprocessing's default fork on Linux) after `build_graph()`.
     outcomes = checks_in_forked_child(4)

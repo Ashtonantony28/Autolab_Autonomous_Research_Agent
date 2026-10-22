@@ -94,7 +94,7 @@ async def test_default_pool_stays_responsive_under_fifty_slow_checks(
 async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     executor.slow_workers = 0  # every check holds the only slot, so the others queue
-    # Fresh callers with no short check behind them, so no stuck slot lends them a place.
+    # Fresh callers: the stuck slot lends one of them a place, so at most two run at once.
     hard = partial(
         Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
@@ -102,7 +102,7 @@ async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> No
     results = await asyncio.gather(*(executor.run(hard) for _ in range(4)))
     wall_ms = (time.perf_counter() - started) * 1000
     slow = [ms for _, ms in results]
-    assert wall_ms >= 4 * _SLOW_S * 1000  # one worker: the checks queued
+    assert wall_ms >= 2 * _SLOW_S * 1000  # one worker and one lent place: the checks queued
     assert all(_SLOW_S * 1000 * 0.9 <= ms < (_SLOW_S + _SLACK_S) * 1000 for ms in slow)
 
 
@@ -261,12 +261,13 @@ async def test_hard_runs_do_not_starve_an_easy_verify_on_one_worker() -> None:
 async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     executor = SolverExecutor(1, slow_workers=1)
     lock = threading.Lock()
-    running, peak = 0, 0
+    running, peak, calls = 0, 0, 0
 
     def hard() -> solver_mod.SolverOutcome:
-        nonlocal running, peak
+        nonlocal running, peak, calls
         with lock:
             running += 1
+            calls += 1
             peak = max(peak, running)
         try:
             return Z3Solver(0.3).check_entailment(
@@ -282,9 +283,11 @@ async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     finally:
         executor.shutdown()
     assert [o.reason for o, _ in outs] == ["timeout"] * 3
-    # One check in the slot and one slow check; the third waits for a slow one to end.
-    assert peak == 2
-    assert threads <= 2
+    # One check in the slot and one slow check. The third, a newcomer, is lent a place
+    # by the stuck slot until its check shows it is hard, then waits as a hard caller.
+    assert peak <= 3
+    assert calls in (3, 4)  # 4 if the lent check was stopped and run again
+    assert threads <= 3  # slot, slow check and lent place
     assert executor._slow == 0
 
 
