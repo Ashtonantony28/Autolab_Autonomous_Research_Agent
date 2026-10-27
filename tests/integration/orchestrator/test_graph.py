@@ -222,7 +222,7 @@ async def test_unbound_conclusion_is_retried_not_escalated() -> None:
     )
     feedback = (
         f"trace does not conclude payload claim {HYPOTHESIS.statement!r}; "
-        "0 valid, 0 invalid, 2 ungrounded across 2 steps"
+        "0 valid, 0 invalid, 3 ungrounded across 3 steps"
     )
     fake.register(
         "research.hypothesis",

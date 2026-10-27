@@ -2,12 +2,63 @@
 
 The actual `streamlit` import is lazy (inside `render`) so this module can
 be imported in tests without requiring the dashboard extra.
+
+`scripts/dashboard.py` (`make dashboard`) renders a persisted run: `load_run`
+rebuilds it from the `StateStore` and `render_run` draws it.
 """
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
+from uuid import UUID
+
+from autolab.monitoring.events import TraceEvent
 from autolab.state.models import ReasoningTrace, VerificationResult
 from autolab.state.schema import AutoLabState
+from autolab.state.store import StateStore
+
+EVENT_COLUMNS = ["node", "attempt", "latency_ms", "score", "decision", "trigger", "reason"]
+
+
+@dataclass(frozen=True)
+class RunView:
+    """A persisted run: its entities as an `AutoLabState` plus its trace events."""
+
+    run_id: UUID
+    state: AutoLabState
+    events: list[TraceEvent]
+
+
+async def load_run(store: StateStore, run_id: UUID) -> RunView:
+    """Rebuild a run from the store (what the dashboard shows)."""
+    state = AutoLabState(
+        research_question=dict(await store.list_runs()).get(run_id, ""),
+        hypotheses=await store.load_hypotheses(run_id),
+        reasoning_traces=await store.load_traces(run_id),
+        verification_history=await store.load_verifications(run_id),
+        analysis_reports=await store.load_reports(run_id),
+    )
+    return RunView(run_id=run_id, state=state, events=await store.load_events(run_id))
+
+
+def render_event_table(events: list[TraceEvent]) -> list[list[str]]:
+    """Return a header + one row per agent execution, in order."""
+    rows = [list(EVENT_COLUMNS)]
+    for e in events:
+        score = "-" if e.consistency_score is None else f"{e.consistency_score:.2f}"
+        rows.append(
+            [
+                e.node,
+                str(e.attempt),
+                f"{e.latency_ms:.1f}",
+                score,
+                e.decision,
+                e.trigger or "",
+                e.hitl_reason or "",
+            ]
+        )
+    return rows
 
 
 def render_trace_table(state: AutoLabState) -> list[list[str]]:
@@ -62,6 +113,52 @@ def render(state: AutoLabState) -> None:  # pragma: no cover - streamlit-depende
     st.table(rows)
 
 
+def render_run(view: RunView) -> None:  # pragma: no cover - streamlit-dependent
+    """Render one persisted run: decisions, hypotheses, reports and verified traces."""
+    import streamlit as st
+
+    st.title("AutoLab — Run audit")
+    st.write(f"**Run:** `{view.run_id}`")
+    st.write(f"**Research question:** {view.state.get('research_question') or '<unknown>'}")
+    st.subheader("Agent decisions")
+    st.table(render_event_table(view.events))
+    st.subheader("Hypotheses")
+    for h in view.state.get("hypotheses", []):
+        st.write(f"- {h.statement} (confidence={h.confidence:.2f})")
+    st.subheader("Analysis")
+    for report in view.state.get("analysis_reports", []):
+        st.write(report.summary)
+    st.subheader("Reasoning traces")
+    st.table(render_trace_table(view.state))
+
+
+def main(database_url: str) -> None:  # pragma: no cover - streamlit-dependent
+    """Streamlit page: pick a persisted run (newest first) and render it."""
+    import streamlit as st
+
+    async def runs() -> list[tuple[UUID, str]]:
+        store = await StateStore.create(database_url)
+        try:
+            return await store.list_runs()
+        finally:
+            await store.dispose()
+
+    async def load(run_id: UUID) -> RunView:
+        store = await StateStore.create(database_url)
+        try:
+            return await load_run(store, run_id)
+        finally:
+            await store.dispose()
+
+    available = asyncio.run(runs())
+    if not available:
+        st.info(f"No runs recorded in {database_url}.")
+        return
+    labels = {f"{q} ({rid})": rid for rid, q in available}
+    choice = st.selectbox("Run", list(labels))
+    render_run(asyncio.run(load(labels[choice])))
+
+
 def trace_count(state: AutoLabState) -> int:
     """Convenience: number of reasoning traces recorded so far."""
     return len(state.get("reasoning_traces") or [])
@@ -76,7 +173,13 @@ def trace_label(trace: ReasoningTrace) -> str:
 
 
 __all__ = [
+    "EVENT_COLUMNS",
+    "RunView",
+    "load_run",
+    "main",
     "render",
+    "render_event_table",
+    "render_run",
     "render_trace_table",
     "trace_count",
     "trace_label",

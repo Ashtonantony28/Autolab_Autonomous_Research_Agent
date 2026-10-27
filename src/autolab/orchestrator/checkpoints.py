@@ -101,9 +101,10 @@ def cost_trigger(max_cost_usd: float, max_duration_min: float) -> HITLTrigger[Ex
 def contradiction_trace(prior: Sequence[Hypothesis], new: Hypothesis) -> ReasoningTrace:
     """Premises: every prior statement and the new one; then the new one, citing them all.
 
-    The verifier checks the cited premises for consistency before entailment,
-    so the last step is INVALID/`premises_inconsistent` exactly when the
-    formalized statements are jointly unsatisfiable.
+    The verifier checks each premise against the earlier ones, so some step is
+    INVALID/`premises_inconsistent` exactly when the formalized statements are
+    jointly unsatisfiable. The trigger fails closed on any other non-VALID
+    premise; the final step's own verdict is not a contradiction signal.
     """
     statements = [h.statement for h in prior] + [new.statement]
     steps = [
@@ -128,8 +129,13 @@ def contradiction_trigger(verifier: Verifier) -> HITLTrigger[Hypothesis]:
         if not prior:
             return None
         result = await verifier.verify(contradiction_trace(prior, hypothesis))
-        if result.step_verdicts[-1].reason == "premises_inconsistent":
+        if any(v.reason == "premises_inconsistent" for v in result.step_verdicts):
             return f"hypothesis contradicts {len(prior)} prior hypothesis(es) in state"
+        # Fail closed (AUDIT-1 #6): a statement that did not formalize, or whose check
+        # timed out, leaves the contradiction undecided.
+        for v in result.step_verdicts[:-1]:
+            if v.verdict != "VALID":
+                return f"could not rule out a contradiction: step {v.step_index} is {v.reason}"
         return None
 
     return check

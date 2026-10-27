@@ -21,7 +21,11 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | done (PR pending) |
 | SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | done (PR pending) |
 | SG5 | Live LLM path | SG1–SG4 | `verification/llm.py` (Claude adapter), `tests/live/` | built, live run pending API key |
-| SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | todo |
+| SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | done (PR pending) |
+| SG7 | Soundness round 2 (AUDIT-1 #1–#4, AUDIT-3 #1) | audit round 1 | `verification/*` (except solver executor), `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/*` | done (PR pending) |
+| SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | todo |
+| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | todo |
+| SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | todo |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -123,7 +127,55 @@ This sub-goal starts only after SG1–SG4 are done.
 **Acceptance:** a test interrupts a run at HITL, rebuilds the graph in a fresh process-equivalent, and resumes to the end. Metrics snapshots match the agent count.
 **Verify:** `uv run pytest tests/integration/monitoring tests/integration/test_resume.py -q`
 
+**Result (2026-10-19):** files changed: `monitoring/events.py` (new `TraceEvent`), `monitoring/tracer.py`, `metrics.py`, `dashboard.py`, `state/store.py`, `state/checkpointer.py`, `orchestrator/graph.py` (node wrapper and `checkpointer`/`tracer`/`metrics` parameters only), `cli.py`, `scripts/dashboard.py` (new), `Makefile` (`make dashboard`), `pyproject.toml` + `uv.lock` (`langgraph-checkpoint-sqlite>=3.0`, which also bumped `langgraph-checkpoint` 4.1.0 → 4.3.0), and the tests. Tests added: 29 (7 in `tests/integration/test_resume.py`, 11 in `tests/integration/monitoring/test_graph_observability.py`, 6 CLI tests in `tests/integration/test_cli_resume.py`, 4 store tests, 1 metrics test; the strict-msgpack resume case is a parametrization). Verify: monitoring + resume tests 21 passed; lint and mypy clean; full suite 326 passed; `autolab.verification` coverage 98.6%; `store.py`, `graph.py`, `dashboard.py`, `events.py`, `metrics.py` 100%; benchmark unchanged (all three scenarios pause once and complete after `approve`). As built: `build_graph(tracer=, metrics=)` wraps every agent node (outside `escalate_permanent_errors`, so errors are observed too) in `_observed`, which times the node and derives the decision by calling the pure monitor node on the would-be state: `pass` (next agent), `retry` (same agent) or `escalate` (`hitl`). `Metrics.observe_agent` gains `retried` and the snapshot a `retries` count; invocations count every execution including retries, so their sum equals the number of reasoning traces. With a tracer, each execution writes one `TraceEvent` (`run_id` = the thread id, which must then be a UUID; `node`, `attempt` = `retry_count + 1`, `started_at`, `latency_ms`, `trace_id`, `consistency_score`, `verdict_summary`, `decision`, `trigger`, `hitl_reason`) plus any new entities (now including `AnalysisReport`) to the `StateStore`. `StateStore.append` upserts by id (`VerificationResult` by `trace_id`), so a resumed run in a new process re-records nothing twice; the store also gains `ensure_run`, `list_runs`, `load_reports`, `load_events` (all loads ordered by timestamp). `state.checkpointer.sqlite_saver(path)` opens an `AsyncSqliteSaver` whose serializer allowlists `CHECKPOINT_TYPES`; a test under `LANGGRAPH_STRICT_MSGPACK` fails without it. `autolab run` now checkpoints to `--checkpoints` (default `autolab_checkpoints.db`), traces to `DATABASE_URL`, and on a pause prints `autolab resume <thread_id> approve|retry|abort [--note ...]`; `autolab resume` exits 2 if the thread has no pending interrupt. `make dashboard` (`streamlit run scripts/dashboard.py [-- --db URL]`) lists persisted runs newest first and renders the decision table, hypotheses, analysis and verified trace table; a Streamlit `AppTest` renders a completed run. Open: only agent nodes emit events; the human's `HITLResolution` is not yet a trace event (it is visible only as the following agent's events). `Metrics` is in-process and the CLI does not print or export it. A run aborted at `hitl` still prints `Run ... complete.`. `Settings` has no checkpoint-path field (SG0 interface), so the path is a CLI flag with a module default. CLI tests call `main` on a worker thread because `asyncio.run` on the main thread after pytest-asyncio tests leaks a loop that `filterwarnings = error` reports in a later test. `.gitignore` does not yet ignore the default `autolab.db` / `autolab_checkpoints.db` files.
+
 ---
+
+### Audit round 1 → SG7–SG10
+
+Round 1 found 1 critical and 9 high findings (AUDIT-1..4 at the repo root; repros in `tests/audit/`, strict-xfail). Each sub-goal below is done when its listed xfails are flipped to plain passing tests and `make lint typecheck test` is green.
+
+- **SG7 Soundness round 2.**
+  - A trace must not conclude its payload claim from a premise that states the same claim; a circular premise yields UNGROUNDED (AUDIT-1 #1).
+  - `declarations` may contain only `declare-const` / `declare-fun` / `declare-sort` forms; anything else is a formalization failure (#2).
+  - The payload conclusion must be VALID for the trace to pass, whatever the score (#3).
+  - Premise steps are checked for consistency with `context.facts` and with each other (#4, medium, folded in).
+  - The INVALID cap is derived from the configured pass threshold, not the import-time constant (AUDIT-3 #1).
+  - `register_trivial_trace` and other fixtures are rebuilt so that passing traces are genuinely entailed.
+
+  **Result (2026-10-19):** Files changed: `verification/vericot.py`, `formalizer.py`, `confidence.py`, `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/agent_helpers.py`, `tests/fixtures/golden_traces.py`, ADR-0007 (amendment), AUDIT-1.md, AUDIT-3.md. Outside SG7's files there are three edits. `orchestrator/checkpoints.py` changes minimally for AUDIT-1 #6. `orchestrator/graph.py` passes `Settings` thresholds to `Verifier` (one call). `tests/audit/test_audit_2.py` raises one probe sleep from 0.05 s to 0.2 s: the starvation repro probed before the new fast premise checks had cleared the pool and XPASSed, and its assertion is unchanged.
+
+  Tests added: 51, including `tests/unit/verification/test_payload_proof.py` (17), 17 formalizer declaration and refusal cases, 10 monitor cases and 7 confidence cases. Xfails flipped: AUDIT-1 #1–#6 (12 tests) and AUDIT-3 #1 and #2 (the formalizer refusal test only).
+
+  Verify: lint and mypy clean. 511 passed, 12 skipped, 19 xfailed. `tests/audit` 25 passed, 19 xfailed. `autolab.verification` coverage 98.6%. Error injection catch rate 34/34 (100%), precision 100%, 26/26 valid admitted. Benchmark unchanged: each scenario pauses once on its policy trigger.
+
+  As built:
+  - Every step is formalized first, then checked in order. A premise is assumed only if it is consistent with the facts and the prior VALID steps, else INVALID/`premises_inconsistent`.
+  - When a bound conclusion is VALID, a tautological conclusion becomes UNGROUNDED/`formalization_failed`. A VALID premise that restates the payload claim (normalized), or entails the conclusion on its own, becomes UNGROUNDED/`no_premises`, and the trace is re-checked without it. Inconclusive checks fail closed.
+  - Declarations must be exactly one `declare-*` form per line.
+  - `blocking_reason` (any INVALID or `no_premises` step, or a final step that is not VALID) is checked before the score in `VerificationMonitor.decide` and in `BaseAgent`. Retry-first stays the default.
+  - `score_cap = min(pass, retry) - 0.01` uses the configured thresholds, and `INVALID_SCORE_CAP` is removed.
+  - `Formalizer` maps a `RuntimeError` (refusal or empty output) to `FormalizationError`.
+  - `register_trivial_trace` is premise P, premise P => C, conclusion C. The new `register_circular_trace` keeps the audit repros circular.
+
+  Open:
+  - An assumption split across two premises is still accepted. Premises are unverified assumptions.
+  - Faithfulness is still off by default for non-live clients (AUDIT-1 #5 is fixed only for tautologies).
+  - Each premise now costs one extra solver check, and a bound VALID conclusion costs 1 + #premises small checks.
+  - Under the default `retry_rework=True`, a blocked trace is retried even when its score is very low.
+- **SG8 Escalation and retries.**
+  - Refusals, empty structured output and permanent `anthropic` API errors escalate to HITL instead of crashing the graph (AUDIT-3 #2).
+  - 529 Overloaded is retried (#4).
+  - The SDK's own retries are set to 0, so `RetryingLLMClient` is the single retry layer, with jitter (#11, AUDIT-2 retry finding).
+- **SG9 Entity identity.**
+  - `id` and `created_at` are assigned in code, not by the model (AUDIT-3 #3).
+  - Store keys include `run_id`.
+  - Upserts are race-free (AUDIT-2 store findings).
+- **SG10 Bounded solver executor.**
+  - Z3 runs on a dedicated bounded executor, so it never starves `asyncio`'s default pool (AUDIT-2 #1).
+  - `solver_ms` is measured inside the worker, so queueing time is excluded.
+
+AUDIT-4 H1 (offline tests never exercise NL→SMT) is closed by SG5's live accuracy run, which waits on an `ANTHROPIC_API_KEY`. AUDIT-4 H2 is fixed by the deterministic tests it added. Medium and low findings stay in the AUDIT files for a later pass unless a sub-goal folds them in. After SG7–SG10, audit round 2 re-runs all four audits with fresh agents.
 
 ## Audits (after SG6)
 
@@ -138,5 +190,6 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 
 ## Log
 
+- 2026-10-19: audit round 1 done (1 critical, 9 high); SG7–SG10 added. SG5 live acceptance waits on an API key.
 - 2026-10-19: plan approved by Ashton; SG0 built.
 - 2026-10-19: plan drafted. Baseline numbers (140 tests, coverage by module) are quoted from `docs/status.md` and have not yet been re-run in this environment.

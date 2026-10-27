@@ -84,8 +84,9 @@ class Formalizer:
         """Formalize `step` and, on success only, extend the vocabulary.
 
         Raises:
-            FormalizationError: if the LLM output fails schema validation
-                (including an empty assertion), conflicts with the vocabulary,
+            FormalizationError: if the LLM refuses or returns no structured
+                output, if its output fails schema validation (including an
+                empty assertion), conflicts with the vocabulary,
                 or does not parse as SMT-LIB.
         """
         prompt = prompt_for(step, self.vocabulary)
@@ -93,6 +94,9 @@ class Formalizer:
             out = await self._llm.call_structured("formalize", prompt, FormalizedStep)
         except (ValidationError, json.JSONDecodeError) as exc:
             raise FormalizationError(f"LLM output is not a valid FormalizedStep: {exc}") from exc
+        except RuntimeError as exc:
+            # A refusal or empty structured output (AUDIT-3 #2): this step fails, not the run.
+            raise FormalizationError(f"LLM gave no structured output: {exc}") from exc
 
         candidate = self.vocabulary.merged(out.declarations)
         full_decls = candidate.smt()
@@ -126,16 +130,30 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
     return "\n".join(lines)
 
 
+_DECL_HEADS = frozenset({"declare-const", "declare-fun", "declare-sort"})
+
+
 def _decl_name(decl: str) -> str | None:
-    """Pull the symbol name out of a `(declare-const X T)` / `(declare-fun X (...) T)`."""
+    """Return X if `decl` is exactly one `(declare-const|declare-fun|declare-sort X ...)` form.
+
+    Anything else (a second command after the form, unbalanced parens, quoted
+    symbols, strings or comments) returns None, so no SMT command other than a
+    declaration can reach the solver through `declarations` (AUDIT-1 #2).
+    """
     body = decl.strip()
-    if not body.startswith("("):
+    if not body.startswith("(") or any(c in body for c in '|";'):
         return None
-    tokens = body.lstrip("(").split()
-    if len(tokens) < 2:
+    depth = 0
+    for i, c in enumerate(body):
+        depth += {"(": 1, ")": -1}.get(c, 0)
+        if depth == 0:
+            if i != len(body) - 1:
+                return None
+            break
+    if depth != 0:
         return None
-    head = tokens[0]
-    if head not in {"declare-const", "declare-fun", "declare-sort"}:
+    tokens = body[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+    if len(tokens) < 2 or tokens[0] not in _DECL_HEADS or tokens[1] in {"(", ")"}:
         return None
     return tokens[1]
 
