@@ -14,7 +14,7 @@ import pytest
 import z3
 from langgraph.types import Command
 
-from autolab.agents.common import with_feedback
+from autolab.agents.common import design_claim, design_facts, with_feedback
 from autolab.agents.design import DesignAgent, build_design_prompt, build_design_trace_prompt
 from autolab.agents.verification_monitor import AgentDecision, VerificationMonitor
 from autolab.orchestrator.checkpoints import (
@@ -107,7 +107,6 @@ ABSORBANCE = FormalizedStep(
 ACTIVE = "Compound K-17 is active"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_gt_hides_a_premise_that_contradicts_the_measurement() -> None:
     fake = FakeLLMClient()
     trace = _register(
@@ -143,7 +142,6 @@ async def test_shadowed_gt_hides_a_premise_that_contradicts_the_measurement() ->
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_lt_in_the_ignored_final_step_defeats_the_contradiction_trigger() -> None:
     prior = Hypothesis(question="q", statement="Yield exceeds 0.5", rationale="r")
     new = Hypothesis(question="q", statement="Yield is below 0.2", rationale="r")
@@ -174,7 +172,6 @@ async def test_shadowed_lt_in_the_ignored_final_step_defeats_the_contradiction_t
     assert reason is not None
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #1")
 async def test_shadowed_not_lets_a_restated_payload_premise_prove_itself() -> None:
     claim = "Compound K-17 cures disease D in humans"
     fake = FakeLLMClient()
@@ -219,7 +216,6 @@ async def test_shadowed_not_lets_a_restated_payload_premise_prove_itself() -> No
 # and the simulator read are never checked against it.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #2")
 async def test_design_cost_fields_that_contradict_the_verified_protocol_skip_the_pause() -> None:
     protocol = "Incubate the plate for 240 minutes using 500 USD of reagent"
     reply: dict[str, Any] = {
@@ -257,9 +253,11 @@ async def test_design_cost_fields_that_contradict_the_verified_protocol_skip_the
 
     update = await agent(state)
 
-    # Today: the trace verifies (score 1.0), the trigger reads $5 / 30 min, there is
+    # Before SG12: the trace verifies (score 1.0), the trigger reads $5 / 30 min, there is
     # no pause, and a design whose own verified protocol costs $500 over 4 h is merged.
-    assert update["confidence"] == 1.0
+    # SG12 binds the trace to `design_claim`, which this bare-protocol conclusion no
+    # longer states, so the assertion `== 1.0` became `< 1.0` (see AUDIT-5.md #2).
+    assert update["confidence"] < 1.0
     assert update["hitl_pending"] is not None
     assert "current_experiment" not in update
 
@@ -283,11 +281,11 @@ def _fail_expensive_design(fake: FakeLLMClient, feedback: str = "") -> None:
         trace_prompt=with_feedback(
             build_design_trace_prompt(tg.HYPOTHESIS, tg.EXPENSIVE), feedback
         ),
-        conclusion=tg.EXPENSIVE.protocol,
+        conclusion=design_claim(tg.EXPENSIVE),
+        facts=design_facts(tg.EXPENSIVE),
     )
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-5 #3")
 async def test_approving_a_verification_escalation_still_applies_the_cost_trigger() -> None:
     fake = FakeLLMClient()
     tg._seed_full_run(fake, tg.EXPENSIVE)
@@ -304,7 +302,7 @@ async def test_approving_a_verification_escalation_still_applies_the_cost_trigge
         Command(resume=HITLResolution(action="approve")), config=config
     )
 
-    # Today: the run completes; Execute ran a $50 design and no cost pause was raised.
+    # Before SG12: the run completes; Execute ran a $50 design and no cost pause was raised.
     assert "__interrupt__" in after
     assert tg._interrupt(after)["payload"]["trigger"] == "policy"
 

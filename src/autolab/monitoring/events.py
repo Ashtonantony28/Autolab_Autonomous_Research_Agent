@@ -1,4 +1,4 @@
-"""Structured trace event: one per agent node execution (CLAUDE.md principle 8)."""
+"""Structured trace event: one per node execution or human decision (CLAUDE.md principle 8)."""
 
 from __future__ import annotations
 
@@ -8,12 +8,17 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-NodeDecision = Literal["pass", "retry", "escalate"]
-"""Where the monitor routes the execution: next agent, the same agent, or `hitl`."""
+NodeDecision = Literal["pass", "retry", "escalate", "approve", "abort"]
+"""Where the run goes next.
+
+For an agent node: the next agent (`pass`), the same agent (`retry`) or `hitl`
+(`escalate`). For the `hitl` node: the human's `approve`, `retry` or `abort`,
+or `escalate` when an approval re-pauses on the agent's policy.
+"""
 
 
 class TraceEvent(BaseModel):
-    """What one agent execution did and how the orchestrator routed it."""
+    """What one agent execution or human decision did and how the orchestrator routed it."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -29,6 +34,10 @@ class TraceEvent(BaseModel):
     decision: NodeDecision
     trigger: str | None = None
     hitl_reason: str | None = None
+    agent: str | None = None
+    """For a `hitl` event: the agent whose request was resolved."""
+    note: str = ""
+    """For a `hitl` event: the human's note."""
 
 
 __all__ = ["NodeDecision", "TraceEvent"]

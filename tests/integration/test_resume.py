@@ -16,7 +16,7 @@ from autolab.agents.execute import build_execute_trace_prompt
 from autolab.monitoring.tracer import RunTracer
 from autolab.orchestrator.graph import build_graph
 from autolab.state.checkpointer import sqlite_saver
-from autolab.state.models import HITLResolution
+from autolab.state.models import ExperimentDesign, HITLResolution
 from autolab.state.schema import empty_state
 from autolab.state.store import StateStore
 from autolab.verification.llm import FakeLLMClient
@@ -29,18 +29,19 @@ from tests.integration.orchestrator.test_graph import (
     REPORT,
     RESULT,
     FixedResultSimulator,
+    FlakyLLMClient,
     _seed_design,
     _seed_full_run,
 )
 
 
-def seed_downstream(fake: FakeLLMClient) -> None:
+def seed_downstream(fake: FakeLLMClient, design: ExperimentDesign = EXPENSIVE) -> None:
     """Only what execute and analysis need: research and design must not re-run."""
     register_trivial_trace(
         fake,
         agent="execute",
         trace_purpose="execute.trace",
-        trace_prompt=build_execute_trace_prompt(EXPENSIVE, RESULT),
+        trace_prompt=build_execute_trace_prompt(design, RESULT),
         conclusion=result_claim(RESULT),
         facts=measurement_facts(RESULT),
     )
@@ -70,7 +71,7 @@ async def run_in_fresh_process(
                 tracer=RunTracer(store) if store else None,
             )
             config = {"configurable": {"thread_id": thread_id}}
-            if not isinstance(graph_input, dict):
+            if isinstance(graph_input, Command):
                 assert (await graph.aget_state(config)).interrupts  # paused on disk
             result: dict[str, Any] = await graph.ainvoke(graph_input, config=config)
             return result
@@ -147,6 +148,29 @@ async def test_abort_after_restart_ends_the_run(tmp_path: Path) -> None:
     assert final["current_agent"] == "hitl"
 
 
+async def test_crash_after_research_continues_from_the_checkpoint(tmp_path: Path) -> None:
+    db = tmp_path / "ckpt.db"
+    fake = FlakyLLMClient("design.experiment", failures=3)
+    _seed_full_run(fake)
+    thread_id = str(uuid4())
+    with pytest.raises(ConnectionError):
+        await run_in_fresh_process(db, fake, empty_state(QUESTION), thread_id)
+
+    async with sqlite_saver(db) as saver:
+        graph = build_graph(llm=FakeLLMClient(), checkpointer=saver)
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    assert snapshot.next == ("design",)
+    assert not snapshot.interrupts
+
+    fresh = FakeLLMClient()  # no research responses: research must not re-run
+    _seed_design(fresh, DESIGN)
+    seed_downstream(fresh, DESIGN)
+    final = await run_in_fresh_process(db, fresh, None, thread_id)
+
+    assert content(*final["analysis_reports"]) == content(REPORT)
+    assert agents(final) == ["research", "design", "execute", "analysis"]
+
+
 async def test_threads_are_isolated_in_one_checkpoint_file(tmp_path: Path) -> None:
     db = tmp_path / "ckpt.db"
     paused = await pause_at_design(db)
@@ -181,9 +205,11 @@ async def test_traces_across_restart_are_persisted_once(tmp_path: Path) -> None:
         assert [(e.node, e.decision) for e in events] == [
             ("research", "pass"),
             ("design", "escalate"),
+            ("hitl", "approve"),
             ("execute", "pass"),
             ("analysis", "pass"),
         ]
+        assert events[2].agent == "design"
         assert [t.agent for t in traces] == ["research", "design", "execute", "analysis"]
         # The resumed tracer re-records the checkpointed hypothesis; it is stored once.
         assert await store.load_hypotheses(run_id) == final["hypotheses"]

@@ -63,7 +63,6 @@ def _autolab(argv: list[str]) -> None:
         pool.submit(cli.main, argv).result()
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-7 #1")
 def test_run_killed_by_a_transient_outage_can_be_resumed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -191,7 +190,6 @@ def test_report_reply_enforces_the_report_validators(interpretations: list[objec
 # --- #6 (low): SolverExecutor shutdown cancels a caller that was not cancelled -
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-7 #6")
 def test_shutdown_does_not_turn_a_queued_check_into_a_cancellation() -> None:
     executor = SolverExecutor(1)
     running = threading.Event()
