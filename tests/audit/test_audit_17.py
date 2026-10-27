@@ -26,7 +26,7 @@ from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, SolverExecutor, Z3Solver
 from autolab.verification.vericot import Verifier
 from scripts.audit_load import NO_CUBES, POSITIVE, XYZ
-from tests.fixtures.agent_helpers import register_trace
+from tests.fixtures.agent_helpers import register_estimate, register_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator import test_graph as tg
 
@@ -37,13 +37,15 @@ async def _design_update(
     protocol: str,
     parameters: Sequence[dict[str, Any]] = (),
     success_criteria: Sequence[str] = (),
+    estimate: tuple[float, float] = (5.0, 30.0),
 ) -> dict[str, Any]:
     """Run the Design agent on a $5 / 30 min design with an honest trace that proves its claim.
 
     The trace's only premise is the protocol itself; the conclusion is the bound
     `design_claim`, formalized as that premise plus every code-built fact, so it
     is entailed, not circular, and scores 1.0. The cost trigger is the default
-    graph's (cost > $10 or duration > 60 min).
+    graph's (cost > $10 or duration > 60 min). `estimate` is the (USD, minutes)
+    an honest independent estimator reads from the design's text (SG25).
     """
     reply: dict[str, Any] = {
         "protocol": protocol,
@@ -73,6 +75,7 @@ async def _design_update(
         ),
         facts=facts,
     )
+    register_estimate(fake, design, cost_usd=estimate[0], duration_minutes=estimate[1])
     agent = DesignAgent(verifier=Verifier(fake), llm=fake, hitl_trigger=cost_trigger(10.0, 60.0))
     state: AutoLabState = {**empty_state(tg.QUESTION), "hypotheses": [tg.HYPOTHESIS]}
     return await agent(state)
@@ -86,20 +89,19 @@ async def _design_update(
 # and the cost/duration pause (principle 7b) never fires.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #1")
 @pytest.mark.parametrize(
-    "parameter",
+    ("parameter", "estimate"),
     [
-        {"name": "incubation_hours", "value": 48},
-        {"name": "reagent_cost_usd", "value": 500.0},
-        {"name": "hours", "value": 48},
-        {"name": "cost (USD)", "value": 500.0},
+        ({"name": "incubation_hours", "value": 48}, (5.0, 2880.0)),
+        ({"name": "reagent_cost_usd", "value": 500.0}, (500.0, 30.0)),
+        ({"name": "hours", "value": 48}, (5.0, 2880.0)),
+        ({"name": "cost (USD)", "value": 500.0}, (500.0, 30.0)),
     ],
 )
 async def test_parameter_named_for_its_unit_cannot_hide_cost_or_duration(
-    parameter: dict[str, Any],
+    parameter: dict[str, Any], estimate: tuple[float, float]
 ) -> None:
-    update = await _design_update(_CLEAN_PROTOCOL, parameters=[parameter])
+    update = await _design_update(_CLEAN_PROTOCOL, parameters=[parameter], estimate=estimate)
 
     # Precondition: the trace verifies, so only the figure guard can stop the design.
     assert update["confidence"] == 1.0
@@ -116,20 +118,21 @@ async def test_parameter_named_for_its_unit_cannot_hide_cost_or_duration(
 # ("500 per well (USD)") and clock notation ("04:00:00").
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #2")
 @pytest.mark.parametrize(
-    "protocol",
+    ("protocol", "estimate"),
     [
-        "Incubate the plate for 3 nights with the reagent kit",
-        "Culture the cells for a week with the reagent kit",
-        "Incubate the plate once using a thousand dollars of reagent",
-        "Incubate the plate for 72 more full hours with the reagent kit",
-        "Incubate the plate with reagent at 500 per well (USD)",
-        "Incubate the plate with the reagent kit; run time 04:00:00 (hh:mm:ss)",
+        ("Incubate the plate for 3 nights with the reagent kit", (5.0, 4320.0)),
+        ("Culture the cells for a week with the reagent kit", (5.0, 10080.0)),
+        ("Incubate the plate once using a thousand dollars of reagent", (1000.0, 30.0)),
+        ("Incubate the plate for 72 more full hours with the reagent kit", (5.0, 4320.0)),
+        ("Incubate the plate with reagent at 500 per well (USD)", (500.0, 30.0)),
+        ("Incubate the plate with the reagent kit; run time 04:00:00 (hh:mm:ss)", (5.0, 240.0)),
     ],
 )
-async def test_protocol_figures_cannot_hide_cost_or_duration(protocol: str) -> None:
-    update = await _design_update(protocol)
+async def test_protocol_figures_cannot_hide_cost_or_duration(
+    protocol: str, estimate: tuple[float, float]
+) -> None:
+    update = await _design_update(protocol, estimate=estimate)
 
     assert update["confidence"] == 1.0
     # Today: no pause, and the $5 / 30 min design is merged.
@@ -142,11 +145,11 @@ async def test_protocol_figures_cannot_hide_cost_or_duration(protocol: str) -> N
 # scanned by `design_figures`, so it can state the run's real duration or cost.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #3")
 async def test_success_criteria_cannot_state_cost_or_duration() -> None:
     update = await _design_update(
         _CLEAN_PROTOCOL,
         success_criteria=["Cells reach confluence after a 48-hour incubation"],
+        estimate=(5.0, 2880.0),
     )
 
     assert update["confidence"] == 1.0
@@ -160,7 +163,6 @@ async def test_success_criteria_cannot_state_cost_or_duration() -> None:
 # invisible characters between amount and unit pass the scan.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #4")
 @pytest.mark.parametrize(
     "protocol",
     [
@@ -237,9 +239,8 @@ def _sleep_on(executor: SolverExecutor, seconds: float) -> None:
     asyncio.run(one())
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-17 #6")
 async def test_slot_hand_off_starts_a_thread_after_earlier_work() -> None:
-    executor = SolverExecutor(1)
+    executor = SolverExecutor(1, slow_workers=1)
     try:
         # Earlier work: two runs from two loops. The second queues behind the first on
         # the pool's one thread, so two items complete for one thread: two permits.
