@@ -86,7 +86,8 @@ class Verifier:
     ) -> None:
         """`check_faithfulness=None` turns the check on only for a live LLM (`is_live`).
 
-        `solver_executor` defaults to the process-wide `default_executor()`.
+        `solver_executor` defaults to the process-wide `default_executor()`, obtained
+        here so its workers start while the trace is formalized (AUDIT-26 #3).
 
         The thresholds are the configured ones; a blocked trace's score is capped below
         both (`confidence.score_cap`).
@@ -99,6 +100,8 @@ class Verifier:
         self._pass_threshold = pass_threshold
         self._retry_threshold = retry_threshold
         self._executor = solver_executor
+        if solver_executor is None:
+            default_executor()
 
     async def verify(
         self,
@@ -233,9 +236,11 @@ class Verifier:
 
         A tautological conclusion says nothing about the claim (AUDIT-1 #5). A
         premise that restates the payload claim, or entails the conclusion on its
-        own, assumes what the trace must prove (AUDIT-1 #1); it is UNGROUNDED, so it
-        and every step resting on it leave the premise pool. An inconclusive check
-        fails closed.
+        own, assumes what the trace must prove (AUDIT-1 #1); it is UNGROUNDED/
+        `no_premises`, so it and every step resting on it leave the premise pool. An
+        inconclusive check fails closed the same way. A premise that was not VALID
+        keeps its verdict, so dropping the premise it conflicted with cannot let it be
+        assumed in the re-check.
         """
         last, conclusion = trace.steps[-1], formulas[-1]
         if not isinstance(conclusion, SmtFormula):
@@ -247,15 +252,14 @@ class Verifier:
             if trivial.verdict == "VALID":
                 reason, details = "formalization_failed", "formalization is a tautology"
             return {last.index: _ungrounded(last, reason, details)}
-        overrides: dict[int, StepVerdict] = {}
+        kept: dict[int, StepVerdict] = {}
+        dropped: dict[int, StepVerdict] = {}
         for step, formula, verdict in zip(trace.steps, formulas, verdicts, strict=True):
-            if (
-                step.claim_type != "premise"
-                or verdict.verdict != "VALID"
-                or not isinstance(formula, SmtFormula)
-            ):
+            if step.claim_type != "premise" or not isinstance(formula, SmtFormula):
                 continue
-            reason = "no_premises"
+            if verdict.verdict != "VALID":
+                kept[step.index] = verdict  # never assumed in the re-check (AUDIT-9 #3)
+                continue
             if _normalize(step.claim) == _normalize(payload_claim):
                 details = "premise restates the payload claim (circular)"
             else:
@@ -264,10 +268,9 @@ class Verifier:
                     continue
                 details = "premise alone entails the payload conclusion (circular)"
                 if alone.verdict == "UNGROUNDED":
-                    reason = alone.reason or "timeout"
                     details = f"could not rule out a circular premise: {alone.details}"
-            overrides[step.index] = _ungrounded(step, reason, details)
-        return overrides
+            dropped[step.index] = _ungrounded(step, "no_premises", details)
+        return {**kept, **dropped} if dropped else {}
 
 
 def _ungrounded(step: ReasoningStep, reason: StepReason, details: str) -> StepVerdict:

@@ -5,7 +5,9 @@ Every agent node is followed by the `monitor` node, which applies the
 
   - no `hitl_pending` → the next agent (or END after analysis).
   - a `verification` request the monitor rates RETRY, with retries left →
-    the same agent again, with the verdict summary as `feedback`.
+    the same agent again, with the verdict summary as `feedback`. A request
+    with its own `payload["feedback"]` (a Design figure rejection or estimate
+    disagreement) is retried on a RETRY or PASS verdict, with that reason too.
   - anything else (ESCALATE, retries exhausted, a policy trigger or an
     error) → the `hitl` node.
 """
@@ -48,19 +50,21 @@ def make_monitor_node(monitor: VerificationMonitor, max_retries: int) -> Monitor
             )
         retries = state.get("retry_count", 0)
         history = state.get("verification_history", [])
-        if (
-            pending.payload.get("trigger") == "verification"
-            and history
-            and retries < max_retries
-            and monitor.decide(history[-1]) is AgentDecision.RETRY
+        if pending.payload.get("trigger") != "verification" or not history:
+            return Command(goto="hitl")
+        decision = monitor.decide(history[-1])
+        fix = str(pending.payload.get("feedback", ""))
+        if retries < max_retries and (
+            decision is AgentDecision.RETRY or (decision is AgentDecision.PASS and fix)
         ):
+            rated = history[-1].summary if decision is AgentDecision.RETRY else ""
             return Command(
                 goto=agent,
                 update={
                     "hitl_pending": None,
                     "hitl_payload": None,
                     "retry_count": retries + 1,
-                    "feedback": history[-1].summary,
+                    "feedback": "; ".join(f for f in (rated, fix) if f),
                 },
             )
         return Command(goto="hitl")

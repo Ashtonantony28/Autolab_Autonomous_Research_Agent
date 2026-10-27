@@ -46,6 +46,8 @@ Precondition: no entry point in this repository runs verifies on two threads tod
 
 **Suggested fix.** Pass `ctx=z3.Context()` to the parse (measured: 0 crashes in 20 runs). A per-thread context also works. Add a test that verifies on two threads in a subprocess. Also consider a lint rule against `z3.*` calls without `ctx=` under `src/`.
 
+**Resolution (SG11).** `Formalizer.formalize` parses with `ctx=formalizer._parse_context()`, a per-thread `z3.Context` held in a `threading.local`, so no two threads ever share a context and none uses Z3's main context. Declarations do not persist between `parse_smt2_string` calls, so a reused per-thread context behaves like a fresh one. A fresh context per parse costs about 1.5 ms per step and pushed `test_audit_2.py::test_ten_step_trace_overlaps_its_llm_calls` over its 1.8 s bound in 2 of 4 runs; the per-thread context costs nothing measurable. `tests/fixtures/golden_traces.py` parses with a fresh `z3.Context()`. No other Z3 parse in `src/` or `tests/fixtures/` lacks a context. The repro now passes (both child interpreters exit 0). Not done: a lint rule against `z3.*` calls without `ctx=`.
+
 ---
 
 ## 2. Medium: SQLite store fails runs with `database is locked` under concurrent writers
@@ -69,6 +71,8 @@ Precondition: no entry point in this repository runs verifies on two threads tod
 **Root cause.** `src/autolab/state/store.py:157` (`create_async_engine(url, echo=echo, future=True)`: no `connect_args={"timeout": ...}`, no WAL pragma, no write serialization). `store.py:241-243` uses one session and commit per entity. `src/autolab/monitoring/tracer.py:32-41` writes the run row, each entity and the event sequentially. `orchestrator/recovery.py:18-22` does not classify `OperationalError` (locked) as transient, so the run aborts.
 
 **Suggested fix.** For SQLite, set `connect_args={"timeout": 30}` and `PRAGMA journal_mode=WAL` on connect. Serialize writes per engine with an `asyncio.Lock`, or write each `record_node` batch in one transaction. Retry `OperationalError` "database is locked" a bounded number of times. Measure Postgres separately.
+
+**Resolution (SG23).** `StateStore.create` now opens SQLite with a 30 s busy timeout (`SQLITE_BUSY_TIMEOUT_S`) and puts file databases in WAL mode on connect, so a writer waits for another writer's lock instead of failing, and readers no longer block it. Every store write is a single upsert, so a transaction never upgrades from a read lock. `test_store_append_waits_out_a_concurrent_writer` now passes as a plain test. Not done: writes are not serialized per engine and `OperationalError` is still not retried, so a lock held for longer than 30 s still fails the run. Postgres is unchanged.
 
 ---
 

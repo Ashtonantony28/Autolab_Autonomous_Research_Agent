@@ -90,6 +90,16 @@ round-1 resolutions fall to this:
 - In `contradiction_trace`, do not formalize the redundant final step, or fail closed on
   it too.
 
+**Resolution (SG11).** `Vocabulary.merged` rejects any declaration whose name is in
+`formalizer.RESERVED_SYMBOLS` (90 names: SMT-LIB core, Ints/Reals/Arrays symbols, sorts,
+syntax keywords, commands, and common Z3 extensions such as `rem`, `^`, `implies`,
+`lambda`). The step raises `FormalizationError` and becomes UNGROUNDED/`formalization_failed`,
+and its declarations never enter the vocabulary, so no later check can shadow a builtin.
+The same rule covers `context.facts`, which seed the vocabulary through `merge`. All three
+repros now pass. Not done: the defence-in-depth items (per-check declarations, dropping a
+judge-rejected step's declarations, showing the judge the check's declaration block, and
+not formalizing the trigger's redundant final step).
+
 ## High
 
 ### #2 Payload binding covers one text field; the Design fields that drive the cost/duration pause and the simulator are never verified
@@ -122,6 +132,8 @@ partial fix is to also run the policy trigger on any cost or duration figure tha
 verified trace formalizes.
 
 **Resolution (SG12).** `common.design_facts` builds one Real fact in code for each of `estimated_cost_usd`, `estimated_duration_minutes` and every numeric (non-bool) parameter (`param_<name>`). The facts go into the Design `context.facts`. The bound claim is now `common.design_claim(design)`: "design protocol: <protocol>; estimated_cost_usd = …, estimated_duration_minutes = …, param_<name> = …" (string and bool parameters are named in the sentence too). The trace prompt asks for that conclusion through `conclusion_instruction`, and `llm.py` is unchanged. A trace that still concludes only the protocol is unbound, so it scores 0.0 and gets a `verification` pause. A trace that concludes the new claim, but whose premise states another value for a bound symbol (for example `(= estimated_cost_usd 500.0)` against the 5.0 fact), is INVALID/`premises_inconsistent` and is not admitted. That case is covered in `tests/unit/agents/test_design.py`. The repro is flipped. **One assertion changed:** `update["confidence"] == 1.0` is now `< 1.0`. The repro's trace concludes the bare protocol, which is no longer the payload claim, so no trace can both score 1.0 and pause unless the trigger guesses which formalized symbols mean cost. That partial fix was not built. The two assertions that matter (`hitl_pending` is set and `current_experiment` is withheld) are unchanged. Limit: a trace that formalizes the protocol's own figures under unrelated symbols (`usd`, `minutes`) is still not linked to the facts. Only an honest formalizer, or faithfulness checking, ties "500 USD" in the protocol text to `estimated_cost_usd`.
+
+**Resolution (SG17, after AUDIT-12 #1 reopened this).** The remaining gap, protocol figures formalized under unrelated symbols, is closed by a rule: the protocol text may not state a currency amount or a duration, and a Design whose protocol does is escalated as a `verification` request and not admitted. The figures live only in the bound fields. AUDIT-12 #1 holds the repro with the original `== 1.0`-style precondition (the trace verifies at 1.0 and the pause still fires).
 
 ## Medium
 
