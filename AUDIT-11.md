@@ -42,6 +42,8 @@
 
 **Fix.** Observe the `hitl` node as well. After `interrupt()` returns, record a `TraceEvent` for the resolution (`node="hitl"`, `decision` = the action, `trigger`, the note). Before returning, call `tracer.record_state(run_id, merged)` on the merged update. Add a test that approves at every agent and compares the store with the final state.
 
+**Resolution (SG18).** `make_hitl_node` takes an `observer`, and `build_graph` passes one when it has a tracer or metrics. Each resolution writes a `hitl` `TraceEvent` (`decision` = `approve`/`retry`/`abort`, the request's `agent`, `trigger` and reason, and the human's `note`), and the update it returns goes through `record_state`, so an approved Analysis report reaches the store. A policy re-pause writes a second `hitl` event with `decision="escalate"`, `trigger="policy"`. `Metrics.hitl_decisions` counts them. The repro is flipped unchanged.
+
 ## 2. Medium: `pytest-timeout` cannot end a hung CLI test
 
 **Impact.**
@@ -69,6 +71,8 @@
 **Root cause.** `cli.py:142-152` checks only `__interrupt__`. The `hitl` node leaves no trace of the abort in state (`checkpoints.py:125`).
 
 **Fix.** Have the `abort` branch set a terminal marker (for example `current_agent="aborted"`, or an `outcome` field). `_drive` then prints `Run <id> aborted at <agent>.` and exits non-zero. Use the same marker in the resume "finished or unknown" message.
+
+**Resolution (SG18).** When `autolab resume <id> abort` is applied to a paused run, `_drive` prints `Run <id> aborted at human review; it will not resume.` instead of "complete". It still exits 0, since the abort succeeded, and the abort itself is now a `hitl` trace event (#1). An `abort` given to a crashed, unpaused run is still ignored, and that run reports "complete". A later `resume` still says "finished or unknown". The repro is flipped unchanged.
 
 ## 4. Medium: the contradiction trigger cannot fire from `autolab run`
 
@@ -104,6 +108,8 @@
 
 **Fix.** Make the symbol injective, for example by appending a short hash or the parameter index on a collision. Alternatively, reject duplicate sanitized names in `DESIGN_REPLY` validation, so the reply is retried.
 
+**Resolution (SG17).** A name that is already a plain identifier keeps `param_<name>`. Any other name becomes `paramx_<sanitized>_<sha256[:12]>`, so it cannot collide with a plain name (different prefix) or with another sanitized name, barring a hash collision. The repro is flipped unchanged. Two parameters with the identical name still share a symbol.
+
 ## 7. Low: `hitl_node` is a dead, policy-free export
 
 **Impact.**
@@ -114,6 +120,8 @@
 **Repro.** `test_no_policy_free_hitl_node_is_exported`.
 
 **Fix.** Drop `hitl_node`, and point `test_audit_4.py` M16/M21 at `make_hitl_node({})`. If a policy-free node is wanted, make `policies` a required argument, so that dropping the policies is an explicit choice.
+
+**Resolution (SG18).** `hitl_node` is removed and `make_hitl_node(policies)` requires `policies`. `test_audit_4.py` M21 now builds the node with `make_hitl_node({})` (M16 already ran the full graph), and its assertions are unchanged. The repro is flipped unchanged. `docs/status.md:142` still names `hitl_node` (#8).
 
 ## 8. Low: stale docs and docstrings
 

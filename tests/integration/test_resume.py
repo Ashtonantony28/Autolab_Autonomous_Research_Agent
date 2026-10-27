@@ -205,9 +205,11 @@ async def test_traces_across_restart_are_persisted_once(tmp_path: Path) -> None:
         assert [(e.node, e.decision) for e in events] == [
             ("research", "pass"),
             ("design", "escalate"),
+            ("hitl", "approve"),
             ("execute", "pass"),
             ("analysis", "pass"),
         ]
+        assert events[2].agent == "design"
         assert [t.agent for t in traces] == ["research", "design", "execute", "analysis"]
         # The resumed tracer re-records the checkpointed hypothesis; it is stored once.
         assert await store.load_hypotheses(run_id) == final["hypotheses"]

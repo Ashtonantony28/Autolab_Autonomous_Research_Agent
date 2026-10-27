@@ -77,7 +77,6 @@ def use_llm(env: pytest.MonkeyPatch, design: ExperimentDesign | None = None) -> 
 # --- #1 (high): an approved Analysis escalation never reaches the store -------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-11 #1")
 async def test_an_approved_analysis_report_is_persisted(tmp_path: Path) -> None:
     fake = FakeLLMClient()
     _seed_full_run(fake)
@@ -155,7 +154,6 @@ def test_a_hung_cli_test_fails_and_is_named(tmp_path: Path) -> None:
 # --- #3 (medium): an aborted run is reported as complete ----------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-11 #3")
 async def test_resume_abort_does_not_report_a_completed_run(
     cli_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -226,7 +224,6 @@ async def test_a_printed_thread_id_is_resumable(
 # --- #6 (low): distinct design parameters can share one fact symbol ----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-11 #6")
 def test_distinct_parameters_get_distinct_fact_symbols() -> None:
     design = ExperimentDesign(
         hypothesis_id=HYPOTHESIS.id,
@@ -240,7 +237,7 @@ def test_distinct_parameters_get_distinct_fact_symbols() -> None:
     )
     facts = design_facts(design)
 
-    # Today: both become `param_temp_C`, so the facts assert 4.0 and 37.0 for one
+    # Before SG17: both became `param_temp_C`, so the facts asserted 4.0 and 37.0 for one
     # symbol and every step of an honest trace is `premises_inconsistent`.
     assert len({f.declarations for f in facts}) == len(facts)
 
@@ -248,7 +245,6 @@ def test_distinct_parameters_get_distinct_fact_symbols() -> None:
 # --- #7 (low): `hitl_node` is a dead, policy-free export ----------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-11 #7")
 def test_no_policy_free_hitl_node_is_exported() -> None:
     # Today: `checkpoints.hitl_node` (no policies) is exported but unused by
     # `build_graph`; wiring it silently drops the AUDIT-5 #3 policy re-check.
