@@ -118,6 +118,8 @@ def test_solver_ms_excludes_worker_start_up(monkeypatch: pytest.MonkeyPatch) -> 
     # A fresh pool, so the check starts and boots its worker; no grace, so the worker
     # is killed and replaced. On a fake clock starting costs 1000 s, booting 100 s,
     # the call 1 s and stopping 10 s: only the call's second is `solver_ms` (AUDIT-28 #5).
+    # Built first, so its prestart thread fills the shared pool, never this one (AUDIT-40 #6).
+    executor = SolverExecutor(1, 0)
     clock = _FakeClock()
     monkeypatch.setattr(solver_mod, "time", SimpleNamespace(perf_counter=clock))
     monkeypatch.setattr(solver_mod, "_clock", clock)
@@ -152,7 +154,6 @@ def test_solver_ms_excludes_worker_start_up(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(worker_type, "ready", ready)
     monkeypatch.setattr(worker_type, "call", call)
     monkeypatch.setattr(worker_type, "stop", stop)
-    executor = SolverExecutor(1, 0)
     hard = partial(
         Z3Solver(_HANG_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )

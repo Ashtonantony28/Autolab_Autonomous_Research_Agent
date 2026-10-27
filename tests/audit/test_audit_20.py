@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
-from typing import Final, TypeVar, cast
+from typing import Final, TypeVar
 
 import pytest
 import z3
@@ -262,27 +262,29 @@ async def test_a_caller_cancelled_while_its_check_is_queued_never_runs_it() -> N
 def test_the_entailment_check_gets_the_time_left_not_the_initial_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # S09: the timeout is set again before the entailment check, to what is left.
-    timeouts: list[int] = []
-    real_set = z3.Solver.set
+    # S09: the entailment check gets what is left of one deadline (SG36: the
+    # watchdog's, which spans both checks), not a fresh budget.
+    deadlines: list[float] = []
+    left: list[float] = []
+    real_init = solver_mod._Watchdog.__init__
     real_check = z3.Solver.check
 
-    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
-        if args and args[0] == "timeout":
-            timeouts.append(int(cast(int, args[1])))
-        real_set(self, *args, **kwargs)
+    def init(self: solver_mod._Watchdog, ctx: z3.Context, deadline: float) -> None:
+        deadlines.append(deadline)
+        real_init(self, ctx, deadline)
 
     def slow_check(self: z3.Solver, *args: z3.ExprRef) -> z3.CheckSatResult:
+        left.append(deadlines[-1] - solver_mod._now())
         out = real_check(self, *args)
         time.sleep(0.3)  # the consistency check takes 0.3 s of a 2 s budget
         return out
 
-    monkeypatch.setattr(z3.Solver, "set", record)
+    monkeypatch.setattr(solver_mod._Watchdog, "__init__", init)
     monkeypatch.setattr(z3.Solver, "check", slow_check)
     out = Z3Solver(2.0)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     assert out.verdict == "VALID"
-    assert len(timeouts) == 2
-    assert timeouts[1] <= timeouts[0] - 250
+    assert (len(deadlines), len(left)) == (1, 2)
+    assert left[1] <= left[0] - 0.25
 
 
 def test_the_entailment_check_asserts_the_negated_claim_instead_of_assuming_it(

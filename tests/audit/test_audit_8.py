@@ -166,14 +166,30 @@ async def test_at_most_workers_checks_are_ever_submitted_to_the_pool() -> None:
 
 
 # --------------------------------------------------------------------------
-# S08: Z3 reads a timeout of 0 as "no limit"; an exhausted deadline must still
-# give the second check a bounded (1 ms) budget.
+# S08: an exhausted deadline must still bound the second check. Since SG36 the
+# limit is `_Watchdog`'s interrupt, which Z3 forgets if it lands between checks, so
+# past the deadline it is sent again until `_solve` returns.
 # --------------------------------------------------------------------------
 
 
+class _Interrupts:
+    def __init__(self) -> None:
+        self.count = 0
+
+    def interrupt(self) -> None:
+        self.count += 1
+
+
 def test_exhausted_deadline_never_becomes_an_unlimited_z3_timeout() -> None:
-    assert solver_mod._remaining_ms(time.monotonic() - 5.0) == 1
-    assert solver_mod._remaining_ms(time.monotonic() + 2.0) > 1000
+    ctx = _Interrupts()
+    with solver_mod._Watchdog(ctx, solver_mod._now() - 5.0):
+        deadline = time.monotonic() + 10.0
+        while ctx.count < 3:
+            assert time.monotonic() < deadline
+            time.sleep(solver_mod._INTERRUPT_EVERY_S)
+    seen = ctx.count
+    time.sleep(3 * solver_mod._INTERRUPT_EVERY_S)
+    assert ctx.count == seen  # none once `_solve` has returned
 
 
 # --------------------------------------------------------------------------

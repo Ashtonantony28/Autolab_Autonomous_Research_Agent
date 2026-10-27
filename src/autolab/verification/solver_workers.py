@@ -11,6 +11,7 @@ the caller's main module, so it never re-runs it: no import cost per boot, and
 a main with no `if __name__ == "__main__":` guard runs once (AUDIT-26 #4, AUDIT-25 #1).
 A process forked from the owner adopts its `Workers` empty and starts its own forkserver:
 it never uses, or kills, the owner's workers (AUDIT-29 #1, AUDIT-30 #2).
+A worker can be paused (SIGSTOP) mid-call; its budget excludes the pause (ADR 0009, SG36).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable, Sequence
 from multiprocessing import forkserver, spawn
@@ -34,6 +36,7 @@ _BOOT_S: Final[float] = 60.0
 """How long a new worker may take to start before it counts as lost."""
 _PR_SET_PDEATHSIG: Final[int] = 1
 
+_PAUSABLE: Final[bool] = hasattr(signal, "SIGSTOP")
 _NAME: Final[str] = "z3-worker"
 _MAIN_KEYS: Final[tuple[str, ...]] = ("init_main_from_path", "init_main_from_name")
 Reply = tuple[bool, Any]
@@ -52,8 +55,19 @@ def _die_with_parent() -> None:
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
-def _serve(conn: Connection, target: Callable[..., Any]) -> None:
+_paused: Any = None
+"""In a worker, the shared total its parent has paused it for (SG36)."""
+
+
+def paused_s() -> float:
+    """How long the parent has paused this worker in all; 0 outside a worker."""
+    return 0.0 if _paused is None else float(_paused.value)
+
+
+def _serve(conn: Connection, target: Callable[..., Any], paused: Any = None) -> None:
     """Worker main loop: answer each `(seq, args)` with `(seq, reply)` until the pipe closes."""
+    global _paused
+    _paused = paused
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent handles Ctrl-C
     _die_with_parent()
     try:
@@ -94,22 +108,27 @@ class Worker:
 
     def __init__(self, ctx: BaseContext, target: Callable[..., Any]) -> None:
         self.conn, child = ctx.Pipe()
+        self._shared = ctx.RawValue(ctypes.c_double, 0.0)
         self.process = ctx.Process(  # type: ignore[attr-defined]
-            target=_serve, args=(child, target), name=_NAME, daemon=True
+            target=_serve, args=(child, target, self._shared), name=_NAME, daemon=True
         )
         self.process.start()
         child.close()
         self._ready = False
         self._seq = 0
+        self._lock = threading.Lock()
+        self._paused_at: float | None = None
+        self._paused_s = 0.0
         self.fault = ""
         """Why the last call returned None (`DIED`, `FAILED_TO_START`, `OUT_OF_TURN`);
         empty when it ran past its budget."""
 
     def ready(self) -> bool:
-        """Wait until the worker has started; False if it died or took over `_BOOT_S`."""
+        """Wait until the worker has started; False if it died or took over `_BOOT_S`
+        (paused time excluded)."""
         try:
             if not self._ready:
-                if not self.conn.poll(_BOOT_S):
+                if not self._poll(_BOOT_S):
                     self.fault = FAILED_TO_START
                     return False
                 self.conn.recv()
@@ -125,13 +144,14 @@ class Worker:
 
         Each request carries a sequence number its reply must echo, so a reply left in
         the pipe by an earlier call is never taken for this one's (AUDIT-28 #1). The
-        budget starts once the worker is ready, so start-up never counts against it.
+        budget starts once the worker is ready, so start-up never counts against it, and it
+        excludes the time the worker is paused.
         """
         try:
             if not self.ready():
                 return None
             self._send(args)
-            if not self.conn.poll(budget_s):
+            if not self._poll(budget_s):
                 return None
             match self.conn.recv():
                 case (self._seq, (bool(), _) as reply):
@@ -143,17 +163,58 @@ class Worker:
             self.fault = DIED
             return None
 
+    def _poll(self, budget_s: float) -> bool:
+        """Whether a message arrives within `budget_s`, not counting the time paused."""
+        end = time.monotonic() + budget_s - self._paused()
+        while not self.conn.poll(max(0.0, end + self._paused() - time.monotonic())):
+            if end + self._paused() <= time.monotonic():
+                return False
+        return True
+
     def _send(self, args: tuple[Any, ...]) -> None:
         self._seq += 1
         self.conn.send((self._seq, args))
 
+    def pause(self) -> None:
+        """Stop the process (SIGSTOP) until `resume`; a no-op where there is no SIGSTOP."""
+        with self._lock:
+            if self._paused_at is None and _PAUSABLE and self._signal(signal.SIGSTOP):
+                self._paused_at = time.monotonic()
+
+    def resume(self) -> None:
+        """Continue a paused process (SIGCONT)."""
+        with self._lock:
+            if self._paused_at is not None:
+                self._paused_s += time.monotonic() - self._paused_at
+                self._paused_at = None
+                self._shared.value = self._paused_s  # read by the worker once it runs again
+                self._signal(signal.SIGCONT)
+
+    def _signal(self, signum: int) -> bool:
+        """Send `signum` to the process; False if it has ended."""
+        try:
+            if self.process.exitcode is None:
+                os.kill(self.process.pid, signum)
+                return True
+        except ProcessLookupError:  # it died and was reaped since `exitcode` was read
+            pass
+        return False
+
+    def _paused(self) -> float:
+        """How long the process has been paused in all, a pause in progress included."""
+        with self._lock:
+            if self._paused_at is None:
+                return self._paused_s
+            return self._paused_s + time.monotonic() - self._paused_at
+
     def interrupt(self) -> None:
         """Kill the process; a call in progress returns None."""
+        self.resume()  # a stopped process would not run its exit, nor let a join return
         self.process.kill()
 
     def stop(self) -> None:
         """Kill the process, wait until it is gone, and free the pipe."""
-        self.process.kill()
+        self.interrupt()
         self.process.join()
         self.conn.close()
 
@@ -219,9 +280,7 @@ class Workers:
             with self._lock:
                 if len(self._idle) >= min(n, self.idle_max):
                     return
-            worker = self._start()
-            with self._lock:
-                self._idle.append(worker)
+            self.release(self._start())  # another thread may have filled the idle list
 
     def acquire(self) -> Worker:
         """An idle worker, or a new one if none is idle."""
@@ -253,9 +312,7 @@ class Workers:
             self._live.discard(worker)
             replace = len(self._idle) < self.idle_max
         if replace:
-            fresh = self._start()
-            with self._lock:
-                self._idle.append(fresh)
+            self.release(self._start())
 
     def live(self) -> int:
         """Worker processes started and not yet stopped."""
@@ -316,5 +373,10 @@ def register(workers: Workers) -> Workers:
 
 @atexit.register
 def _close_all() -> None:
+    # Before multiprocessing's own exit hook, whose SIGTERM and join a paused worker ignores.
     for workers in _all:
         workers.close()
+        with workers._lock:
+            live = list(workers._live)
+        for worker in live:
+            worker.resume()

@@ -92,7 +92,6 @@ def test_a_forked_child_that_exits_normally_leaves_the_owners_workers_alone(
 # --- #2 (low): SolverExecutor.run may call `fn` twice ----------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-35 #2")
 def test_run_calls_fn_once() -> None:
     # `SolverExecutor.run(fn)`: "Run `fn` on the pool". SG34 stops a newcomer's check on
     # a lent place once it has run `_HARD_SLICES` slices and runs `fn` again for a slot.

@@ -45,30 +45,39 @@ class _Held:
         return "held"
 
 
-class _UntilStopped:
-    """A check that runs until its worker is killed; run again, it decides at once."""
+class _UntilPaused:
+    """A check that runs until its worker is paused; resumed, it decides at once. `order`
+    records each start and resume (SG36 pauses a check that gives way, not stops it)."""
 
     def __init__(self, name: str, order: list[str]) -> None:
         self.name = name
         self.order = order
         self.started = threading.Event()
-        self._stop = threading.Event()
+        self._paused = False
+        self._end = threading.Event()
 
     def interrupt(self) -> None:
-        self._stop.set()
+        self._end.set()
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        if self._paused:
+            self._paused = False
+            self.order.append(self.name)
+            self._end.set()
 
     def __call__(self) -> str:
         self.order.append(self.name)
-        if self._stop.is_set():
-            return "decided"
         interrupt = solver_mod._worker.interrupt
         assert interrupt.attach(self)
         self.started.set()
         try:
-            assert self._stop.wait(_WAIT_S)
+            assert self._end.wait(_WAIT_S)
         finally:
             interrupt.detach()
-        return "stopped"
+        return "decided"
 
 
 class _FakeClock:
@@ -104,7 +113,6 @@ async def _until(condition: Callable[[], bool]) -> None:
 # --- #1: a newcomer that gave way waits for a slot while its lent place idles --------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-38 #1")
 async def test_a_newcomer_that_gave_way_is_served_before_the_slot_frees(
     executors: list[SolverExecutor], clock: _FakeClock
 ) -> None:
@@ -131,7 +139,7 @@ async def test_a_newcomer_that_gave_way_is_served_before_the_slot_frees(
     assert await asyncio.to_thread(blocker.started.wait, _WAIT_S)
     slots = executor._slots[asyncio.get_running_loop()]
     await _until(lambda: slots.stuck == 1)
-    newcomer = _UntilStopped("new", order)
+    newcomer = _UntilPaused("new", order)
     new_task = asyncio.create_task(executor.run(newcomer))
     assert await asyncio.to_thread(newcomer.started.wait, _WAIT_S)
     go_short.set()
@@ -151,7 +159,6 @@ async def test_a_newcomer_that_gave_way_is_served_before_the_slot_frees(
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-38 #2")
 async def test_z3_processes_running_at_once_never_outnumber_the_places() -> None:
     # A 1-CPU host's defaults: 1 slot, no slow place. One hard check holds the slot; three
     # hard checks arrive in new tasks while it runs. Counted from /proc (state R), not as
