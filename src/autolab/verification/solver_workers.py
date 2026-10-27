@@ -9,6 +9,8 @@ stays off the hot path. Processes come from a forkserver (spawn where there is
 none), never from a fork of this threaded process. A worker needs nothing from
 the caller's main module, so it never re-runs it: no import cost per boot, and
 a main with no `if __name__ == "__main__":` guard runs once (AUDIT-26 #4, AUDIT-25 #1).
+A process forked from the owner adopts its `Workers` empty and starts its own forkserver:
+it never uses, or kills, the owner's workers (AUDIT-29 #1, AUDIT-30 #2).
 """
 
 from __future__ import annotations
@@ -17,11 +19,13 @@ import atexit
 import contextlib
 import ctypes
 import multiprocessing
+import os
 import signal
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Sequence
-from multiprocessing import spawn
+from multiprocessing import forkserver, spawn
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from typing import Any, Final
@@ -171,6 +175,24 @@ class Workers:
         self._idle: list[Worker] = []
         self._ctx: BaseContext | None = None
         self._live: set[Worker] = set()
+        self._pid = os.getpid()
+        _made.add(self)
+
+    def _own(self) -> None:
+        """In a process other than the one that built this pool, `_adopt` it first."""
+        if self._pid != os.getpid():
+            self._adopt()
+
+    def _adopt(self) -> None:
+        """Forget the owner's workers without touching their processes; start afresh."""
+        for worker in self._idle:
+            worker.conn.close()  # this process's copy of the pipe only
+        for worker in self._live:
+            # Or this process's exit would SIGTERM them (AUDIT-35 #1, AUDIT-36 #1).
+            _children().discard(worker.process)
+        self._lock = threading.Lock()
+        self._idle, self._live, self._ctx = [], set(), None
+        self._pid = os.getpid()
 
     def _context(self) -> BaseContext:
         with self._lock:
@@ -192,6 +214,7 @@ class Workers:
 
     def prestart(self, n: int) -> None:
         """Start workers until `n` (at most `idle_max`) are idle."""
+        self._own()
         while True:
             with self._lock:
                 if len(self._idle) >= min(n, self.idle_max):
@@ -202,6 +225,7 @@ class Workers:
 
     def acquire(self) -> Worker:
         """An idle worker, or a new one if none is idle."""
+        self._own()
         with self._lock:
             while self._idle:
                 worker = self._idle.pop()
@@ -240,6 +264,7 @@ class Workers:
 
     def close(self) -> None:
         """Stop every idle worker; a worker in use comes back (or stops) when its call ends."""
+        self._own()
         with self._lock:
             idle, self._idle = self._idle, []
             for worker in idle:
@@ -249,6 +274,38 @@ class Workers:
 
 
 _all: list[Workers] = []
+_made: weakref.WeakSet[Workers] = weakref.WeakSet()
+
+
+def _children() -> set[Any]:
+    """Multiprocessing's record of this process's children, whose daemons it terminates at
+    exit; a raw `os.fork` child inherits its parent's."""
+    children: set[Any] = vars(multiprocessing.process)["_children"]
+    return children
+
+
+def _forget_forkserver() -> None:
+    """Drop the owner's forkserver in a forked child; the next worker starts this one's own.
+
+    The child cannot `waitpid` a forkserver it did not start, so multiprocessing's
+    `ensure_running` would raise ChildProcessError.
+    """
+    server: Any = forkserver._forkserver
+    if server._forkserver_alive_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(server._forkserver_alive_fd)
+    server._forkserver_address = server._forkserver_alive_fd = server._forkserver_pid = None
+    server._lock = threading.Lock()
+
+
+def _after_fork_in_child() -> None:
+    _forget_forkserver()
+    for workers in list(_made):
+        workers._adopt()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def register(workers: Workers) -> Workers:
