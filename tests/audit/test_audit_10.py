@@ -12,12 +12,15 @@ from typing import Final
 
 import pytest
 
+from autolab.config import SOLVER_TIMEOUT_S
 from autolab.verification import solver as solver_mod
-from autolab.verification.solver import SolverExecutor
+from autolab.verification.solver import SolverExecutor, Z3Solver
 from scripts.audit_load_2 import P95, pct
 from scripts.audit_load_3 import (
+    CHAIN_CLAIM,
+    CHAIN_PREMISES,
     concurrent_solver_ms,
-    context_overhead_ratio,
+    contexts_created,
     held_contexts_report,
     printer_peak_concurrency,
     s08_suite_probe,
@@ -57,11 +60,12 @@ async def test_the_default_solver_pool_does_not_inflate_solver_ms_under_concurre
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-10 #2")
 def test_a_hung_main_thread_solver_check_fails_within_the_per_test_limit() -> None:
     # AUDIT-8 H1's mutant S08 (no solver time limit) on a sync test whose Z3 check runs on
     # the main thread, with --timeout=1. The signal-based timeout cannot interrupt the C
     # call, so the child pytest never finishes; it is killed after 8 s with no test named.
+    # Since SG29 the check runs in a worker process and the main thread waits on a pipe,
+    # which the signal interrupts.
     wall, killed, out = s08_suite_probe(limit_s=1.0, kill_after_s=8.0)
     assert not killed
     assert "test_hard_premise_consistency_check_times_out" in out
@@ -82,12 +86,16 @@ def test_threads_that_have_formalized_do_not_each_keep_a_z3_context() -> None:
 # --- #4 (low): every check builds and frees a fresh z3.Context -------------------------
 
 
-@pytest.mark.perf
 @pytest.mark.xfail(strict=True, reason="AUDIT-10 #4")
 def test_a_trivial_check_is_not_dominated_by_creating_a_context() -> None:
-    # The same parse and two checks on one reused context take about a third of the time
-    # `Z3Solver.check_entailment` takes (ratio ~3.0, measured interleaved on one thread).
-    assert context_overhead_ratio(rounds=150) < 1.5
+    # Every check builds and frees its own context; reusing one makes the same parse and
+    # two checks about twice as fast. Counted, not timed: since SG29 a ratio of times
+    # mixes in worker timing and passes on fast runners (AUDIT-28 #8).
+    solver = Z3Solver(SOLVER_TIMEOUT_S)
+    premises = list(CHAIN_PREMISES)
+    assert (
+        contexts_created(lambda: [solver._check_here(premises, CHAIN_CLAIM) for _ in range(3)]) <= 1
+    )
 
 
 # --- #5 (low): counter-models go through z3's shared printer on every worker ----------

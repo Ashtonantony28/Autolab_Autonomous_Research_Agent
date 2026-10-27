@@ -43,6 +43,14 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG25 | Independent cost and duration estimate for designs (AUDIT-17 #1–#3, AUDIT-19 #1, #2) | audit round 5 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/`, `orchestrator/routing.py` (figure retry only) | done (PR pending) |
 | SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | done (PR pending) |
 | SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | done (PR pending) |
+| SG28 | Formalizer probe cost linear in arity (AUDIT-22 #1) | audit round 6 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
+| SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | done (PR pending) |
+| SG30 | Slot fairness by elapsed time with aging (AUDIT-22 #4, AUDIT-24 #2, #3) | SG29 | `verification/solver.py` scheduling only, `tests/unit/verification/test_solver_scheduling.py` | done (PR pending) |
+| SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (PR pending) |
+| SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
+| SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
+| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
+| SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (PR pending); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -419,6 +427,49 @@ Round 5 (AUDIT-17..20, fresh agents, base `603e452`) found 1 critical and 9 high
 - **SG27 Real-valued premise pools honour timeouts.** Real-valued premise pools ignore the solver timeout (up to 20×) and cancels (a worker held 9.4 s), and cost 9–12× the same pool over Int (AUDIT-18 #3, high). The audit suggests checking each trace incrementally on one solver. **Flip:** AUDIT-18 #3 ×3, #7. **Verify:** as SG26, plus error injection.
 
 Medium and low round-5 findings not folded in above stay in the AUDIT files.
+
+### Audit round 6 → SG28–SG30
+
+Round 6 (AUDIT-21..24, fresh agents, base `492980e`) found 1 critical and 4 high findings. Soundness held: no wrong trace or understated design is admitted on the agent's own path. Repros are strict xfails in `tests/audit/test_audit_{21..24}.py`. SG28 and SG29 run in parallel; SG30 runs after SG29.
+
+- **SG28 Probe cost linear in arity.** SG24's 2k+2 variants each parse all k arguments, so cost grows with k²: one 4 KB declaration line blocks the event loop for 11–13 s (AUDIT-22 #1, critical). Cap the arity a declaration may have (a `Final` constant, rejected with a reason the formalizer retry can use) and keep the per-declaration parse budget linear. **Flip:** AUDIT-22 #1. **Verify:** `uv run pytest tests/audit/test_audit_13.py tests/audit/test_audit_18.py tests/audit/test_audit_22.py tests/unit/verification -q` · error injection · bench.
+- **SG29 Bounded checks by process isolation.**
+  - Three rounds of in-process fixes (SG19, SG22, SG27) have not bounded Z3: a single simplex run ignores its limit and interrupts (AUDIT-22 #3, high), and SG27's per-premise loading costs a GIL hand-off per premise, so checks beside a Python thread run 80–116× slower and time out (AUDIT-22 #2, high).
+  - The default chosen here: run each check in a small pool of persistent worker processes that receive the SMT-LIB text and return the outcome. A check past its deadline or cancelled is ended by killing its worker and starting a fresh one, so timeouts and cancels hold for any formula shape, and solving never holds the parent's GIL. Revert SG27's per-premise loading. `SolverExecutor` and `Z3Solver.check_entailment` keep their signatures. Record the choice in an ADR.
+  - Size the pool from the cgroup CPU quota as well as affinity (AUDIT-22 #6). A cancelled check's slow place returns only when its worker is gone (AUDIT-22 #5).
+  - Make the AUDIT-14 #1 repro catch the SG19 regression again (AUDIT-24 #1, high) and pin the loading/limit mutants AUDIT-24 #4–#6 or retire them with the loading path.
+  - **Flip:** AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6, and any AUDIT-18 #3 repro the change affects. **Verify:** `make lint typecheck test` · error injection (34/34, 26/26) · golden verdicts unchanged · bench (step p95 ≤ 50 ms) · AUDIT-10/14/18/22 loads · `make test` green 5 times under load.
+- **SG30 Fair slots.** A new run's first check waits until no short caller is left, with no aging (AUDIT-22 #4, high). Count a run as hard by elapsed time rather than loop wake-ups (AUDIT-24 #2), and stop a lent place from lending again (AUDIT-24 #3). **Flip:** AUDIT-22 #4, AUDIT-24 #2, #3. **Verify:** as SG29.
+
+Medium and low round-6 findings not folded in above stay in the AUDIT files. Two auditors independently found that approving an escalated Design figure request re-checks cost on the design's own figures, not the estimate (AUDIT-21 #1, AUDIT-23 #1, medium).
+### Audit round 7 → SG31–SG33
+
+Round 7 (AUDIT-25..28, fresh agents, base `7123eed`) found 0 critical and 3 high findings. Soundness held on the agent's own path, but AUDIT-28 #1 shows one unguarded line between a stale worker reply and a false VALID. Repros are strict xfails in `tests/audit/test_audit_{25..28}.py`. SG31 and SG33 run in parallel; SG32 runs after SG31.
+
+- **SG31 Matched worker replies.** A check cut short in the caller can leave its reply in the worker's pipe, and only `pool.discard` in one `except` stops the next check reading it; with `release` there a non-entailed claim comes back VALID (AUDIT-28 #1, high). Tag each request with a sequence number and treat any other reply as a dead worker. Also: a cancel during acquire (AUDIT-28 #4), a test that pins start-up and replacement for real (AUDIT-28 #5), `ready()` inside the guarded block (AUDIT-25 #3), a dead worker reported as `worker_died`, not a timeout (AUDIT-25 #2, AUDIT-27 #1), and a timeout bound that cannot overflow `poll` (AUDIT-27 #2). **Flip:** those repros. **Verify:** `make lint typecheck test` · error injection (34/34, 26/26) · bench.
+- **SG32 Newcomers and cold start.** A new task's first check still queues behind every hard caller: aging counts only later arrivals passing it (AUDIT-26 #1, high). Give a caller with no completed check a bounded wait regardless of arrival order. Start the default executor's workers when a `Verifier` is built, not on the first check (AUDIT-26 #3); preload `__main__`'s imports once instead of per boot, or document and measure why not (AUDIT-26 #4); detect an unguarded `__main__` and fail with a clear error, not a timeout (AUDIT-25 #1, AUDIT-26 #5). Pin that a cancelled slow check keeps its slow place (AUDIT-28 #2) and replace the absolute 0.8 s judges test with the calibrated one (AUDIT-28 #3). **Flip:** those repros. **Verify:** as SG31, plus `make test` green 5 times under load.
+- **SG33 Probe budget per reply.** SG28 caps one declaration's arity, not a reply's total probe work: 100 declarations at the cap make 6 800 parses and block the loop 1.8–3.2 s, and nested sorts parse in quadratic time (AUDIT-26 #2, high). Bound total probe work and sort nesting depth per reply (`Final` constants, rejected with a reason the formalizer retry can use). **Flip:** AUDIT-26 #2 repros. **Verify:** `uv run pytest tests/audit/test_audit_22.py tests/audit/test_audit_26.py tests/unit/verification -q` · error injection · bench.
+
+Medium and low round-7 findings not folded in above stay in the AUDIT files. AUDIT-21 #1 / AUDIT-23 #1 (medium) is still open. AUDIT-10 #4 is now counted, not timed (AUDIT-28 #8).
+### Audit round 8 → SG34
+
+Round 8 (AUDIT-29..32, fresh agents, base `f09ea60`) found 0 critical and 1 high finding. Soundness held: no stale, out-of-turn or dead-worker reply came back VALID in stress runs, and SG33's budget only refuses. Repros are strict xfails in `tests/audit/test_audit_{29..32}.py`.
+
+- **SG34 Runs that start together; fork safety.** A newcomer still queues behind hard runs that started together: a 10-step easy verify beside 16 hard runs takes 20.3 s against 0.04 s alone, and in the orchestrator every node and retry runs in a fresh task, so this is the normal case (AUDIT-30 #1, high; AUDIT-32 #8). Bound a newcomer's wait by elapsed time behind hard checks, not arrival order among newcomers, keeping SG30/SG32's no-starvation guarantees. Also: a process forked after a `Verifier` is built must start its own workers and never reuse the parent's (AUDIT-29 #1, AUDIT-30 #2, medium, an SG32 regression found by two auditors). **Flip:** AUDIT-30 #1 ×2, #2, AUDIT-29 #1. **Verify:** `make lint typecheck test` · `make test` green 5 times under load · error injection (34/34, 26/26) · bench.
+
+Medium and low round-8 findings not folded in above stay in the AUDIT files, among them `worker_died` on a non-final step still passing the trace (AUDIT-31 #1), the unpinned forkserver preload and boot-timeout fault (AUDIT-32 #1, #2), probe charges for repeated vocabulary (AUDIT-29 #2) and merge cost growing with vocabulary size (AUDIT-30 #3). AUDIT-21 #1 / AUDIT-23 #1 (medium) is still open.
+### Audit round 9 → SG35
+
+Round 9 (AUDIT-33..36, fresh agents, base `10ae977`) found 0 critical and 1 high finding. Soundness held: no stopped-and-rerun or forked check returned a wrong VALID in stress runs. Repros are strict xfails in `tests/audit/test_audit_{33..36}.py`.
+
+- **SG35 Stopped newcomers keep their place; fork exit safety.** A newcomer stopped on a lent place to let a short caller in is re-queued at the hard rank with a new arrival number, so it goes to the back of the hard queue: a 150 ms check waited 18.7–20.5 s at the default timeout, against 5.4–8.5 s before SG34; the stop rule also counts worker boot time (AUDIT-34 #1, high). A stopped check must keep its arrival order and rank ahead of hard runs that arrived after it, and boot time must not count toward a stop. Keep Z3 checks within slots plus slow places so lent places do not oversubscribe the CPUs (AUDIT-34 #2). Restore the strength of the two retuned SG34 tests (AUDIT-34 #3, AUDIT-36 #9). Also: a forked child that exits normally SIGTERMs the parent's workers through multiprocessing's `_children`; the child must drop them (AUDIT-35 #1, AUDIT-36 #1, medium, found by two auditors), with a fork test that exits via `sys.exit`. **Flip:** AUDIT-34 #1 ×2, #2, #3, AUDIT-35 #1, AUDIT-36 #1. **Verify:** `make lint typecheck test` · `make test` green 5 times under load · error injection (34/34, 26/26) · bench.
+
+Medium and low round-9 findings not folded in above stay in the AUDIT files, among them fork during a worker start (AUDIT-33 #1, #2), unpinned at-fork lock resets and stop rules (AUDIT-36 #2, #6), `run` calling `fn` twice (AUDIT-35 #2) and the doubled xfail count from a leaked event loop (AUDIT-36 #8). AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1 (medium) are still open.
+### Audit round 10: no critical or high findings
+
+Round 10 (AUDIT-37..40, fresh agents, base `1e537af`) found 0 critical and 0 high findings, so the audit loop ends here. Soundness held: no stopped, kept or forked check returned a wrong verdict in stress runs. SG35 fixed AUDIT-34 #1 (a stopped 150 ms check waits 3.4–8.4 s, the pre-SG34 spread) and the fork-exit kill; all five flipped repros fail on `6c16dce`. Coverage on `verification/` is 97.7%.
+
+Open for the owner: AUDIT-34 #2 / AUDIT-38 #2 (lent places run 5.1–5.6 Z3 checks on 4 CPUs). SG35 found no CPU bound that keeps AUDIT-30 #1 and SG30's aging; AUDIT-38 prototyped pausing the lender's worker (SIGSTOP), which kept both at a mean of 3.9–4.0 but spends paused checks' wall-clock budget. Other medium findings stay in the AUDIT files: a newcomer that gave way waits the pre-SG34 time (AUDIT-38 #1), untested waiting-slot rule (AUDIT-40 #2), two load-sensitive tests (AUDIT-40 #5, #6), fork during a worker start (AUDIT-33 #1, #2, AUDIT-37 #1, AUDIT-38 #3, AUDIT-39 #2), AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -433,9 +484,19 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-9..12 | Round 3, on SG11–SG14 |
 | AUDIT-13..16 | Round 4, on SG15–SG19 |
 | AUDIT-17..20 | Round 5, on SG20–SG23 |
+| AUDIT-21..24 | Round 6, on SG24–SG27 |
+| AUDIT-25..28 | Round 7, on SG28–SG30 |
+| AUDIT-29..32 | Round 8, on SG31–SG33 |
+| AUDIT-33..36 | Round 9, on SG34 |
+| AUDIT-37..40 | Round 10, on SG35 |
 
 ## Log
 
+- 2026-10-22: audit round 10 done (0 critical, 0 high); the audit loop ends. Soundness held; CPU oversubscription from lent places (AUDIT-34 #2) waits on the owner.
+- 2026-10-22: audit round 9 done (0 critical, 1 high); SG35 added. Soundness held; the high is a stopped newcomer going to the back of the hard queue.
+- 2026-10-21: audit round 8 done (0 critical, 1 high); SG34 added. Soundness held; the high is newcomers queueing behind runs that started together.
+- 2026-10-21: audit round 7 done (0 critical, 3 high); SG31–SG33 added. No wrong trace admitted; the highs are a stale-reply guard, newcomer queueing and total probe work.
+- 2026-10-20: audit round 6 done (1 critical, 4 high); SG28–SG30 added. Soundness held; the remaining highs are solver timing and the probe cost, and SG29 moves checks into worker processes.
 - 2026-10-20: audit round 5 done (1 critical, 9 high); SG24–SG27 added. No wrong trace admitted by the verifier; the Design figure guard is replaced by an independent estimate (SG25).
 - 2026-10-20: audit round 4 done (2 critical, 7 high); SG20–SG23 added. AUDIT-9 #1 and AUDIT-12 #1 reopened.
 - 2026-10-20: audit round 3 done (1 critical, 7 high); SG15–SG19 added. AUDIT-5 #2 reopened by AUDIT-12 #1.

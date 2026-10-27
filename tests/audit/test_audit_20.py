@@ -279,7 +279,7 @@ def test_the_entailment_check_gets_the_time_left_not_the_initial_budget(
 
     monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3.Solver, "check", slow_check)
-    out = Z3Solver(2.0).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(2.0)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     assert out.verdict == "VALID"
     assert len(timeouts) == 2
     assert timeouts[1] <= timeouts[0] - 250
@@ -300,9 +300,7 @@ def test_the_entailment_check_asserts_the_negated_claim_instead_of_assuming_it(
 
     monkeypatch.setattr(z3.Solver, "check", check)
     decls = "(declare-const x Int)"
-    out = Z3Solver(5.0).check_entailment(
-        [SmtFormula(decls, "(> x 1)")], SmtFormula(decls, "(> x 0)")
-    )
+    out = Z3Solver(5.0)._check_here([SmtFormula(decls, "(> x 1)")], SmtFormula(decls, "(> x 0)"))
     assert out.verdict == "VALID"
     assert calls == [0, 0]
 
@@ -326,7 +324,7 @@ def test_the_audit_14_1_timeout_repro_reaches_the_entailment_check(
         return real_check(self, *args)
 
     monkeypatch.setattr(z3.Solver, "check", check)
-    out = Z3Solver(timeout_s).check_entailment(premises, claim)
+    out = Z3Solver(timeout_s)._check_here(premises, claim)
     assert out.reason == "timeout"
     # Before SG26: 1 call. The guard returned (or, on a slow run, the consistency check
     # itself timed out); either way no entailment check was timed.
@@ -368,7 +366,7 @@ def _guarded_run(
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3.Solver, "check", check)
     monkeypatch.setattr(z3.Solver, "from_string", parse)
-    out = Z3Solver(budget_s).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(budget_s)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     return out, len(calls)
 
 

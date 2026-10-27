@@ -1,14 +1,16 @@
-"""SG27: long premise pools are loaded one formula at a time (AUDIT-18 #3, #7).
+"""SG27: long Real premise pools are loaded one formula at a time (AUDIT-18 #3, #7).
 
-Counters and fake clocks, no wall clocks; the AUDIT-18 #3 repros time the real thing.
-Loading must reach the verdict the one-call path reaches on every input.
+Since SG29 checks run in worker processes; these tests run `_solve`, the code the
+worker runs, in this process (`Z3Solver._check_here`) so they can count Z3 calls
+and fake the clock. Counters and fake clocks, no wall clocks; the AUDIT-18 #3
+repros time the real thing. Loading must reach the verdict the one-call path
+reaches on every input.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
 from typing import Final
 
 import pytest
@@ -21,6 +23,7 @@ from tests.fixtures.golden_traces import ALL, build
 
 _LONG: Final = solver_mod._LOAD_ABOVE + 20
 """Premises in a pool that is loaded one formula at a time."""
+_DOCUMENTED_RESET_SHARE: Final = 0.9
 
 
 def _chain(n: int, claim: str = "(> r0 0.0)") -> tuple[list[SmtFormula], SmtFormula]:
@@ -55,11 +58,9 @@ def counts(monkeypatch: pytest.MonkeyPatch) -> _Counts:
     return seen
 
 
-@pytest.fixture
-def load_everything(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Load every pool one formula at a time, however short."""
-    monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 0)
-    yield
+def _load_everything(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Load every pool one formula at a time, however short and whatever its sorts."""
+    monkeypatch.setattr(solver_mod, "_loaded", lambda smt2, premises: True)
 
 
 # --- what is loaded, and how often it is checked ------------------------------------------
@@ -67,7 +68,7 @@ def load_everything(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def test_a_long_pool_is_checked_between_formulas_then_twice_as_a_whole(counts: _Counts) -> None:
     premises, claim = _chain(_LONG + 1)
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("INVALID", "not_entailed")
     assert "r0" in out.counter_model
     # Every premise and the claim's definition, each but the first after a check.
@@ -78,7 +79,7 @@ def test_a_long_pool_is_checked_between_formulas_then_twice_as_a_whole(counts: _
 def test_a_pool_at_the_limit_is_asserted_in_one_call(counts: _Counts) -> None:
     premises, claim = _chain(solver_mod._LOAD_ABOVE + 1)
     assert len(premises) == solver_mod._LOAD_ABOVE
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert out.verdict == "INVALID"
     assert (counts.loading, counts.checks) == (0, 2)
 
@@ -86,7 +87,7 @@ def test_a_pool_at_the_limit_is_asserted_in_one_call(counts: _Counts) -> None:
 def test_loading_stops_at_the_first_inconsistent_prefix(counts: _Counts) -> None:
     premises, claim = _chain(_LONG)
     premises.insert(3, SmtFormula("", "(< r0 r3)"))  # r0 > r1 + 1 > r2 + 2 > r3 + 3
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("INVALID", "premises_inconsistent")
     assert counts.loading == 4  # the check after the 4th formula sees it
     assert counts.checks == 0
@@ -95,7 +96,7 @@ def test_loading_stops_at_the_first_inconsistent_prefix(counts: _Counts) -> None
 def test_an_inconsistency_in_the_last_premise_is_found(counts: _Counts) -> None:
     premises, claim = _chain(_LONG)
     premises.append(SmtFormula("", f"(< r0 r{_LONG - 1})"))
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("INVALID", "premises_inconsistent")
 
 
@@ -103,14 +104,14 @@ def test_a_malformed_late_premise_is_reported_before_any_check(counts: _Counts) 
     premises, claim = _chain(_LONG)
     premises.insert(1, SmtFormula("", "false"))
     premises.append(SmtFormula("", "(> r0 undeclared)"))
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("UNGROUNDED", "formalization_failed")
     assert (counts.loading, counts.checks) == (0, 0)
 
 
 def test_a_long_pool_that_entails_its_claim_is_valid(counts: _Counts) -> None:
     premises, claim = _chain(_LONG, claim=f"(> r0 (+ r{_LONG - 1} {_LONG - 2}.0))")
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("VALID", "entailed")
 
 
@@ -140,31 +141,26 @@ def test_loading_stops_once_the_deadline_passes(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(_LONG)
-    out = Z3Solver(1.0).check_entailment(premises, claim)
+    out = Z3Solver(1.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
     assert loads[0] == 2
 
 
-def test_loading_stops_when_interrupted(monkeypatch: pytest.MonkeyPatch) -> None:
-    interrupt = solver_mod._Interrupt()
-    loads = [0]
-    real_load = z3.Z3_solver_check
+def test_a_long_pool_without_reals_is_asserted_in_one_call(counts: _Counts) -> None:
+    # Int and Boolean pools are cheapest in one call (AUDIT-22 #2).
+    decls = "\n".join(f"(declare-const b{i} Int)" for i in range(_LONG))
+    premises = [SmtFormula("", f"(> b{i} (+ b{i + 1} 1))") for i in range(_LONG - 1)]
+    out = Z3Solver(30.0)._check_here(premises, SmtFormula(decls, "(> b0 0)"))
+    assert (out.verdict, out.reason) == ("INVALID", "not_entailed")
+    assert (counts.loading, counts.checks) == (0, 2)
 
-    def load(ctx: object, solver: object) -> int:
-        loads[0] += 1
-        if loads[0] == 3:
-            interrupt.request()
-        return int(real_load(ctx, solver))
 
-    monkeypatch.setattr(z3, "Z3_solver_check", load)
-    premises, claim = _chain(_LONG)
-    solver_mod._worker.interrupt = interrupt
-    try:
-        out = Z3Solver(30.0).check_entailment(premises, claim)
-    finally:
-        solver_mod._worker.interrupt = None
-    assert out is solver_mod._INTERRUPTED
-    assert loads[0] == 3
+def test_only_long_real_pools_are_loaded() -> None:
+    real = "(declare-const r Real)\n(assert (> r 0.0))"
+    assert solver_mod._loaded(real, solver_mod._LOAD_ABOVE + 1)
+    assert not solver_mod._loaded(real, solver_mod._LOAD_ABOVE)
+    assert not solver_mod._loaded("(declare-const r Int)", solver_mod._LOAD_ABOVE + 1)
+    assert not solver_mod._loaded("(declare-const Reals Int)", solver_mod._LOAD_ABOVE + 1)
 
 
 def test_a_loading_check_never_gets_much_more_than_the_time_left(
@@ -188,7 +184,7 @@ def test_a_loading_check_never_gets_much_more_than_the_time_left(
 
     def load(ctx: object, solver: object) -> int:
         left_ms = int((deadline - clock.now) * solver_mod._MS_PER_S)
-        if limit[0] > left_ms / solver_mod._RESET_SHARE + 1:
+        if limit[0] > left_ms / _DOCUMENTED_RESET_SHARE + 1:  # not the constant (AUDIT-24 #5)
             over.append((limit[0], left_ms))
         clock.now += timeout_s / 100
         return int(real_load(ctx, solver))
@@ -197,10 +193,40 @@ def test_a_loading_check_never_gets_much_more_than_the_time_left(
     monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(_LONG)
-    out = Z3Solver(timeout_s).check_entailment(premises, claim)
+    out = Z3Solver(timeout_s)._check_here(premises, claim)
     assert out.reason == "timeout"
     assert over == []
     assert sets[0] < 30  # about log(100) / log(1 / 0.9), not one per check
+
+
+def test_every_loading_check_runs_under_a_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AUDIT-24 #4: a limit is set before the first loading check, and every later one.
+    limits: list[int] = []
+    unlimited: list[int] = []
+    real_set, real_load = z3.Solver.set, z3.Z3_solver_check
+
+    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
+        if args and args[0] == "timeout":
+            limits.append(int(str(args[1])))
+        real_set(self, *args, **kwargs)
+
+    def load(ctx: object, solver: object) -> int:
+        if not (limits and 0 < limits[-1] <= 30_000):
+            unlimited.append(1)
+        return int(real_load(ctx, solver))
+
+    monkeypatch.setattr(z3.Solver, "set", record)
+    monkeypatch.setattr(z3, "Z3_solver_check", load)
+    premises, claim = _chain(_LONG)
+    assert Z3Solver(30.0)._check_here(premises, claim).reason == "not_entailed"
+    assert limits and unlimited == []
+
+
+def test_the_audit_18_3_pool_is_loaded_one_formula_at_a_time(counts: _Counts) -> None:
+    # AUDIT-24 #6: pinned in premises, not relative to `_LOAD_ABOVE`.
+    premises, claim = _chain(1000, claim="true")
+    assert Z3Solver(30.0)._check_here(premises, claim).verdict == "VALID"
+    assert counts.loading == 999
 
 
 # --- the premise check (claim `true`) needs no entailment check (AUDIT-18 #7) ------------
@@ -209,11 +235,11 @@ def test_a_loading_check_never_gets_much_more_than_the_time_left(
 def test_a_premise_check_is_decided_by_its_consistency_check(counts: _Counts) -> None:
     decls = "(declare-const p Bool)\n(declare-const q Bool)"
     premises = [SmtFormula(decls, "p"), SmtFormula(decls, "(=> p q)")]
-    out = Z3Solver(5.0).check_entailment(premises, SmtFormula(decls, " true "))
+    out = Z3Solver(5.0)._check_here(premises, SmtFormula(decls, " true "))
     assert (out.verdict, out.reason) == ("VALID", "entailed")
     assert counts.checks == 1
     premises.append(SmtFormula(decls, "(not q)"))
-    out = Z3Solver(5.0).check_entailment(premises, SmtFormula(decls, "true"))
+    out = Z3Solver(5.0)._check_here(premises, SmtFormula(decls, "true"))
     assert (out.verdict, out.reason) == ("INVALID", "premises_inconsistent")
 
 
@@ -231,10 +257,10 @@ def test_a_premise_check_with_little_time_left_is_still_valid(
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3.Solver, "check", check)
     decls = "(declare-const p Bool)"
-    out = Z3Solver(1.0).check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "true"))
+    out = Z3Solver(1.0)._check_here([SmtFormula(decls, "p")], SmtFormula(decls, "true"))
     assert (out.verdict, out.reason) == ("VALID", "entailed")
     # Any other claim still gets the guard.
-    out = Z3Solver(1.0).check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
+    out = Z3Solver(1.0)._check_here([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
     assert out.details == "too little time left for the entailment check"
 
 
@@ -264,7 +290,7 @@ _CASES: Final[dict[str, tuple[list[tuple[str, str]], tuple[str, str]]]] = {
 def _outcome(case: str) -> SolverOutcome:
     premises, (decls, claim) = _CASES[case]
     pool = [SmtFormula(d, a) for d, a in premises]
-    out = Z3Solver(30.0).check_entailment(pool, SmtFormula(decls, claim))
+    out = Z3Solver(30.0)._check_here(pool, SmtFormula(decls, claim))
     return SolverOutcome(out.verdict, out.reason, counter_model=str(bool(out.counter_model)))
 
 
@@ -273,7 +299,7 @@ def test_loading_reaches_the_verdict_of_the_one_call_path(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     once = _outcome(case)
-    monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 0)
+    _load_everything(monkeypatch)
     assert _outcome(case) == once
 
 
@@ -290,8 +316,10 @@ async def _verdicts() -> list[tuple[float, list[tuple[str, str | None]]]]:
 async def test_loading_every_pool_keeps_every_golden_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # In this process, so that the patch reaches every check of every verify.
+    monkeypatch.setattr(Z3Solver, "check_entailment", Z3Solver._check_here)
     once = await _verdicts()
-    monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 0)
+    _load_everything(monkeypatch)
     assert await _verdicts() == once
 
 
