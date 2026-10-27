@@ -51,7 +51,8 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 | SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
 | SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (PR pending); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
-| SG36 | Pause the lending check's worker (AUDIT-34 #2, #3, AUDIT-38 #1, #2, AUDIT-40 #5, #6) | owner's choice after audit round 10 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/` | done (PR pending); the 5 loaded runs are not yet green (see Result) |
+| SG36 | Pause the lending check's worker (AUDIT-34 #2, #3, AUDIT-38 #1, #2, AUDIT-40 #5, #6) | owner's choice after audit round 10 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/` | done (PR pending); loaded runs since repeated: 4 of 5 green twice, misses in tests SG36 does not change |
+| SG37 | Bound paused checks (AUDIT-42 #1, #2, AUDIT-41 #1, AUDIT-43 #2, #3) | audit round 11 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | open |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -478,6 +479,13 @@ Open for the owner: AUDIT-34 #2 / AUDIT-38 #2 (lent places run 5.1–5.6 Z3 chec
 
 Result: done (ADR 0009, SG36 amendment). One lender is frozen per lent place, longest stuck first. Z3's own timeout is wall-clock and runs on through a SIGSTOP, so a watchdog thread in the worker interrupts the check on a clock that excludes paused time. A newcomer that gives way is paused, not killed, so `fn` runs once (AUDIT-35 #2, AUDIT-39 #3 pass too). Until it shows it is hard it stays lendable, and it gives way again as soon as a short caller queues. Measured (`audit_load_10`, 2 + 2 places): 3.0–3.8 Z3 processes run on average, over 4 in 0–1 % of samples (5.1–5.6 before); a 150 ms newcomer at 5 s waits 0.17–0.18 s (3.4–8.4 s before); no check is re-run and no worker restarted. AUDIT-34 #2's in-flight repros were adapted to count calls whose worker is not paused, not retired; AUDIT-38 #2's /proc test passes 3 of 3. AUDIT-40 #2's test already exists in `test_audit_40.py` and passes. Costs: a frozen check holds a worker process and a pool thread; a step's `bench_verifier` p50 is 6.10 ms (5.83 ms before). Without SIGSTOP (not POSIX), nothing is paused. Open: `make test` under 4 CPU burners failed in 1–2 of 5 runs, three rounds in a row, on load-sensitive tests. These were hardened, and the last failure, a reaped worker raising `ProcessLookupError` on SIGCONT, was a real race and is fixed; the 5 loaded runs have not been repeated since.
 
+### Audit round 11 → SG37
+
+Round 11 (AUDIT-41..44, fresh agents, base `3d2d7b4`) found 0 critical and 3 high findings. Soundness held: no paused, resumed, cancelled or forked check returned a wrong verdict (349 pauses in stress runs). SG36's CPU bound holds in steady state (mean 3.0–3.8 Z3 processes on 4 CPUs). Repros are strict xfails in `tests/audit/test_audit_{41..44}.py`.
+
+- **SG37 Bound paused checks.** Nothing limits how long a lender stays paused: paused time is not budget, so beside a stream of short callers a 1.0 s check is not done after 10 s (1.00 s before SG36), and the slot it keeps holds up every hard caller behind it (AUDIT-42 #1, high; AUDIT-41 #1). A newcomer paused after it shows it is hard keeps its worker and pool thread, so 64 new tasks peak at 48–50 processes and 1.2–1.3 GB (6 and 0.2 GB before) (AUDIT-42 #2, high; AUDIT-43 #2). Bound a lender's paused time (age lenders, or alternate the pause) and the number of paused newcomers (past the cap, stop and re-queue as SG35 did), keeping SG36's CPU bound, AUDIT-30 #1 and SG30's aging. Also: the slot handed on when a lender ends while its place is lent (AUDIT-43 #3), one shared watchdog thread instead of one per check (AUDIT-42 #4), and keep AUDIT-44 #13's lent-place guard test (high, now covered). **Flip:** AUDIT-42 #1, #2, #4, AUDIT-41 #1, AUDIT-43 #2, #3. **Verify:** `make lint typecheck test` · `make test` ×5 under 4 CPU burners · error injection (34/34, 26/26) · bench.
+
+Medium and low round-11 findings not folded in above stay in the AUDIT files, among them a newcomer that gives way to every short caller in a stream (AUDIT-42 #3, not a regression), non-POSIX growth (AUDIT-43 #4), stale docs (AUDIT-43 #5) and the AUDIT-44 survivors now killed by its plain tests. AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1 (medium) are still open.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -497,9 +505,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-29..32 | Round 8, on SG31–SG33 |
 | AUDIT-33..36 | Round 9, on SG34 |
 | AUDIT-37..40 | Round 10, on SG35 |
+| AUDIT-41..44 | Round 11, on SG36 |
 
 ## Log
 
+- 2026-10-27: audit round 11 done (0 critical, 3 high); SG37 added. Soundness held; the highs are unbounded pauses and paused workers piling up.
 - 2026-10-27: SG36 done (PR pending): a lending slot's worker is paused (SIGSTOP), so Z3 checks stay within slots plus slow places; paused time is not budget.
 - 2026-10-22: audit round 10 done (0 critical, 0 high); the audit loop ends. Soundness held; CPU oversubscription from lent places (AUDIT-34 #2) waits on the owner.
 - 2026-10-22: audit round 9 done (0 critical, 1 high); SG35 added. Soundness held; the high is a stopped newcomer going to the back of the hard queue.
