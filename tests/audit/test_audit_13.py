@@ -11,7 +11,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import pytest
-import z3
 
 from autolab.agents.common import design_claim, design_facts
 from autolab.agents.design import DesignAgent, build_design_prompt, build_design_trace_prompt
@@ -32,16 +31,20 @@ from autolab.state.models import (
 )
 from autolab.state.schema import AutoLabState, empty_state
 from autolab.verification.faithfulness import faithfulness_prompt
-from autolab.verification.formalizer import FormalizationError, Vocabulary, prompt_for
+from autolab.verification.formalizer import (
+    FormalizationError,
+    Formalizer,
+    Vocabulary,
+    prompt_for,
+)
 from autolab.verification.llm import FakeLLMClient
-from autolab.verification.solver import SmtFormula
 from autolab.verification.vericot import Verifier
 from tests.fixtures.agent_helpers import register_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator import test_graph as tg
 
 
-def _register_steps(
+async def _register_steps(
     fake: FakeLLMClient,
     steps: Sequence[ReasoningStep],
     formulas: Sequence[tuple[str, str]],
@@ -51,28 +54,32 @@ def _register_steps(
     """Register each step's formalization and an honest judge verdict (faithful).
 
     The judge is shown the step's claim, the vocabulary so far and the assertion;
-    each assertion below states its claim under those declarations.
+    each assertion below states its claim under those declarations. A shadow
+    `Formalizer` decides which steps are accepted, so the registration follows
+    the formalizer under test (AUDIT-20 #2).
     """
-    vocab = Vocabulary()
+    shadow = FakeLLMClient()
+    formalizer = Formalizer(shadow)
     for fact in facts:
-        vocab.merge(fact.declarations)
+        formalizer.vocabulary.merge(fact.declarations)
     for step, (decls, assertion) in zip(steps, formulas, strict=True):
-        fake.register(
-            "formalize",
-            prompt_for(step, vocab),
-            json.dumps({"declarations": decls, "assertion": assertion}),
-        )
-        candidate = vocab.merged(decls)
-        z3.parse_smt2_string(f"{candidate.smt()}\n(assert {assertion})", ctx=z3.Context())
+        prompt = prompt_for(step, formalizer.vocabulary)
+        reply = json.dumps({"declarations": decls, "assertion": assertion})
+        fake.register("formalize", prompt, reply)
+        shadow.register("formalize", prompt, reply)
+        # As in the verifier, a rejected step is not judged and does not extend the vocabulary.
+        try:
+            formula = await formalizer.formalize(step)
+        except FormalizationError:
+            continue
         fake.register(
             "faithfulness",
-            faithfulness_prompt(step, SmtFormula(candidate.smt(), assertion)),
+            faithfulness_prompt(step, formula),
             json.dumps({"back_translation": step.claim, "faithful": True, "explanation": ""}),
         )
-        vocab = candidate
 
 
-def _register(
+async def _register(
     fake: FakeLLMClient, steps: Sequence[GoldenStep], *, facts: Sequence[FormalizedStep] = ()
 ) -> ReasoningTrace:
     reasoning = tuple(
@@ -84,7 +91,9 @@ def _register(
         )
         for i, gs in enumerate(steps)
     )
-    _register_steps(fake, reasoning, [(gs.declarations, gs.assertion) for gs in steps], facts=facts)
+    await _register_steps(
+        fake, reasoning, [(gs.declarations, gs.assertion) for gs in steps], facts=facts
+    )
     return ReasoningTrace(agent="audit", steps=reasoning)
 
 
@@ -107,10 +116,9 @@ ACTIVE = "Compound K-17 is active"
 # predicate (AUDIT-5 #1 / AUDIT-9 #1 again).
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #1")
 async def test_shadowed_equals_hides_a_premise_that_contradicts_a_measurement() -> None:
     fake = FakeLLMClient()
-    trace = _register(
+    trace = await _register(
         fake,
         [
             # Contradicts the measured fact absorbance = 0.42. When step 0 is
@@ -142,7 +150,6 @@ async def test_shadowed_equals_hides_a_premise_that_contradicts_a_measurement() 
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #1")
 @pytest.mark.parametrize(
     "decl",
     [
@@ -164,10 +171,9 @@ def test_vocabulary_rejects_builtins_that_only_exist_with_arguments(decl: str) -
 # and the parse check see Z3's `false`; the checks see the premise's term.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #2")
 async def test_named_premise_cannot_redefine_false_for_later_steps() -> None:
     fake = FakeLLMClient()
-    trace = _register(
+    trace = await _register(
         fake,
         [
             # The proposition asserted is `plate_read`; `:named` only labels it.
@@ -202,13 +208,12 @@ async def test_named_premise_cannot_redefine_false_for_later_steps() -> None:
     assert not _passes(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #2")
 async def test_named_prior_hypothesis_cannot_hide_a_contradiction() -> None:
     prior = Hypothesis(question=tg.QUESTION, statement=ACTIVE, rationale="r")
     new = Hypothesis(question=tg.QUESTION, statement="Compound K-17 is not active", rationale="r")
     trace = contradiction_trace([prior], new)
     fake = FakeLLMClient()
-    _register_steps(
+    await _register_steps(
         fake,
         trace.steps,
         [
@@ -232,7 +237,6 @@ async def test_named_prior_hypothesis_cannot_hide_a_contradiction() -> None:
 # takes far more, and the cost/duration pause (principle 7b) never fires.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-13 #3")
 @pytest.mark.parametrize(
     "protocol",
     [

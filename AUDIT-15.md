@@ -44,6 +44,8 @@
 
 **Fix.** Sanitize with `re.sub(r"[^A-Za-z0-9_]", "_", name)` (or `re.ASCII`), so a non-ASCII name takes the hashed `paramx_` form; apply the same to `_symbol`, prefixing a non-letter start. Add a test that every `design_facts` / `measurement_facts` declaration merges into an empty `Vocabulary`.
 
+**Resolution (SG21).** `_param_symbol` keeps `param_<name>` only for an ASCII `[A-Za-z0-9_]+` name; any other name becomes `paramx_<ascii>_<sha256[:12]>`. `_symbol` keeps a measurement name only if it is an ASCII identifier starting with a letter and not with `m_`; any other name becomes `m_<ascii>_<sha256[:12]>`, so the two forms cannot meet. Both are plain identifiers and stay injective up to the hash. Tests merge the facts for `volume_µL`, `OD₆₀₀`, `température` and look-alike ASCII names into one `Vocabulary`. Both repros are flipped with their assertions unchanged.
+
 ## 2. Medium: the formalize prompts do not state SG15's rules
 
 **Impact.**
@@ -54,6 +56,8 @@
 **Repro.** `test_formalize_prompt_states_the_identifier_and_single_term_rules`.
 
 **Fix.** Add one sentence to `SYSTEM_PROMPTS["formalize"]`: "Name every symbol with a plain identifier `[A-Za-z_][A-Za-z0-9_]*` that is not an SMT-LIB or Z3 builtin (for example not `map`, `union`, `default`); never use `|quoted|` symbols or `;` comments."
+
+**Resolution (SG20).** `prompt_for` now lists what the formalizer rejects: names that are not plain identifiers `[A-Za-z_][A-Za-z0-9_]*`, `|quoted|` symbols, SMT-LIB reserved words and Z3 builtins with or without arguments (with examples), a name an earlier step used, anything but declare-const/declare-fun/declare-sort lines, and in the assertion SMT commands, a second term, `!` annotations, `|` and `;`. `SYSTEM_PROMPTS["formalize"]` is in `verification/llm.py` (an SG0 interface) and is unchanged. The repro passes as a plain test.
 
 ## 3. Medium: `protocol_figures` reads Svedberg units as durations
 
@@ -67,6 +71,8 @@
 
 **Fix.** Require whitespace or a longer unit for seconds (`\d+\s+s\b`, `sec`, `secs`, `seconds`) and keep the case-sensitive `S` out, or exclude `\d+S\b` explicitly. Give the figures rejection its own trigger (`policy` or `figures`) or route it to a retry with the reason as feedback, since the model can fix it.
 
+**Resolution (SG21).** Single-letter and two-letter units match in their own case only, so `16S`, `70S`, `30S` (and `3D`, `5 M`, `MS`) are not durations; the repro is flipped unchanged. Not done: the retry half. The monitor retries a `verification` request only when `decide(history[-1])` is RETRY (`orchestrator/routing.py`), and the verdict of a design rejected for figures passes. Retrying it needs a change in `orchestrator/` (for example, retry a `figures` trigger with the request reason as feedback), which SG21 may not touch. It still escalates to a human.
+
 ## 4. Medium: a string parameter carries a cost or duration into the bound claim
 
 **Impact.**
@@ -78,6 +84,8 @@
 
 **Fix.** Run `protocol_figures` over every free-text field that reaches `design_claim` (string parameter values and units), or over the whole claim minus the code-built `name = value` parts. Mention parameters in `PROTOCOL_FIGURES_RULE`.
 
+**Resolution (SG21).** `design_figures` runs `protocol_figures` over the protocol and over every parameter's name and `value unit` text, numeric values included. `DesignAgent` rejects a match in either and names it in the request (`parameters state cost or duration figures [...]`). `PROTOCOL_FIGURES_RULE` now names parameters. The repro is flipped with its assertions unchanged.
+
 ## 5. Medium: a premise whose term starts with `(assert…` is dropped
 
 **Impact.**
@@ -88,6 +96,8 @@
 **Repro.** `test_a_premise_whose_predicate_starts_with_assert_is_kept`: `(assertive 1)` does not entail `(assertive 1)`.
 
 **Fix.** Always wrap: `_wrap_assert` should return `f"(assert {body})"`. The `(assert` branch is dead for every formalized step since SG15, and `vericot` never passes one.
+
+**Resolution (SG22).** `_wrap_assert` always returns `(assert <body>)`. The repro passes as a plain test with its assertion unchanged.
 
 ## 6. Low: the dashboard drops the `hitl` event's agent and note
 

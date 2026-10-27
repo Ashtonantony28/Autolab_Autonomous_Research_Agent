@@ -75,6 +75,8 @@ RegEx; one to three arguments). See the note below for the result.
    followed by a use of N parses to a different AST from the same use without the
    declaration, over a small set of signatures.
 
+**Resolution (SG20).** Two layers in `formalizer.py`. (a) Structural: `Formalizer.formalize` refuses a step that declares a new name already used as a token by an earlier step's assertion or by a vocabulary declaration. A name that an earlier step used undeclared had its meaning from Z3 (or from a local binder), so no later declaration can change how any earlier step reads, whether or not the probes know the name. With `!` refused (#2), every step parses the same under the final vocabulary as under its own. (b) Probe: `Vocabulary.merged` also parses the declared name applied to its declared argument sorts, with each Int/Real argument tried both ways, without the declaration. Z3 resolves a user function only at its declared arity, with Int and Real coerced, so these are the uses a declaration could take over. `equals`, `equiv` and `if_then_else` are refused at any signature Z3 resolves. A declared sort with parameters is probed applied to Int. The four repros pass as plain tests. Their assertions are unchanged; the `_register_steps` helper now skips a step the formalizer rejects, as SG15 did for `test_audit_9.py`. Not done: per-check declarations (item 3 of AUDIT-5/AUDIT-9 #1), which belong in `vericot.py`. Facts' assertions are built in code and are not part of the token rule.
+
 ### #2 A `:named` annotation in one step redefines the builtin `false` (and `pi`, `euler`, rounding modes) in every later step
 
 **Impact.** SG15 accepts `(! t :named n)` as a single term, and its tests pin that.
@@ -125,6 +127,8 @@ acceptance test should be flipped. If annotations are wanted later, accept only
 `:pattern` inside a quantifier and run the name checks on any symbol that follows a
 keyword. The re-parse in #1's fix 2 would catch this as well.
 
+**Resolution (SG20).** `Formalizer.formalize` refuses an assertion that contains a `!` token or any keyword token (`:named`, `:pattern`, `:weight`, ...), after the single-term check and before the merge and the parse. The SG15 test that accepted `(! p :named n)` now expects the refusal. The two repros pass as plain tests with their assertions unchanged: the `:named false` premise is UNGROUNDED/`formalization_failed`, and the contradiction trigger fails closed.
+
 ---
 
 ## High
@@ -160,6 +164,8 @@ symbol, `US dollars?`, and any ISO 4217 code or currency symbol (`\p{Sc}` via th
 rule to an allow-list. Refuse any number in the protocol that is followed (after
 optional hyphen or space) by an alphabetic token outside a list of lab units (mL, µL,
 °C, rpm, nm, mM, …), and send everything else to review.
+
+**Resolution (SG21).** `protocol_figures` is now a token scan, not one regex. It flags any currency symbol (Unicode category `Sc`, so `500$`, `US$`, `₹`), and any amount (digits, superscripts, fractions or a number word such as `four`) next to a time unit from milliseconds to years (`ms`, `s`, `min`, `h`, `d`, `wk`, `mo`, `yr`, `am`/`pm`, plurals and long forms), a currency word (`dollars`, `rupees`, `kr`, …) or an ISO 4217 code, on either side (`USD 500`, `day 14`), with spaces, hyphens, `_` or a `k`/`M`/`thousand` multiplier between them (`240-minute`, `12-hour`, `5k USD`, `500 US dollars`). It stays a rejection check: no figure is read into state. All six forms here are rejected and the repro is flipped with its assertions unchanged.
 
 ---
 

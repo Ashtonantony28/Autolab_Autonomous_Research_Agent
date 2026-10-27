@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from functools import partial
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 import z3
 
@@ -79,18 +79,13 @@ def lia_trace(n: int, *, cite: bool = False) -> GoldenTrace:
     return GoldenTrace(f"lia-{n}", "numeric chain", "VALID", (), tuple(steps))
 
 
-def _add_based_check(
-    self: Z3Solver,
-    premises: list[SmtFormula],
-    claim: SmtFormula,
-    ctx: z3.Context,
-    deadline: float,
-    interrupt: Any,
-) -> SolverOutcome:
+def _add_based_check(smt2: str, premises: int, true_claim: bool, timeout_s: float) -> SolverOutcome:
     """The pre-SG19 second check, for comparison: assert `claim!` instead of assuming it."""
+    deadline = time.monotonic() + timeout_s
+    ctx = z3.Context()
     solver = z3.Solver(ctx=ctx)
     try:
-        solver.from_string(solver_mod._build_smt2(premises, claim))
+        solver.from_string(smt2)
     except z3.Z3Exception as exc:
         return SolverOutcome("UNGROUNDED", "formalization_failed", f"SMT parse error: {exc}")
     solver.set("timeout", solver_mod._remaining_ms(deadline))
@@ -110,21 +105,32 @@ def _add_based_check(
 
 @contextmanager
 def add_based_checks() -> Iterator[None]:
-    """Temporarily run `Z3Solver` checks the pre-SG19 way (comparison only)."""
-    real = Z3Solver._check
-    Z3Solver._check = _add_based_check  # type: ignore[method-assign]
+    """Temporarily run `Z3Solver` checks the pre-SG19 way, in this process (comparison only)."""
+    real_solve, real_check = solver_mod._solve, Z3Solver.check_entailment
+    solver_mod._solve = _add_based_check
+    Z3Solver.check_entailment = Z3Solver._check_here  # type: ignore[method-assign]
     try:
         yield
     finally:
-        Z3Solver._check = real  # type: ignore[method-assign]
+        solver_mod._solve = real_solve
+        Z3Solver.check_entailment = real_check  # type: ignore[method-assign]
 
 
 def timed_check(
     premises: list[SmtFormula], claim: SmtFormula, timeout_s: float
 ) -> tuple[str, float]:
-    """(reason, wall s) of one `check_entailment` on this thread."""
+    """(reason, wall s) of one `check_entailment` from this thread (in a worker process)."""
     started = time.perf_counter()
     outcome = Z3Solver(timeout_s).check_entailment(premises, claim)
+    return outcome.reason, time.perf_counter() - started
+
+
+def core_check(
+    premises: list[SmtFormula], claim: SmtFormula, timeout_s: float
+) -> tuple[str, float]:
+    """(reason, wall s) of the check a worker would run, run in this process (`_solve`)."""
+    started = time.perf_counter()
+    outcome = Z3Solver(timeout_s)._check_here(premises, claim)
     return outcome.reason, time.perf_counter() - started
 
 
@@ -140,9 +146,9 @@ def assume_vs_add(n: int, rounds: int = 3) -> tuple[float, float]:
     premises, claim = lia_chain(n)
     now, old = [], []
     for _ in range(rounds):
-        now.append(timed_check(premises, claim, 30.0)[1])
+        now.append(core_check(premises, claim, 30.0)[1])
         with add_based_checks():
-            old.append(timed_check(premises, claim, 30.0)[1])
+            old.append(core_check(premises, claim, 30.0)[1])
     return sorted(now)[rounds // 2] * 1000, sorted(old)[rounds // 2] * 1000
 
 
