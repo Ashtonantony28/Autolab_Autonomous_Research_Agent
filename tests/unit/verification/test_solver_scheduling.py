@@ -373,6 +373,27 @@ async def test_a_newcomer_overtaken_for_every_lent_place_twice_is_lent_the_next(
     assert (slots.held, slots.lent, slots.stuck, len(slots._waiters)) == (0, 0, 0, 0)
 
 
+async def test_a_caller_queued_again_keeps_its_arrival_and_is_lent_nothing() -> None:
+    # AUDIT-34 #1: a stopped check queues again with its first arrival number, ahead of
+    # callers that arrived after it; `lend=False` keeps it off lent places.
+    slots = _Slots(1)
+    stopped = slots.arrive()
+    assert await slots.acquire(short=False) is False
+    later = await _queued(slots, short=False)
+    again = asyncio.create_task(slots.acquire(False, True, stopped, lend=False))
+    await asyncio.sleep(0)
+    assert [w.arrival for w in slots._waiters] == [stopped, stopped + 1]
+    assert slots.stick(lent=False)
+    await asyncio.sleep(0)
+    assert not again.done() and slots.lent == 0
+    slots.unstick()
+    slots.release(lent=False)
+    assert await again is False
+    assert not later.done()
+    slots.release(lent=False)
+    assert await later is False
+
+
 def test_a_lent_place_never_sticks_or_lends() -> None:
     # AUDIT-24 #3, in `_Slots` itself, whatever `run` asks.
     slots = _Slots(1)
@@ -600,11 +621,13 @@ async def test_a_short_caller_overtakes_hard_checks_above_the_slow_cap(
     assert (await executor.run(lambda: "easy"))[0] == "easy"
     assert not other.started.is_set() and not hard.gate.is_set()
 
-    async def new() -> bool:
-        await executor.run(lambda: None)
-        return other.started.is_set()
+    async def new() -> tuple[int, bool]:
+        lent, _ = await executor.run(lambda: slots.lent)
+        return lent, other.started.is_set()
 
-    assert await asyncio.create_task(new()) is False  # lent a place, as the short one
+    # Lent a place, as the short one, before the slot frees (AUDIT-36 #9).
+    assert await asyncio.create_task(new()) == (1, False)
+    assert not hard.gate.is_set()
     hard.gate.set()
     other.gate.set()
     assert await other_task == "held"
@@ -644,7 +667,7 @@ async def test_runs_that_start_together_do_not_hold_up_a_later_newcomer(
     # AUDIT-30 #1, AUDIT-32 #8: 1 slot, no slow room, its check stuck. Three runs start
     # together, all newcomers; the one lent the place shows it is hard and is stopped
     # and queued again as hard. An easy newcomer arriving after them is served next, and
-    # every stopped run is decided once the slot frees.
+    # every stopped run is decided once the slot frees, in arrival order (AUDIT-34 #1).
     executor = _executor(executors, 1, 0)
     blocker = _Held()
     slot_task = asyncio.create_task(executor.run(blocker))
@@ -668,7 +691,7 @@ async def test_runs_that_start_together_do_not_hold_up_a_later_newcomer(
     blocker.gate.set()
     assert [r for r, _ in await asyncio.gather(*tasks)] == ["decided"] * 3
     await slot_task
-    assert order == ["r0", "easy", "r2", "r1", "r0", "r2", "r1"]
+    assert order == ["r0", "easy", "r2", "r1", "r0", "r1", "r2"]
     assert all(t in executor._short for t in tasks)  # each decided at once when run again
     assert (slots.held, slots.lent, slots.stuck, executor._pool._max_workers) == (0, 0, 0, 1)
 

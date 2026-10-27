@@ -261,7 +261,16 @@ async def test_hard_runs_do_not_starve_an_easy_verify_on_one_worker() -> None:
 async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     executor = SolverExecutor(1, slow_workers=1)
     lock = threading.Lock()
-    running, peak, calls = 0, 0, 0
+    running, peak, calls, slow_peak = 0, 0, 0, 0
+    to_slow = executor._to_slow
+
+    def counted(interrupt: solver_mod._Interrupt) -> bool:
+        nonlocal slow_peak
+        moved = to_slow(interrupt)
+        slow_peak = max(slow_peak, executor._slow)
+        return moved
+
+    executor._to_slow = counted  # type: ignore[method-assign]
 
     def hard() -> solver_mod.SolverOutcome:
         nonlocal running, peak, calls
@@ -285,6 +294,7 @@ async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     assert [o.reason for o, _ in outs] == ["timeout"] * 3
     # One check in the slot and one slow check. The third, a newcomer, is lent a place
     # by the stuck slot until its check shows it is hard, then waits as a hard caller.
+    assert slow_peak == 1  # the cap, never above it (AUDIT-34 #3, AUDIT-36 #9)
     assert peak <= 3
     assert calls in (3, 4)  # 4 if the lent check was stopped and run again
     assert threads <= 3  # slot, slow check and lent place

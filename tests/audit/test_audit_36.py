@@ -179,7 +179,6 @@ def test_a_forked_child_that_ends_without_exiting_hard_never_kills_the_parents_w
 
 
 @fork_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-36 #1")
 def test_a_forked_child_that_exits_normally_never_kills_the_parents_workers() -> None:
     assert _forked("exit")["parents_idle_alive"] == [True] * 5
 

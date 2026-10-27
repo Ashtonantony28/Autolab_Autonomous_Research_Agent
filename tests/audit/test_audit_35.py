@@ -66,7 +66,6 @@ if __name__ == "__main__":
 
 
 @fork_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-35 #1")
 def test_a_forked_child_that_exits_normally_leaves_the_owners_workers_alone(
     tmp_path: Path,
 ) -> None:

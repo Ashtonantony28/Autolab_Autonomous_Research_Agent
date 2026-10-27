@@ -187,6 +187,9 @@ class Workers:
         """Forget the owner's workers without touching their processes; start afresh."""
         for worker in self._idle:
             worker.conn.close()  # this process's copy of the pipe only
+        for worker in self._live:
+            # Or this process's exit would SIGTERM them (AUDIT-35 #1, AUDIT-36 #1).
+            _children().discard(worker.process)
         self._lock = threading.Lock()
         self._idle, self._live, self._ctx = [], set(), None
         self._pid = os.getpid()
@@ -272,6 +275,13 @@ class Workers:
 
 _all: list[Workers] = []
 _made: weakref.WeakSet[Workers] = weakref.WeakSet()
+
+
+def _children() -> set[Any]:
+    """Multiprocessing's record of this process's children, whose daemons it terminates at
+    exit; a raw `os.fork` child inherits its parent's."""
+    children: set[Any] = vars(multiprocessing.process)["_children"]
+    return children
 
 
 def _forget_forkserver() -> None:
