@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,7 @@ from tests.integration.orchestrator.test_graph import (
     DESIGN,
     EXPENSIVE,
     FAILING_SUMMARY,
-    HYPOTHESIS,
     QUESTION,
-    REPORT,
     RESULT,
     FixedResultSimulator,
     _fail_design_trace,
@@ -215,10 +214,32 @@ async def test_tracer_persists_run_entities_once(store: StateStore) -> None:
     _, config, final = await run(fake, store=store)
 
     rid = run_id(config)
-    assert await store.load_hypotheses(rid) == [HYPOTHESIS]
+    assert await store.load_hypotheses(rid) == final["hypotheses"]
     assert await store.load_traces(rid) == final["reasoning_traces"]
     assert await store.load_verifications(rid) == final["verification_history"]
-    assert await store.load_reports(rid) == [REPORT]
+    assert await store.load_reports(rid) == final["analysis_reports"]
+
+
+@pytest.mark.parametrize("n", [30])
+async def test_concurrent_traced_runs_share_one_store(store: StateStore, n: int) -> None:
+    fake = FakeLLMClient()  # every run replays the same fixture replies
+    _seed_full_run(fake)
+
+    outs = await asyncio.gather(*(run(fake, store=store) for _ in range(n)), return_exceptions=True)
+
+    assert [o for o in outs if isinstance(o, BaseException)] == []
+    finals = [o for o in outs if not isinstance(o, BaseException)]
+    assert len({final["hypotheses"][0].id for _, _, final in finals}) == n
+    for _, config, final in finals:
+        rid = run_id(config)
+        assert await store.load_hypotheses(rid) == final["hypotheses"]
+        assert [e.node for e in await store.load_events(rid)] == [
+            "research",
+            "design",
+            "execute",
+            "analysis",
+        ]
+    assert len(await store.list_runs()) == n
 
 
 async def test_dashboard_renders_a_completed_run_from_the_store(store: StateStore) -> None:

@@ -3,7 +3,7 @@
 Thin glue between an `AutoLabState` snapshot and the persistence layer.
 Idempotent enough to call after every agent: we append each new entity
 once. Detecting "new" is by id — the tracer keeps a per-run set of ids
-already persisted, and the store upserts by id, so a fresh tracer after a
+already persisted, and the store upserts by `(run_id, id)`, so a fresh tracer after a
 restart does not duplicate rows either.
 
 `record_node` is what the graph calls after every agent execution: it

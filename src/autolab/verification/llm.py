@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
-from autolab.state.models import AnalysisReport, ExperimentDesign, Hypothesis, ReasoningStep
+from autolab.state.models import ReasoningStep
 
 if TYPE_CHECKING:
     from anthropic import AsyncAnthropic
@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 LLMPurpose = str
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+DEFAULT_MODEL: Final[str] = "claude-sonnet-4-6"
+"""The one model id every agent and verifier call uses unless a caller overrides it."""
 
 
 @runtime_checkable
@@ -81,7 +84,7 @@ _AGENT_ROLES: Final[dict[str, str]] = {
     "design": (
         "You are the Design agent of AutoLab. Turn the given hypothesis into one concrete, "
         "safe experiment: protocol, parameters with units, honest cost (USD) and duration "
-        "(minutes) estimates, and success criteria. Copy the given hypothesis_id exactly."
+        "(minutes) estimates, and success criteria."
     ),
     "execute": (
         "You are the Execute agent of AutoLab. The experiment has already been run on the lab "
@@ -91,7 +94,7 @@ _AGENT_ROLES: Final[dict[str, str]] = {
     "analysis": (
         "You are the Analysis agent of AutoLab. Interpret the experiment result with several "
         "ranked candidate interpretations (rank 0 is the most likely) and likelihoods in "
-        "[0, 1]. Copy the given result_id exactly."
+        "[0, 1]."
     ),
 }
 
@@ -128,25 +131,32 @@ class _TraceReply(BaseModel):
     steps: tuple[ReasoningStep, ...]
 
 
-_REPLY_SCHEMAS: Final[dict[str, type[BaseModel]]] = {
-    "research.hypothesis": Hypothesis,
-    "design.experiment": ExperimentDesign,
-    "analysis.report": AnalysisReport,
-}
-
-
 def system_prompt(purpose: LLMPurpose) -> str:
     """Return the system prompt for `purpose` (looked up by its family)."""
     return SYSTEM_PROMPTS.get(purpose.split(".", 1)[0], DEFAULT_SYSTEM_PROMPT)
 
 
 def reply_schema(purpose: LLMPurpose) -> type[BaseModel] | None:
-    """The schema a JSON-replying `call` purpose must satisfy, if any."""
-    return _TraceReply if purpose.endswith(".trace") else _REPLY_SCHEMAS.get(purpose)
+    """The schema a JSON-replying `call` purpose must satisfy, if any.
+
+    Agent payloads use `call_structured` with content-only schemas
+    (`agents.common`), so the model never sees ids or timestamps.
+    """
+    return _TraceReply if purpose.endswith(".trace") else None
+
+
+class StructuredOutputError(RuntimeError):
+    """Claude's reply has no usable content (a refusal, `max_tokens`, an empty reply)."""
 
 
 def is_live(llm: object) -> bool:
-    """True if `llm` (or the client it wraps) calls a real model."""
+    """True if `llm` calls a real model.
+
+    Wrapper contract: a decorator either declares `live` itself or keeps the
+    client it wraps in `_inner`, which this follows.
+    """
+    while not hasattr(llm, "live") and hasattr(llm, "_inner"):
+        llm = getattr(llm, "_inner", None)
     return getattr(llm, "live", False) is True
 
 
@@ -158,7 +168,9 @@ class ClaudeLLMClient:
     which constrains decoding to the schema and validates the reply with
     Pydantic. `call` routes the agents' JSON purposes (see `reply_schema`)
     through the same path and returns the validated JSON, so no agent parses
-    free-form prose. Tests only construct it with a stub client; real calls
+    free-form prose. The SDK client it builds has `max_retries=0`, since
+    `RetryingLLMClient` owns retries; an injected `client` should do the same.
+    Tests only construct it with a stub client; real calls
     are gated on `RUN_LIVE_TESTS=1` (`tests/live/`).
     """
 
@@ -169,7 +181,7 @@ class ClaudeLLMClient:
         self,
         api_key: str,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = DEFAULT_MODEL,
         max_tokens: int = 4096,
         client: AsyncAnthropic | None = None,
     ) -> None:
@@ -184,7 +196,8 @@ class ClaudeLLMClient:
         if self._client is None:
             from anthropic import AsyncAnthropic
 
-            self._client = AsyncAnthropic(api_key=self._api_key)
+            # `RetryingLLMClient` is the single retry layer.
+            self._client = AsyncAnthropic(api_key=self._api_key, max_retries=0)
         return self._client
 
     async def call(self, purpose: LLMPurpose, prompt: str) -> str:
@@ -205,7 +218,10 @@ class ClaudeLLMClient:
         for block in response.content:
             if isinstance(block, TextBlock):
                 return block.text
-        raise RuntimeError(f"Claude returned no text content for purpose={purpose!r}")
+        raise StructuredOutputError(
+            f"Claude returned no text content for purpose={purpose!r} "
+            f"(stop_reason={getattr(response, 'stop_reason', None)!r})"
+        )
 
     async def call_structured(
         self, purpose: LLMPurpose, prompt: str, schema: type[SchemaT]
@@ -214,7 +230,8 @@ class ClaudeLLMClient:
 
         Raises:
             pydantic.ValidationError: if the reply does not validate.
-            RuntimeError: if the reply has no structured output (e.g. a refusal).
+            StructuredOutputError: if the reply has no structured output (e.g. a refusal).
+            anthropic.APIError: if the request fails (`orchestrator.recovery.is_transient`).
         """
         response = await self._get_client().messages.parse(
             model=self._model,
@@ -224,11 +241,15 @@ class ClaudeLLMClient:
             output_format=schema,
         )
         if response.parsed_output is None:
-            raise RuntimeError(f"Claude returned no structured output for purpose={purpose!r}")
+            raise StructuredOutputError(
+                f"Claude returned no structured output for purpose={purpose!r} "
+                f"(stop_reason={getattr(response, 'stop_reason', None)!r})"
+            )
         return response.parsed_output
 
 
 __all__ = [
+    "DEFAULT_MODEL",
     "DEFAULT_SYSTEM_PROMPT",
     "SYSTEM_PROMPTS",
     "ClaudeLLMClient",
@@ -236,6 +257,7 @@ __all__ = [
     "LLMClient",
     "LLMPurpose",
     "SchemaT",
+    "StructuredOutputError",
     "is_live",
     "reply_schema",
     "system_prompt",
