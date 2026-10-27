@@ -1,33 +1,73 @@
-"""Conditional routing behaviour."""
+"""The `monitor` node's routing."""
 
 from __future__ import annotations
 
-from autolab.orchestrator.routing import route_after_agent
-from autolab.state.models import HITLRequest
-from autolab.state.schema import empty_state
+from uuid import uuid4
+
+from langgraph.graph import END
+
+from autolab.agents.verification_monitor import VerificationMonitor
+from autolab.orchestrator.routing import make_monitor_node
+from autolab.state.models import HITLRequest, StepVerdict, VerificationResult
+from autolab.state.schema import AutoLabState, empty_state
+
+node = make_monitor_node(VerificationMonitor(), max_retries=2)
 
 
-def test_next_when_confidence_above_threshold() -> None:
+def _vr(score: float) -> VerificationResult:
+    return VerificationResult(
+        trace_id=uuid4(),
+        step_verdicts=(StepVerdict(step_index=0, verdict="VALID"),),
+        consistency_score=score,
+        summary=f"summary {score}",
+    )
+
+
+def _state(agent: str, trigger: str | None, score: float = 0.5, retries: int = 0) -> AutoLabState:
     state = empty_state("Q?")
-    state["confidence"] = 0.9
-    assert route_after_agent(state) == "next"
+    state["current_agent"] = agent
+    state["retry_count"] = retries
+    state["verification_history"] = [_vr(score)]
+    if trigger is not None:
+        state["hitl_pending"] = HITLRequest(agent=agent, reason="r", payload={"trigger": trigger})
+    return state
 
 
-def test_end_when_terminal_and_passing() -> None:
-    state = empty_state("Q?")
-    state["confidence"] = 0.9
-    assert route_after_agent(state, terminal=True) == "end"
+def test_pass_goes_to_next_agent_and_resets_retries() -> None:
+    cmd = node(_state("research", None, 0.9, retries=1))
+    assert cmd.goto == "design"
+    assert cmd.update == {"retry_count": 0, "feedback": ""}
 
 
-def test_hitl_when_pending_set() -> None:
-    state = empty_state("Q?")
-    state["confidence"] = 1.0  # high confidence, but a pending request exists
-    state["hitl_pending"] = HITLRequest(agent="design", reason="cost too high")
-    assert route_after_agent(state) == "hitl"
+def test_pass_after_analysis_ends() -> None:
+    assert node(_state("analysis", None, 0.9)).goto == END
 
 
-def test_hitl_when_confidence_below_threshold() -> None:
-    state = empty_state("Q?")
-    state["confidence"] = 0.4
-    assert route_after_agent(state) == "hitl"
-    assert route_after_agent(state, terminal=True) == "hitl"
+def test_retry_band_reruns_same_agent_with_feedback() -> None:
+    cmd = node(_state("design", "verification", 0.5, retries=1))
+    assert cmd.goto == "design"
+    assert cmd.update == {
+        "hitl_pending": None,
+        "hitl_payload": None,
+        "retry_count": 2,
+        "feedback": "summary 0.5",
+    }
+
+
+def test_retries_exhausted_escalates() -> None:
+    assert node(_state("design", "verification", 0.5, retries=2)).goto == "hitl"
+
+
+def test_escalate_band_goes_to_hitl() -> None:
+    assert node(_state("design", "verification", 0.1)).goto == "hitl"
+
+
+def test_policy_and_error_requests_are_never_retried() -> None:
+    assert node(_state("design", "policy", 0.9)).goto == "hitl"
+    assert node(_state("design", "error", 0.5)).goto == "hitl"
+
+
+def test_verification_request_without_history_escalates() -> None:
+    state = _state("research", "verification")
+    state["verification_history"] = []
+    assert node(state).goto == "hitl"

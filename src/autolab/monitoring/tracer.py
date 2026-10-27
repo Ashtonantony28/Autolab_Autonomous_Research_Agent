@@ -3,13 +3,18 @@
 Thin glue between an `AutoLabState` snapshot and the persistence layer.
 Idempotent enough to call after every agent: we append each new entity
 once. Detecting "new" is by id — the tracer keeps a per-run set of ids
-already persisted.
+already persisted, and the store upserts by id, so a fresh tracer after a
+restart does not duplicate rows either.
+
+`record_node` is what the graph calls after every agent execution: it
+persists the run row, any new entities and one `TraceEvent`.
 """
 
 from __future__ import annotations
 
 from uuid import UUID
 
+from autolab.monitoring.events import TraceEvent
 from autolab.state.schema import AutoLabState
 from autolab.state.store import StateStore
 
@@ -22,6 +27,18 @@ class RunTracer:
         # Keyed by (run_id, entity_type, entity_id) so a VerificationResult
         # doesn't collide with the ReasoningTrace it references.
         self._seen: set[tuple[UUID, str, UUID]] = set()
+        self._runs: set[UUID] = set()
+
+    async def record_node(
+        self, event: TraceEvent, research_question: str, *states: AutoLabState
+    ) -> None:
+        """Persist one agent execution: its run row, new entities in `states`, then `event`."""
+        if event.run_id not in self._runs:
+            await self._store.ensure_run(event.run_id, research_question)
+            self._runs.add(event.run_id)
+        for state in states:
+            await self.record_state(event.run_id, state)
+        await self._store.append(event.run_id, event)
 
     async def record_state(self, run_id: UUID, state: AutoLabState) -> int:
         """Append everything in `state` that we haven't yet persisted.
@@ -54,6 +71,11 @@ class RunTracer:
             # Identified by trace_id (VerificationResult has no own UUID).
             if self._mark(run_id, "verification", v.trace_id):
                 await self._store.append(run_id, v)
+                appended += 1
+
+        for a in state.get("analysis_reports", []) or []:
+            if self._mark(run_id, "report", a.id):
+                await self._store.append(run_id, a)
                 appended += 1
 
         return appended

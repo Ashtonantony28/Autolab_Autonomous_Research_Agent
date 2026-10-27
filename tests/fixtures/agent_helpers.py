@@ -4,15 +4,22 @@ The agent tests need to register both the agent's "produce" responses *and*
 the formalizations the verifier will request for the resulting reasoning
 trace. These helpers cover the trace + formalizations; the caller still
 registers their own payload response.
+
+Agents bind traces to their payload (`VerificationContext.payload_claim`), so
+a passing trace must conclude the agent's payload claim: pass it as
+`conclusion`. Agents that inject measurement facts seed the formalizer's
+vocabulary with them, so pass the same `facts` to keep prompts aligned.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
-from autolab.state.models import ReasoningStep, ReasoningTrace
+from autolab.state.models import FormalizedStep, ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import Vocabulary, prompt_for
 from autolab.verification.llm import FakeLLMClient
+from tests.fixtures.golden_traces import GoldenStep
 
 
 def _sym(agent: str, letter: str) -> str:
@@ -21,58 +28,104 @@ def _sym(agent: str, letter: str) -> str:
     return f"{sanitized}_{letter}"
 
 
+def register_trace(
+    fake: FakeLLMClient,
+    *,
+    agent: str,
+    trace_purpose: str,
+    trace_prompt: str,
+    steps: Sequence[GoldenStep],
+    facts: Sequence[FormalizedStep] = (),
+) -> ReasoningTrace:
+    """Register an arbitrary trace reply plus every formalization it will request."""
+    vocab = Vocabulary()
+    for fact in facts:
+        vocab.merge(fact.declarations)
+    reasoning = tuple(
+        ReasoningStep(
+            index=i,
+            claim=s.claim,
+            claim_type=s.claim_type,
+            referenced_step_indices=s.referenced_step_indices,
+        )
+        for i, s in enumerate(steps)
+    )
+    fake.register(
+        trace_purpose,
+        trace_prompt,
+        json.dumps({"steps": [step.model_dump(mode="json") for step in reasoning]}),
+    )
+    for step, spec in zip(reasoning, steps, strict=True):
+        fake.register(
+            "formalize",
+            prompt_for(step, vocab),
+            json.dumps({"declarations": spec.declarations, "assertion": spec.assertion}),
+        )
+        vocab.merge(spec.declarations)
+    return ReasoningTrace(agent=agent, steps=reasoning)
+
+
 def register_trivial_trace(
     fake: FakeLLMClient,
     *,
     agent: str,
     trace_purpose: str,
     trace_prompt: str,
+    conclusion: str | None = None,
+    facts: Sequence[FormalizedStep] = (),
 ) -> ReasoningTrace:
-    """Register a 2-step trace (premise P, conclusion P) that verifies VALID/VALID.
+    """Register a 3-step trace (premise P, premise P => C, conclusion C) that verifies VALID.
 
-    Symbol names are namespaced by `agent` so multiple agents' fakes can
-    coexist on the same `FakeLLMClient` without colliding.
+    The conclusion states `conclusion` (default: a placeholder) and is genuinely
+    entailed: neither premise proves it alone. Symbol names are namespaced by
+    `agent` so multiple agents' fakes can coexist on the same `FakeLLMClient`.
     """
-    sym = _sym(agent, "P")
-    claim = f"premise of {agent}"
-    steps = (
-        ReasoningStep(index=0, claim=claim, claim_type="premise"),
-        ReasoningStep(index=1, claim=claim, claim_type="conclusion", referenced_step_indices=(0,)),
-    )
-    trace = ReasoningTrace(agent=agent, steps=steps)
-
-    fake.register(
-        trace_purpose,
-        trace_prompt,
-        json.dumps(
-            {
-                "steps": [
-                    {"index": 0, "claim": claim, "claim_type": "premise"},
-                    {
-                        "index": 1,
-                        "claim": claim,
-                        "claim_type": "conclusion",
-                        "referenced_step_indices": [0],
-                    },
-                ]
-            }
+    sym_p = _sym(agent, "P")
+    sym_c = _sym(agent, "C")
+    claim = conclusion or f"conclusion of {agent}"
+    return register_trace(
+        fake,
+        agent=agent,
+        trace_purpose=trace_purpose,
+        trace_prompt=trace_prompt,
+        steps=(
+            GoldenStep(
+                f"premise of {agent}",
+                "premise",
+                f"(declare-const {sym_p} Bool)\n(declare-const {sym_c} Bool)",
+                sym_p,
+            ),
+            GoldenStep(
+                f"premise of {agent} implies {claim}", "premise", "", f"(=> {sym_p} {sym_c})"
+            ),
+            GoldenStep(claim, "conclusion", "", sym_c, (0, 1)),
         ),
+        facts=facts,
     )
 
-    v = Vocabulary()
-    decl = f"(declare-const {sym} Bool)"
-    fake.register(
-        "formalize",
-        prompt_for(steps[0], v),
-        json.dumps({"declarations": decl, "assertion": sym}),
+
+def register_circular_trace(
+    fake: FakeLLMClient,
+    *,
+    agent: str,
+    trace_purpose: str,
+    trace_prompt: str,
+    conclusion: str,
+    facts: Sequence[FormalizedStep] = (),
+) -> ReasoningTrace:
+    """Register a circular 2-step trace: premise C, then conclusion C citing it (AUDIT-1 #1)."""
+    sym = _sym(agent, "P")
+    return register_trace(
+        fake,
+        agent=agent,
+        trace_purpose=trace_purpose,
+        trace_prompt=trace_prompt,
+        steps=(
+            GoldenStep(conclusion, "premise", f"(declare-const {sym} Bool)", sym),
+            GoldenStep(conclusion, "conclusion", "", sym, (0,)),
+        ),
+        facts=facts,
     )
-    v.merge(decl)
-    fake.register(
-        "formalize",
-        prompt_for(steps[1], v),
-        json.dumps({"declarations": "", "assertion": sym}),
-    )
-    return trace
 
 
 def register_failing_trace(
@@ -81,49 +134,27 @@ def register_failing_trace(
     agent: str,
     trace_purpose: str,
     trace_prompt: str,
+    conclusion: str | None = None,
+    facts: Sequence[FormalizedStep] = (),
 ) -> ReasoningTrace:
-    """Register a 2-step trace whose conclusion (Q) is unrelated to its premise (P)."""
+    """Register a 2-step trace whose conclusion (Q) is not entailed by its premise (P)."""
     sym_p = _sym(agent, "P")
     sym_q = _sym(agent, "Q")
-    claim_p = f"premise of {agent}"
-    claim_q = f"unrelated conclusion of {agent}"
-    steps = (
-        ReasoningStep(index=0, claim=claim_p, claim_type="premise"),
-        ReasoningStep(
-            index=1, claim=claim_q, claim_type="conclusion", referenced_step_indices=(0,)
+    return register_trace(
+        fake,
+        agent=agent,
+        trace_purpose=trace_purpose,
+        trace_prompt=trace_prompt,
+        steps=(
+            GoldenStep(
+                f"observation of {agent}",
+                "premise",
+                f"(declare-const {sym_p} Bool)\n(declare-const {sym_q} Bool)",
+                sym_p,
+            ),
+            GoldenStep(
+                conclusion or f"unrelated conclusion of {agent}", "conclusion", "", sym_q, (0,)
+            ),
         ),
+        facts=facts,
     )
-    trace = ReasoningTrace(agent=agent, steps=steps)
-
-    fake.register(
-        trace_purpose,
-        trace_prompt,
-        json.dumps(
-            {
-                "steps": [
-                    {"index": 0, "claim": claim_p, "claim_type": "premise"},
-                    {
-                        "index": 1,
-                        "claim": claim_q,
-                        "claim_type": "conclusion",
-                        "referenced_step_indices": [0],
-                    },
-                ]
-            }
-        ),
-    )
-
-    v = Vocabulary()
-    decls = f"(declare-const {sym_p} Bool)\n(declare-const {sym_q} Bool)"
-    fake.register(
-        "formalize",
-        prompt_for(steps[0], v),
-        json.dumps({"declarations": decls, "assertion": sym_p}),
-    )
-    v.merge(decls)
-    fake.register(
-        "formalize",
-        prompt_for(steps[1], v),
-        json.dumps({"declarations": "", "assertion": sym_q}),
-    )
-    return trace

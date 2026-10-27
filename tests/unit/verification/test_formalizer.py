@@ -5,15 +5,16 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import BaseModel
 
-from autolab.state.models import ClaimType, ReasoningStep
+from autolab.state.models import ClaimType, FormalizedStep, ReasoningStep
 from autolab.verification.formalizer import (
     FormalizationError,
     Formalizer,
     Vocabulary,
     prompt_for,
 )
-from autolab.verification.llm import FakeLLMClient
+from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
 
 
 def _step(index: int, claim: str = "claim", claim_type: ClaimType = "inference") -> ReasoningStep:
@@ -66,7 +67,7 @@ async def test_formalizer_rejects_empty_assertion() -> None:
         prompt_for(step, Vocabulary()),
         json.dumps({"declarations": "", "assertion": "   "}),
     )
-    with pytest.raises(FormalizationError, match="empty assertion"):
+    with pytest.raises(FormalizationError, match="assertion"):
         await Formalizer(fake).formalize(step)
 
 
@@ -120,3 +121,153 @@ async def test_formalizer_rejects_invalid_smt() -> None:
     )
     with pytest.raises(FormalizationError, match="invalid SMT"):
         await Formalizer(fake).formalize(step)
+
+
+async def test_formalizer_rejects_schema_violation() -> None:
+    step = _step(0)
+    fake = FakeLLMClient()
+    fake.register(
+        "formalize", prompt_for(step, Vocabulary()), json.dumps({"declarations": "", "x": 1})
+    )
+    with pytest.raises(FormalizationError):
+        await Formalizer(fake).formalize(step)
+
+
+async def test_formalizer_uses_structured_call() -> None:
+    calls: list[tuple[str, type[BaseModel]]] = []
+
+    class _Recording(FakeLLMClient):
+        async def call(self, purpose: str, prompt: str) -> str:
+            raise AssertionError("formalizer must use call_structured")
+
+        async def call_structured(
+            self, purpose: str, prompt: str, schema: type[SchemaT]
+        ) -> SchemaT:
+            calls.append((purpose, schema))
+            return schema.model_validate(
+                {"declarations": "(declare-const p Bool)", "assertion": "p"}
+            )
+
+    out = await Formalizer(_Recording()).formalize(_step(0))
+    assert out.assertion == "p"
+    assert calls == [("formalize", FormalizedStep)]
+
+
+async def test_unparseable_step_leaves_vocabulary_unchanged() -> None:
+    step = _step(0)
+    fake = FakeLLMClient()
+    fake.register(
+        "formalize",
+        prompt_for(step, Vocabulary()),
+        json.dumps({"declarations": "(declare-const q Bool)", "assertion": "(and q"}),
+    )
+    f = Formalizer(fake)
+    with pytest.raises(FormalizationError, match="invalid SMT"):
+        await f.formalize(step)
+    assert f.vocabulary.declarations == {}
+
+
+async def test_conflicting_step_leaves_vocabulary_unchanged() -> None:
+    step = _step(1)
+    vocab = {"p": "(declare-const p Bool)"}
+    fake = FakeLLMClient()
+    fake.register(
+        "formalize",
+        prompt_for(step, Vocabulary(dict(vocab))),
+        json.dumps(
+            {"declarations": "(declare-const q Bool)\n(declare-const p Int)", "assertion": "q"}
+        ),
+    )
+    f = Formalizer(fake)
+    f.vocabulary = Vocabulary(dict(vocab))
+    with pytest.raises(FormalizationError, match="re-declared"):
+        await f.formalize(step)
+    assert f.vocabulary.declarations == vocab
+
+
+def test_merge_is_atomic() -> None:
+    v = Vocabulary({"p": "(declare-const p Bool)"})
+    with pytest.raises(FormalizationError):
+        v.merge("(declare-const q Bool)\n(declare-const p Int)")
+    assert v.declarations == {"p": "(declare-const p Bool)"}
+    with pytest.raises(FormalizationError):
+        v.merge("(declare-const r Bool)\ngarbage")
+    assert v.declarations == {"p": "(declare-const p Bool)"}
+
+
+def test_merged_returns_copy() -> None:
+    v = Vocabulary({"p": "(declare-const p Bool)"})
+    w = v.merged("(declare-const q Bool)")
+    assert set(w.declarations) == {"p", "q"}
+    assert set(v.declarations) == {"p"}
+
+
+@pytest.mark.parametrize(
+    "bad", ["declare-const p Bool", "(declare-const)", "(define-fun p () Bool true)"]
+)
+def test_merge_rejects_malformed_declarations(bad: str) -> None:
+    v = Vocabulary()
+    with pytest.raises(FormalizationError, match="unrecognized declaration"):
+        v.merge(f"(declare-const ok Bool)\n\n{bad}")
+    assert v.declarations == {}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "(declare-const cures Bool) (assert cures)",
+        "(declare-const k Bool) (define-fun cures () Bool true)",
+        "(declare-const k Bool)(reset)",
+        "(declare-const k Bool))",
+        "(declare-fun f (Int) Bool",
+        "(declare-const |k) (assert true| Bool)",
+        "(declare-const k Bool) ; (assert k)",
+        '(declare-const k "Bool")',
+        "(declare-const ( Bool)",
+        "(push)",
+        "()",
+    ],
+)
+def test_merge_rejects_anything_but_one_declaration_form(bad: str) -> None:
+    # AUDIT-1 #2: no SMT command other than a declaration may ride along.
+    with pytest.raises(FormalizationError, match="unrecognized declaration"):
+        Vocabulary().merge(bad)
+
+
+@pytest.mark.parametrize(
+    ("decl", "name"),
+    [
+        ("(declare-const k Bool)", "k"),
+        ("  (declare-fun f ((Array Int Int) Int) Bool)  ", "f"),
+        ("(declare-sort S 0)", "S"),
+        ("(declare-fun g () Real)", "g"),
+    ],
+)
+def test_merge_accepts_single_declaration_forms(decl: str, name: str) -> None:
+    assert name in Vocabulary().merged(decl).declarations
+
+
+async def test_smuggled_assertion_fails_formalization() -> None:
+    fake = FakeLLMClient()
+    step = _step(0)
+    fake.register(
+        "formalize",
+        prompt_for(step, Vocabulary()),
+        json.dumps({"declarations": "(declare-const c Bool) (assert c)", "assertion": "c"}),
+    )
+    f = Formalizer(fake)
+    with pytest.raises(FormalizationError):
+        await f.formalize(step)
+    assert f.vocabulary.declarations == {}
+
+
+class _RefusingLLM(FakeLLMClient):
+    async def call_structured(
+        self, purpose: LLMPurpose, prompt: str, schema: type[SchemaT]
+    ) -> SchemaT:
+        raise RuntimeError("model refused")
+
+
+async def test_refusal_becomes_formalization_error() -> None:
+    with pytest.raises(FormalizationError, match="no structured output"):
+        await Formalizer(_RefusingLLM()).formalize(_step(0))

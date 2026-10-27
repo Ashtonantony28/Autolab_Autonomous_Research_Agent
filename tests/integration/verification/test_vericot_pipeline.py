@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import json
 
-from autolab.state.models import ReasoningStep, ReasoningTrace
+from autolab.config import PASS_THRESHOLD
+from autolab.state.models import (
+    ClaimType,
+    FormalizedStep,
+    ReasoningStep,
+    ReasoningTrace,
+    VerificationContext,
+)
 from autolab.verification.formalizer import Vocabulary, prompt_for
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.vericot import Verifier
@@ -71,7 +78,7 @@ async def test_invalid_inference_is_caught() -> None:
 
     assert result.step_verdicts[0].verdict == "VALID"  # premise
     assert result.step_verdicts[1].verdict == "INVALID"
-    assert result.consistency_score == 0.5
+    assert result.consistency_score < PASS_THRESHOLD
 
 
 async def test_malformed_formalization_yields_ungrounded() -> None:
@@ -99,3 +106,97 @@ async def test_single_premise_conclusion_unrelated() -> None:
 
     result = await Verifier(fake).verify(trace)
     assert result.step_verdicts[1].verdict == "INVALID"
+
+
+_Spec = tuple[ClaimType, str, str, tuple[int, ...]]
+
+
+def _trace(specs: list[_Spec], seed_decls: str = "") -> tuple[ReasoningTrace, FakeLLMClient]:
+    fake = FakeLLMClient()
+    v = Vocabulary().merged(seed_decls)
+    steps = []
+    for i, (kind, decls, assertion, refs) in enumerate(specs):
+        step = ReasoningStep(
+            index=i, claim=f"step {i}", claim_type=kind, referenced_step_indices=refs
+        )
+        steps.append(step)
+        v = _register_formalization(fake, step, v, declarations=decls, assertion=assertion)
+    return ReasoningTrace(agent="x", steps=tuple(steps)), fake
+
+
+async def _reasons(specs: list[_Spec], context: VerificationContext | None = None) -> list[str]:
+    seed = "\n".join(f.declarations for f in context.facts) if context else ""
+    trace, fake = _trace(specs, seed)
+    result = await Verifier(fake).verify(trace, context=context)
+    return [f"{sv.verdict}:{sv.reason}" for sv in result.step_verdicts]
+
+
+_PQ = "(declare-const P Bool)\n(declare-const Q Bool)"
+
+
+async def test_contradictory_premises_do_not_entail_anything() -> None:
+    out = await _reasons(
+        [("premise", _PQ, "P", ()), ("premise", "", "(not P)", ()), ("conclusion", "", "Q", ())]
+    )
+    # The premise that breaks consistency is INVALID itself and leaves the pool.
+    assert out[1:] == ["INVALID:premises_inconsistent", "INVALID:not_entailed"]
+
+
+async def test_invalid_step_is_excluded_from_later_pools() -> None:
+    out = await _reasons(
+        [("premise", _PQ, "P", ()), ("inference", "", "Q", ()), ("conclusion", "", "Q", ())]
+    )
+    assert out == ["VALID:assumed", "INVALID:not_entailed", "INVALID:not_entailed"]
+
+
+async def test_ungrounded_step_is_excluded_from_later_pools() -> None:
+    # Step 0 has no premises (UNGROUNDED); step 2 must not be able to lean on it.
+    out = await _reasons(
+        [("inference", _PQ, "Q", ()), ("premise", "", "P", ()), ("conclusion", "", "Q", ())]
+    )
+    assert out == ["UNGROUNDED:no_premises", "VALID:assumed", "INVALID:not_entailed"]
+
+
+async def test_references_restrict_premises() -> None:
+    decls = _PQ + "\n(declare-const R Bool)"
+    specs: list[_Spec] = [
+        ("premise", decls, "P", ()),
+        ("premise", "", "(=> P Q)", ()),
+        ("premise", "", "R", ()),
+        ("conclusion", "", "Q", (2,)),
+    ]
+    assert (await _reasons(specs))[3] == "INVALID:not_entailed"
+    specs[3] = ("conclusion", "", "Q", (0, 1))
+    assert (await _reasons(specs))[3] == "VALID:entailed"
+
+
+async def test_references_include_context_facts() -> None:
+    fact = FormalizedStep(declarations="(declare-const F Bool)", assertion="F")
+    out = await _reasons(
+        [("premise", _PQ, "P", ()), ("conclusion", "", "(and P F)", (0,))],
+        context=VerificationContext(facts=(fact,)),
+    )
+    assert out[1] == "VALID:entailed"
+
+
+async def test_citing_only_invalid_steps_is_ungrounded() -> None:
+    out = await _reasons(
+        [("premise", _PQ, "P", ()), ("inference", "", "Q", (0,)), ("conclusion", "", "Q", (1,))]
+    )
+    assert out[2] == "UNGROUNDED:no_premises"
+
+
+async def test_diluted_invalid_trace_cannot_pass() -> None:
+    decls = _PQ + "\n(declare-const R Bool)\n(declare-const S Bool)"
+    trace, fake = _trace(
+        [
+            ("premise", decls, "P", ()),
+            ("premise", "", "R", ()),
+            ("premise", "", "S", ()),
+            ("inference", "", "Q", ()),
+            ("conclusion", "", "P", ()),
+        ]
+    )
+    result = await Verifier(fake).verify(trace)
+    assert [sv.verdict for sv in result.step_verdicts].count("INVALID") == 1
+    assert result.consistency_score < PASS_THRESHOLD

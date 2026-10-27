@@ -1,21 +1,31 @@
 """Z3 wrapper for entailment checking.
 
-Each step is verified by asking Z3: `premises and not claim` — if `unsat`, the
-claim is entailed by its premises (VALID); if `sat`, there's a model that
-satisfies the premises but contradicts the claim (INVALID); if `unknown`
-(timeout or undecidable), we conservatively return UNGROUNDED.
+Each step is verified in two checks. First the premises alone must be
+satisfiable; an unsat premise set would entail anything (ex falso), so it is
+INVALID with reason `premises_inconsistent`. Then Z3 is asked about
+`premises and not claim` — if `unsat`, the claim is entailed (VALID); if
+`sat`, there's a model that satisfies the premises but contradicts the claim
+(INVALID); if `unknown` (timeout or undecidable), we conservatively return
+UNGROUNDED.
 
 Inputs are SMT-LIB 2 strings, parsed via `z3.parse_smt2_string` so the
-boundary between LLM-produced text and Z3's AST is explicit.
+boundary between LLM-produced text and Z3's AST is explicit. Every check
+runs in a fresh `z3.Context`, so checks are safe to run on worker threads,
+and both checks share one `timeout_seconds` deadline.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from typing import Final
 
 import z3
 
+from autolab.config import SOLVER_TIMEOUT_S
 from autolab.state.models import StepReason, Verdict
+
+_MS_PER_S: Final[int] = 1000
 
 
 @dataclass(frozen=True)
@@ -44,9 +54,9 @@ class SolverOutcome:
 
 @dataclass
 class Z3Solver:
-    """Stateless Z3-backed entailment checker."""
+    """Stateless Z3-backed entailment checker; safe to call from any thread."""
 
-    timeout_seconds: float = 5.0
+    timeout_seconds: float = SOLVER_TIMEOUT_S
 
     def check_entailment(
         self,
@@ -57,6 +67,7 @@ class Z3Solver:
 
         Conventions:
           - No premises → UNGROUNDED.
+          - premises alone unsat → INVALID (`premises_inconsistent`).
           - premises and not claim is unsat → VALID.
           - premises and not claim is sat   → INVALID.
           - Any solver error / unknown / timeout → UNGROUNDED.
@@ -66,9 +77,11 @@ class Z3Solver:
                 verdict="UNGROUNDED", reason="no_premises", details="no premises to entail from"
             )
 
+        deadline = time.monotonic() + self.timeout_seconds
+        ctx = z3.Context()
         smt = _build_smt2(premises, claim)
         try:
-            assertions = z3.parse_smt2_string(smt)
+            assertions = z3.parse_smt2_string(smt, ctx=ctx)
         except z3.Z3Exception as exc:
             return SolverOutcome(
                 verdict="UNGROUNDED",
@@ -76,9 +89,27 @@ class Z3Solver:
                 details=f"SMT parse error: {exc}",
             )
 
-        solver = z3.Solver()
-        solver.set("timeout", int(self.timeout_seconds * 1000))
-        solver.add(assertions)
+        solver = z3.Solver(ctx=ctx)
+        solver.set("timeout", _remaining_ms(deadline))
+        # The negated claim is always the last assertion `_build_smt2` emits.
+        negated_claim = assertions[len(assertions) - 1]
+        for i in range(len(assertions) - 1):
+            solver.add(assertions[i])
+        consistency = solver.check()
+        if consistency == z3.unsat:
+            return SolverOutcome(
+                verdict="INVALID",
+                reason="premises_inconsistent",
+                details="premises are mutually unsatisfiable",
+            )
+        if consistency != z3.sat:
+            return SolverOutcome(
+                verdict="UNGROUNDED",
+                reason="timeout",
+                details=f"premise consistency check returned {consistency}",
+            )
+        solver.add(negated_claim)
+        solver.set("timeout", _remaining_ms(deadline))
         result = solver.check()
         if result == z3.unsat:
             return SolverOutcome(
@@ -97,6 +128,11 @@ class Z3Solver:
             reason="timeout",
             details=f"solver returned {result}",
         )
+
+
+def _remaining_ms(deadline: float) -> int:
+    """Milliseconds left before `deadline`, at least 1 (Z3 treats 0 as no limit)."""
+    return max(1, int((deadline - time.monotonic()) * _MS_PER_S))
 
 
 def _build_smt2(premises: list[SmtFormula], claim: SmtFormula) -> str:

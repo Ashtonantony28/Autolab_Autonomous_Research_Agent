@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -28,13 +28,17 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from autolab.monitoring.events import TraceEvent
 from autolab.state.models import (
+    AnalysisReport,
     ExperimentDesign,
     ExperimentResult,
     Hypothesis,
     ReasoningTrace,
     VerificationResult,
 )
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class Base(DeclarativeBase):
@@ -82,12 +86,24 @@ class VerificationResultRow(_EntityRow):
     __tablename__ = "verification_results"
 
 
+class AnalysisReportRow(_EntityRow):
+    __tablename__ = "analysis_reports"
+
+
+class TraceEventRow(_EntityRow):
+    __tablename__ = "trace_events"
+
+    node: Mapped[str] = mapped_column(String(64))
+
+
 _ROW_FOR_MODEL: dict[type[BaseModel], type[_EntityRow]] = {
     Hypothesis: HypothesisRow,
     ExperimentDesign: ExperimentDesignRow,
     ExperimentResult: ExperimentResultRow,
     ReasoningTrace: ReasoningTraceRow,
     VerificationResult: VerificationResultRow,
+    AnalysisReport: AnalysisReportRow,
+    TraceEvent: TraceEventRow,
 }
 
 
@@ -118,9 +134,9 @@ class StateStore:
         async with self._sessionmaker() as session:
             yield session
 
-    async def create_run(self, research_question: str) -> UUID:
-        """Insert a new run row and return its id."""
-        run_id = uuid4()
+    async def create_run(self, research_question: str, *, run_id: UUID | None = None) -> UUID:
+        """Insert a new run row (with a fresh id unless `run_id` is given) and return its id."""
+        run_id = run_id or uuid4()
         async with self.session() as session:
             session.add(
                 RunRow(
@@ -132,16 +148,40 @@ class StateStore:
             await session.commit()
         return run_id
 
+    async def ensure_run(self, run_id: UUID, research_question: str) -> None:
+        """Create the run row unless it already exists (e.g. a resumed run)."""
+        async with self.session() as session:
+            if await session.get(RunRow, str(run_id)) is not None:
+                return
+        await self.create_run(research_question, run_id=run_id)
+
+    async def list_runs(self) -> list[tuple[UUID, str]]:
+        """Return `(run_id, research_question)` for every run, newest first."""
+        async with self.session() as session:
+            rows = await session.scalars(select(RunRow).order_by(RunRow.created_at.desc()))
+            return [(UUID(r.id), r.research_question) for r in rows]
+
     async def append(self, run_id: UUID, model: BaseModel) -> None:
-        """Persist any supported domain model under the given run."""
+        """Persist any supported domain model under the given run.
+
+        Idempotent: rows are upserted by id (`VerificationResult` by `trace_id`),
+        so re-recording an entity after a restart does not duplicate it.
+        """
         row_cls = _ROW_FOR_MODEL.get(type(model))
         if row_cls is None:
             raise TypeError(f"no persistence mapping for {type(model).__name__}")
 
         # All supported models carry an `id` field. Other projected columns are
         # populated only when present on the model.
-        ident = getattr(model, "id", uuid4())
-        created = getattr(model, "created_at", None) or getattr(model, "produced_at", None)
+        ident = getattr(model, "id", None) or getattr(model, "trace_id", None) or uuid4()
+        created = next(
+            (
+                getattr(model, f)
+                for f in ("created_at", "produced_at", "completed_at", "started_at")
+                if hasattr(model, f)
+            ),
+            None,
+        )
         if not isinstance(created, datetime):
             created = datetime.now(tz=UTC)
 
@@ -157,34 +197,40 @@ class StateStore:
             kwargs["status"] = getattr(model, "status", "success")
         if row_cls is ReasoningTraceRow:
             kwargs["agent"] = getattr(model, "agent", "")
+        if row_cls is TraceEventRow:
+            kwargs["node"] = getattr(model, "node", "")
 
         async with self.session() as session:
-            session.add(row_cls(**kwargs))
+            await session.merge(row_cls(**kwargs))
             await session.commit()
 
     async def load_hypotheses(self, run_id: UUID) -> list[Hypothesis]:
-        async with self.session() as session:
-            rows = await session.scalars(
-                select(HypothesisRow).where(HypothesisRow.run_id == str(run_id))
-            )
-            return [Hypothesis.model_validate(r.payload) for r in rows]
+        return await self._load(run_id, Hypothesis)
 
     async def load_traces(self, run_id: UUID) -> list[ReasoningTrace]:
-        async with self.session() as session:
-            rows = await session.scalars(
-                select(ReasoningTraceRow).where(ReasoningTraceRow.run_id == str(run_id))
-            )
-            return [ReasoningTrace.model_validate(r.payload) for r in rows]
+        return await self._load(run_id, ReasoningTrace)
 
     async def load_verifications(self, run_id: UUID) -> list[VerificationResult]:
+        return await self._load(run_id, VerificationResult)
+
+    async def load_reports(self, run_id: UUID) -> list[AnalysisReport]:
+        return await self._load(run_id, AnalysisReport)
+
+    async def load_events(self, run_id: UUID) -> list[TraceEvent]:
+        """Return the run's trace events in execution order."""
+        return await self._load(run_id, TraceEvent)
+
+    async def _load(self, run_id: UUID, model: type[ModelT]) -> list[ModelT]:
+        row_cls = _ROW_FOR_MODEL[model]
         async with self.session() as session:
             rows = await session.scalars(
-                select(VerificationResultRow).where(VerificationResultRow.run_id == str(run_id))
+                select(row_cls).where(row_cls.run_id == str(run_id)).order_by(row_cls.created_at)
             )
-            return [VerificationResult.model_validate(r.payload) for r in rows]
+            return [model.model_validate(r.payload) for r in rows]
 
 
 __all__ = [
+    "AnalysisReportRow",
     "Base",
     "ExperimentDesignRow",
     "ExperimentResultRow",
@@ -192,5 +238,6 @@ __all__ = [
     "ReasoningTraceRow",
     "RunRow",
     "StateStore",
+    "TraceEventRow",
     "VerificationResultRow",
 ]
