@@ -101,15 +101,25 @@ async def newcomer_first_check_s(hogs: int, timeout_s: float) -> tuple[float, fl
     """(s a new task's first easy check waits beside `hogs` hard runs, one hard check's s).
 
     2 slots and 2 slow places, whatever the machine's size; each hard run makes
-    back-to-back checks that run to `timeout_s`.
+    back-to-back checks that run to `timeout_s`. The newcomer arrives once every hard
+    run has completed a check: before that the runs are newcomers too, and a fair
+    queue serves them, having arrived first, before it (SG32).
     """
     ex = SolverExecutor(2, 2)
     tasks: list[asyncio.Task[None]] = []
+    hard = [0]
+
+    async def hog() -> None:
+        await slow_check(ex, timeout_s)
+        hard[0] += 1
+        await slow_verify(ex, timeout_s, 1000)
+
     try:
         # The first check may pay worker start-up (finding 3); the unit is a warm one.
         unit = min([await asyncio.create_task(hard_check_s(ex, timeout_s)) for _ in range(2)])
-        tasks = [asyncio.create_task(slow_verify(ex, timeout_s, 1000)) for _ in range(hogs)]
-        await asyncio.sleep(timeout_s / 4)  # every hard run is in or queued for a check
+        tasks = [asyncio.create_task(hog()) for _ in range(hogs)]
+        while hard[0] < hogs:  # every run is hard, and in or queued for a check
+            await asyncio.sleep(0.01)
         check = partial(Z3Solver().check_entailment, *EASY)
 
         async def newcomer() -> float:
