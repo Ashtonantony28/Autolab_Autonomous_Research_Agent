@@ -17,6 +17,7 @@ class AgentMetrics:
     total_latency_ms: float = 0.0
     sum_consistency_score: float = 0.0
     hitl_escalations: int = 0
+    retries: int = 0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -40,13 +41,17 @@ class Metrics:
         latency_ms: float,
         consistency_score: float,
         escalated: bool,
+        retried: bool = False,
     ) -> None:
+        """Record one agent execution; `retried` means the monitor re-ran the agent."""
         m = self.by_agent.setdefault(name, AgentMetrics())
         m.invocations += 1
         m.total_latency_ms += latency_ms
         m.sum_consistency_score += consistency_score
         if escalated:
             m.hitl_escalations += 1
+        if retried:
+            m.retries += 1
 
     def snapshot(self) -> dict[str, dict[str, float]]:
         """Return a JSON-friendly snapshot."""
@@ -56,6 +61,7 @@ class Metrics:
                 "avg_latency_ms": m.avg_latency_ms,
                 "avg_consistency_score": m.avg_consistency_score,
                 "hitl_escalations": float(m.hitl_escalations),
+                "retries": float(m.retries),
             }
             for name, m in self.by_agent.items()
         }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from autolab.config import RETRY_THRESHOLD
+from autolab.config import PASS_THRESHOLD
 from autolab.state.models import (
     ClaimType,
     FormalizedStep,
@@ -78,7 +78,7 @@ async def test_invalid_inference_is_caught() -> None:
 
     assert result.step_verdicts[0].verdict == "VALID"  # premise
     assert result.step_verdicts[1].verdict == "INVALID"
-    assert result.consistency_score < RETRY_THRESHOLD
+    assert result.consistency_score < PASS_THRESHOLD
 
 
 async def test_malformed_formalization_yields_ungrounded() -> None:
@@ -138,7 +138,8 @@ async def test_contradictory_premises_do_not_entail_anything() -> None:
     out = await _reasons(
         [("premise", _PQ, "P", ()), ("premise", "", "(not P)", ()), ("conclusion", "", "Q", ())]
     )
-    assert out[2] == "INVALID:premises_inconsistent"
+    # The premise that breaks consistency is INVALID itself and leaves the pool.
+    assert out[1:] == ["INVALID:premises_inconsistent", "INVALID:not_entailed"]
 
 
 async def test_invalid_step_is_excluded_from_later_pools() -> None:
@@ -198,4 +199,4 @@ async def test_diluted_invalid_trace_cannot_pass() -> None:
     )
     result = await Verifier(fake).verify(trace)
     assert [sv.verdict for sv in result.step_verdicts].count("INVALID") == 1
-    assert result.consistency_score < RETRY_THRESHOLD
+    assert result.consistency_score < PASS_THRESHOLD

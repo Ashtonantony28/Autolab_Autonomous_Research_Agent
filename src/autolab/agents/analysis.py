@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
+from autolab.agents.common import (
+    conclusion_instruction,
+    measurement_facts,
+    parse_trace,
+    result_claim,
+    with_feedback,
+)
 from autolab.state.models import (
     AnalysisReport,
     ExperimentResult,
-    ReasoningStep,
-    ReasoningTrace,
+    Interpretation,
+    VerificationContext,
 )
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
@@ -31,7 +37,10 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
         if not results:
             raise ValueError("AnalysisAgent invoked without any results in state")
         latest = results[-1]
-        raw = await self._llm.call("analysis.report", build_analysis_prompt(latest))
+        feedback = state.get("feedback", "")
+        raw = await self._llm.call(
+            "analysis.report", with_feedback(build_analysis_prompt(latest), feedback)
+        )
         payload = AnalysisReport.model_validate_json(raw)
         if payload.result_id != latest.id:
             raise ValueError(
@@ -40,13 +49,17 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
             )
 
         trace_raw = await self._llm.call(
-            "analysis.trace", build_analysis_trace_prompt(latest, payload)
+            "analysis.trace",
+            with_feedback(build_analysis_trace_prompt(latest, payload), feedback),
         )
-        trace = _parse_trace(self.name, trace_raw)
-        return AgentOutput(payload=payload, reasoning_trace=trace)
+        trace = parse_trace(self.name, trace_raw)
+        context = VerificationContext(
+            facts=measurement_facts(latest), payload_claim=top_interpretation(payload).statement
+        )
+        return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     def _merge_payload(self, payload: AnalysisReport) -> dict[str, Any]:
-        return {}  # AnalysisReport is informational; not appended to state in Phase 3.
+        return {"analysis_reports": [payload]}
 
 
 def build_analysis_prompt(result: ExperimentResult) -> str:
@@ -65,14 +78,19 @@ def build_analysis_trace_prompt(result: ExperimentResult, report: AnalysisReport
         "Explain the reasoning for the ranked interpretations. "
         'Reply with JSON: {"steps": [...]}.\n\n'
         f"result_id: {result.id}\n"
-        f"top_interpretation: {report.interpretations[0].statement}"
+        f"measurements: {result_claim(result)}\n"
+        f"{conclusion_instruction(top_interpretation(report).statement)}"
     )
 
 
-def _parse_trace(agent: str, raw: str) -> ReasoningTrace:
-    data = json.loads(raw)
-    steps = tuple(ReasoningStep.model_validate(s) for s in data["steps"])
-    return ReasoningTrace(agent=agent, steps=steps)
+def top_interpretation(report: AnalysisReport) -> Interpretation:
+    """The rank-0 interpretation, which the trace must conclude."""
+    return min(report.interpretations, key=lambda i: i.rank)
 
 
-__all__ = ["AnalysisAgent", "build_analysis_prompt", "build_analysis_trace_prompt"]
+__all__ = [
+    "AnalysisAgent",
+    "build_analysis_prompt",
+    "build_analysis_trace_prompt",
+    "top_interpretation",
+]
