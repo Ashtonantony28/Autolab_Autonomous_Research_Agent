@@ -12,20 +12,21 @@ from anthropic.lib._parse._transform import transform_schema
 from anthropic.types import TextBlock
 from pydantic import BaseModel
 
-from autolab.agents.common import parse_trace
+from autolab.agents.common import DESIGN_REPLY, HYPOTHESIS_REPLY, REPORT_REPLY, parse_trace
 from autolab.state.models import (
     AnalysisReport,
-    ExperimentDesign,
     FormalizedStep,
-    Hypothesis,
     Interpretation,
     ReasoningStep,
 )
 from autolab.verification.faithfulness import FaithfulnessVerdict
 from autolab.verification.llm import (
+    DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
     ClaudeLLMClient,
+    FakeLLMClient,
+    StructuredOutputError,
     is_live,
     reply_schema,
     system_prompt,
@@ -86,23 +87,13 @@ async def test_plain_call_uses_create_with_system_prompt() -> None:
     assert kwargs["messages"] == [{"role": "user", "content": "p"}]
 
 
-def test_reply_schemas_cover_the_agent_json_purposes() -> None:
-    assert reply_schema("research.hypothesis") is Hypothesis
-    assert reply_schema("design.experiment") is ExperimentDesign
-    assert reply_schema("analysis.report") is AnalysisReport
+def test_reply_schemas_cover_only_the_trace_purposes() -> None:
+    # Agent payloads go through `call_structured` with content-only schemas.
+    for purpose in ("research.hypothesis", "design.experiment", "analysis.report"):
+        assert reply_schema(purpose) is None
     traces = {reply_schema(f"{a}.trace") for a in ("research", "design", "execute", "analysis")}
     assert len(traces) == 1 and None not in traces
     assert reply_schema("formalize") is None and reply_schema("commonsense") is None
-
-
-async def test_json_purpose_call_goes_through_structured_output() -> None:
-    hypothesis = Hypothesis(question="q", statement="s", rationale="r")
-    messages = _StubMessages(hypothesis)
-    raw = await _client(messages).call("research.hypothesis", "p")
-    assert Hypothesis.model_validate_json(raw) == hypothesis
-    ((kind, kwargs),) = messages.calls
-    assert kind == "parse" and kwargs["output_format"] is Hypothesis
-    assert kwargs["system"] == SYSTEM_PROMPTS["research"]
 
 
 async def test_trace_purpose_reply_parses_as_an_agent_trace() -> None:
@@ -119,9 +110,9 @@ async def test_trace_purpose_reply_parses_as_an_agent_trace() -> None:
     [
         FormalizedStep,
         FaithfulnessVerdict,
-        Hypothesis,
-        ExperimentDesign,
-        AnalysisReport,
+        HYPOTHESIS_REPLY,
+        DESIGN_REPLY,
+        REPORT_REPLY,
         reply_schema("x.trace"),
     ],
 )
@@ -137,17 +128,46 @@ async def test_one_async_anthropic_client_is_reused(monkeypatch: pytest.MonkeyPa
         summary="s",
     )
     messages = _StubMessages(report, text="t")
-    built: list[str] = []
+    built: list[tuple[str, int]] = []
 
-    def fake_ctor(*, api_key: str) -> SimpleNamespace:
-        built.append(api_key)
+    def fake_ctor(*, api_key: str, max_retries: int) -> SimpleNamespace:
+        built.append((api_key, max_retries))
         return SimpleNamespace(messages=messages)
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", fake_ctor)
     client = ClaudeLLMClient("key")
     assert is_live(client)
     await client.call("commonsense", "a")
-    await client.call("analysis.report", "b")
+    await client.call("analysis.trace", "b")
     await client.call_structured("formalize", "c", AnalysisReport)
-    assert built == ["key"]
+    assert built == [("key", 0)]  # one client, and the SDK never retries
     assert [kind for kind, _ in messages.calls] == ["create", "parse", "parse"]
+
+
+async def test_missing_structured_output_names_the_stop_reason() -> None:
+    class Refusing:
+        async def parse(self, **_: Any) -> SimpleNamespace:
+            return SimpleNamespace(parsed_output=None, stop_reason="refusal")
+
+    client = ClaudeLLMClient("k", client=SimpleNamespace(messages=Refusing()))  # type: ignore[arg-type]
+    with pytest.raises(StructuredOutputError, match="stop_reason='refusal'"):
+        await client.call_structured("formalize", "p", FormalizedStep)
+    assert issubclass(StructuredOutputError, RuntimeError)  # faithfulness still fails closed
+
+
+def test_model_id_comes_from_one_constant() -> None:
+    assert ClaudeLLMClient("k")._model == DEFAULT_MODEL
+
+
+class _Wrapper:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+
+def test_is_live_follows_the_wrapper_contract() -> None:
+    live = ClaudeLLMClient("k")
+    assert is_live(_Wrapper(_Wrapper(live)))
+    assert not is_live(_Wrapper(FakeLLMClient())) and not is_live(_Wrapper(None))
+    opted_out = _Wrapper(live)
+    opted_out.live = False  # type: ignore[attr-defined]  # a wrapper's own `live` wins
+    assert not is_live(opted_out)

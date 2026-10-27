@@ -6,6 +6,7 @@ from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
 from autolab.agents.common import (
+    REPORT_REPLY,
     conclusion_instruction,
     measurement_facts,
     parse_trace,
@@ -38,15 +39,10 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
             raise ValueError("AnalysisAgent invoked without any results in state")
         latest = results[-1]
         feedback = state.get("feedback", "")
-        raw = await self._llm.call(
-            "analysis.report", with_feedback(build_analysis_prompt(latest), feedback)
+        reply = await self._llm.call_structured(
+            "analysis.report", with_feedback(build_analysis_prompt(latest), feedback), REPORT_REPLY
         )
-        payload = AnalysisReport.model_validate_json(raw)
-        if payload.result_id != latest.id:
-            raise ValueError(
-                f"AnalysisReport.result_id={payload.result_id} does not match "
-                f"latest result id={latest.id}"
-            )
+        payload = AnalysisReport(**dict(reply), result_id=latest.id)
 
         trace_raw = await self._llm.call(
             "analysis.trace",
@@ -64,10 +60,7 @@ class AnalysisAgent(BaseAgent[AnalysisReport]):
 
 def build_analysis_prompt(result: ExperimentResult) -> str:
     return (
-        "Produce a ranked AnalysisReport for the following ExperimentResult. "
-        "Reply with the JSON of an autolab.state.models.AnalysisReport whose "
-        "result_id matches the input.\n\n"
-        f"result_id: {result.id}\n"
+        "Produce a ranked AnalysisReport for the following ExperimentResult.\n\n"
         f"status: {result.status}\n"
         f"measurement_summary: {len(result.measurements)} measurements"
     )
@@ -77,7 +70,6 @@ def build_analysis_trace_prompt(result: ExperimentResult, report: AnalysisReport
     return (
         "Explain the reasoning for the ranked interpretations. "
         'Reply with JSON: {"steps": [...]}.\n\n'
-        f"result_id: {result.id}\n"
         f"measurements: {result_claim(result)}\n"
         f"{conclusion_instruction(top_interpretation(report).statement)}"
     )
