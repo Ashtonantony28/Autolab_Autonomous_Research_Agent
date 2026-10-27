@@ -268,7 +268,8 @@ async def test_z3_checks_never_outnumber_the_slots_and_slow_places() -> None:
     # together do not outnumber the CPUs. Three hard checks in new tasks: before SG36 one
     # ran in the slot and another on a lent place for `_HARD_SLICES` beside it (peak 2),
     # and the lent one was killed and run again. Counted as calls in flight whose worker
-    # is not paused; AUDIT-38 #2 counts running processes.
+    # is not paused; AUDIT-38 #2 counts running processes. Since SG37 one newcomer per slot
+    # waits paused, so the third may be stopped and run again (AUDIT-42 #2).
     executor = SolverExecutor(1, 0)
     check = partial(Z3Solver(0.5).check_entailment, *UNDECIDABLE)
     try:
@@ -276,7 +277,7 @@ async def test_z3_checks_never_outnumber_the_slots_and_slow_places() -> None:
             await asyncio.gather(*(executor.run(check) for _ in range(3)))
     finally:
         executor.shutdown()
-    assert (peak[0], meter.restarts) == (1, 0)
+    assert peak[0] == 1 and meter.restarts <= 1, (peak[0], meter.restarts)
 
 
 @pytest.mark.perf

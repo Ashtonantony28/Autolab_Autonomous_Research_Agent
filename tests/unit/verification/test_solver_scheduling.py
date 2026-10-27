@@ -327,6 +327,7 @@ async def test_a_lent_place_does_not_overtake_a_caller_that_could_not_take_it() 
     assert slots._waiters[0].passed == 0
     late = await _queued(slots, short=True)
     assert await late is True
+    slots.release(lent=True)
     slots.unstick()
     slots.release(lent=False)
     assert await hard is False
@@ -679,7 +680,8 @@ async def test_runs_that_start_together_do_not_hold_up_a_later_newcomer(
     # AUDIT-30 #1, AUDIT-32 #8: 1 slot, no slow room, its check stuck. Three runs start
     # together, all newcomers; the one lent the place shows it is hard and is paused
     # and queued again as hard. An easy newcomer arriving after them is served next, and
-    # every paused run resumes once the slot frees, in arrival order (AUDIT-34 #1).
+    # every run goes on once the slot frees, in arrival order (AUDIT-34 #1): `r0` paused,
+    # `r2` and `r1`, past the one paused newcomer a slot allows, made again (AUDIT-42 #2).
     executor = _executor(executors, 1, 0)
     blocker = _Held()
     slot_task = asyncio.create_task(executor.run(blocker))
@@ -704,7 +706,7 @@ async def test_runs_that_start_together_do_not_hold_up_a_later_newcomer(
     assert [r for r, _ in await asyncio.gather(*tasks)] == ["decided"] * 3
     await slot_task
     assert order == ["r0", "easy", "r2", "r1", "r0", "r1", "r2"]
-    assert all(t in executor._hard for t in tasks)  # each ran hard before it was paused
+    assert tasks[0] in executor._hard  # it ran hard before it was paused
     assert (slots.held, slots.lent, slots.stuck, executor._pool._max_workers) == (0, 0, 0, 1)
 
 
@@ -895,23 +897,23 @@ async def test_a_lent_check_that_goes_slow_returns_its_place(
     tasks.append(asyncio.create_task(executor.run(stuck)))
     slots = executor._slots[asyncio.get_running_loop()]
     await _until(lambda: slots.stuck == 1)
-    seen: list[tuple[int, int, int]] = []
+    seen: list[tuple[int, int, int, int]] = []
 
     async def drive() -> None:
         assert await asyncio.to_thread(lent.started.wait, _WAIT_S)
-        seen.append((slots.lent, executor._slow, slots.stuck))
-        stuck.gate.set()  # the lender ends; the lent place stays until its check ends
+        seen.append((slots.held, slots.lent, executor._slow, slots.stuck))
+        stuck.gate.set()  # the lender ends; the lent check keeps its slot (AUDIT-43 #3)
         await _until(lambda: slots.stuck == 0)
-        seen.append((slots.lent, executor._slow, slots.stuck))
+        seen.append((slots.held, slots.lent, executor._slow, slots.stuck))
         slow.gate.set()
-        await _until(lambda: slots.lent == 0)  # the lent check took the free slow place
-        seen.append((slots.lent, executor._slow, slots.stuck))
+        await _until(lambda: slots.held == 0)  # the lent check took the free slow place
+        seen.append((slots.held, slots.lent, executor._slow, slots.stuck))
         lent.gate.set()
 
     driver = asyncio.create_task(drive())
     assert (await executor.run(lent))[0] == "held"
     await asyncio.gather(driver, *tasks)
-    assert seen == [(1, 1, 1), (1, 1, 0), (0, 1, 0)]
+    assert seen == [(1, 1, 1, 1), (1, 0, 1, 0), (0, 0, 1, 0)]
     assert (executor._slow, slots.held, slots.lent, slots.stuck) == (0, 0, 0, 0)
     assert executor._pool._max_workers == 1
 

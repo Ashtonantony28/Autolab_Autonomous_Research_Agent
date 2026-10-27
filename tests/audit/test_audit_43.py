@@ -64,7 +64,7 @@ def test_a_sub_goal_is_done_only_once_its_verification_is_green() -> None:
 
 
 class _Snapshot:
-    """What an executor holds once `_NEWCOMERS` newcomers wait, frozen, for a slot."""
+    """What an executor holds once `_NEWCOMERS` newcomers wait, frozen or stopped, for a slot."""
 
     def __init__(self, executor: SolverExecutor) -> None:
         running = list(executor._running)
@@ -81,7 +81,7 @@ class _Snapshot:
 
 async def _frozen_newcomers(executor: SolverExecutor) -> _Snapshot:
     """A hard check stuck in the pool's one slot, then `_NEWCOMERS` hard newcomers: each is
-    lent the place, shows it is hard, gives way and waits, frozen, for a slot."""
+    lent the place, shows it is hard, gives way and waits for a slot."""
     check = partial(Z3Solver(_LONG_S).check_entailment, *UNDECIDABLE)
     tasks = [asyncio.create_task(executor.run(check))]
     slots = executor._slot()
@@ -97,18 +97,18 @@ async def _frozen_newcomers(executor: SolverExecutor) -> _Snapshot:
 
 
 @linux_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-43 #2")
 async def test_worker_processes_in_use_stay_within_the_pools_places() -> None:
     # Before SG36 a newcomer that gave way was killed, so at most 2 x workers + slow_workers
-    # checks held a worker (what `_IDLE_WORKERS` is sized for). Since SG36 each one waits
-    # frozen with its worker process (about 61 MB RSS here) and a pool thread, so both grow
-    # with the number of runs. Observed: in flight 4, threads 4 (1 slot, 0 slow, 3 newcomers).
+    # checks held a worker (what `_IDLE_WORKERS` is sized for). SG36 kept each one frozen
+    # with its worker process (about 61 MB RSS here) and a pool thread: in flight 4,
+    # threads 4 (1 slot, 0 slow, 3 newcomers). Since SG37 at most `workers` wait frozen;
+    # the others are stopped, as before SG36.
     executor = SolverExecutor(1, 0)
     try:
         got = await _frozen_newcomers(executor)
     finally:
         executor.shutdown()
-    assert (got.frozen, got.z3_running) == (_NEWCOMERS, 1)  # the CPU bound itself holds
+    assert (got.frozen, got.z3_running) == (executor.workers, 1)  # the CPU bound itself holds
     bound = 2 * executor.workers + executor.slow_workers
     assert got.in_flight <= bound and got.threads <= bound, (got.in_flight, got.threads)
 
@@ -127,7 +127,6 @@ class _Target:
         pass
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-43 #3")
 async def test_checks_never_outnumber_the_slots_once_a_lender_ends() -> None:
     # `_Slots`: "While a place is lent, one lending slot's check is frozen, so ... Z3 checks
     # never outnumber slots and slow places". A lender that ends (here: cancelled) while
@@ -155,7 +154,6 @@ async def test_checks_never_outnumber_the_slots_once_a_lender_ends() -> None:
 
 
 @linux_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-43 #4")
 async def test_without_sigstop_the_pre_sg36_bound_still_holds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -163,11 +161,12 @@ async def test_without_sigstop_the_pre_sg36_bound_still_holds(
     # `_PAUSABLE = False`. Before SG36 a newcomer that gave way was killed, so at most
     # 2 x workers + slow_workers Z3 checks ran. Now it is frozen in name only and keeps
     # running while the next newcomer is lent its place. Observed: 4 running on 1 slot.
+    # Since SG37 none is frozen there: each is stopped and made again, as before SG36.
     monkeypatch.setattr(solver_workers, "_PAUSABLE", False)
     executor = SolverExecutor(1, 0)
     try:
         got = await _frozen_newcomers(executor)
     finally:
         executor.shutdown()
-    assert got.frozen == _NEWCOMERS  # the state under test was reached
+    assert got.frozen == 0  # stopped, not frozen in name only
     assert got.z3_running <= 2 * executor.workers + executor.slow_workers, got.z3_running

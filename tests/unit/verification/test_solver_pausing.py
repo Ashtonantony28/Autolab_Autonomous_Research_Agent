@@ -396,3 +396,159 @@ def test_a_child_forked_while_a_worker_is_paused_leaves_it_to_its_owner() -> Non
     assert line, proc.stderr[-800:]
     got = json.loads(line[len("RESULT ") :])
     assert got == {"state": "T", "out": [[True, None]], "alive": True}
+
+
+# --- bounded pauses (SG37) ------------------------------------------------------------------
+
+
+async def test_a_lender_frozen_past_its_share_runs_on_while_the_lent_check_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AUDIT-42 #1: a short stream kept the lender frozen without end. Frozen for
+    # `_FROZEN_SHARE` times its timeout, it runs on and the lent check is frozen in its
+    # place instead; the place stays lent, and Z3 checks stay within the slot.
+    now = [0.0]
+    monkeypatch.setattr(solver_mod, "_clock", lambda: now[0])
+    slots = solver_mod._Slots(1)
+    log: list[str] = []
+    lender, lent = _lender(log, "a"), _lender(log, "l")
+    lender.budget_s = 1.0
+    assert await slots.acquire(short=False) is False
+    assert slots.stick(False, lender)
+    assert await slots.acquire(short=True) is True
+    slots.lending(lent)
+    assert log == ["pause a"]
+    now[0] = solver_mod._FROZEN_SHARE - 0.01
+    slots.wake()
+    assert log == ["pause a"]
+    now[0] = solver_mod._FROZEN_SHARE + 0.01
+    slots.wake()
+    assert log[1:] == ["pause l", "resume a"]  # never two running at once
+    now[0] += 10.0
+    slots.wake()
+    assert len(log) == 3
+    slots.release(lent=True, check=lent)
+    assert len(log) == 3  # it ends: its detach continues its worker
+    slots.unstick(lender)
+    slots.release(lent=False)
+    assert (slots.held, slots.lent, slots.stuck, slots._lent_checks) == (0, 0, 0, [])
+
+
+async def test_a_lent_check_of_a_lender_that_ended_holds_the_slot_and_runs() -> None:
+    log: list[str] = []
+    slots = solver_mod._Slots(1)
+    lender, lent = _lender(log, "a"), _lender(log, "l")
+    lender.budget_s = 0.0  # due as soon as it is frozen at all
+    assert await slots.acquire(short=False) is False
+    assert slots.stick(False, lender)
+    assert await slots.acquire(short=True) is True
+    slots.lending(lent)
+    slots.wake()
+    assert lent.frozen() and not lender.frozen()
+    slots.unstick(lender)
+    slots.release(lent=False)
+    assert not lent.frozen() and (slots.held, slots.lent) == (1, 0)
+    slots.release(lent=True, check=lent)
+    assert (slots.held, slots.lent, slots._holders) == (0, 0, set())
+
+
+async def test_a_lent_check_keeps_the_slot_of_a_lender_that_ended() -> None:
+    # AUDIT-43 #3: the next caller gets the slot only once the lent check is done.
+    slots = solver_mod._Slots(1)
+    lender = _lender([], "a")
+    assert await slots.acquire(short=False) is False
+    assert slots.stick(False, lender)
+    assert await slots.acquire(short=True) is True
+    slots.unstick(lender)  # e.g. cancelled
+    slots.release(lent=False)
+    later = asyncio.ensure_future(slots.acquire(short=True))
+    await asyncio.sleep(0)
+    assert not later.done() and (slots.held, slots.lent) == (1, 0)
+    slots.release(lent=True)  # the lent check ends
+    assert await later is False
+    slots.release(lent=False)
+    assert (slots.held, slots.lent, slots._handed) == (0, 0, 0)
+
+
+def test_paused_newcomers_are_bounded_by_the_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AUDIT-42 #2: each holds a worker process and a pool thread; without SIGSTOP none
+    # is paused, as it would keep running (AUDIT-43 #4).
+    executor = SolverExecutor(2, 0)
+    try:
+        assert [executor._pause() for _ in range(3)] == [True, True, False]
+        executor._unpause()
+        assert executor._pause()
+        monkeypatch.setattr(solver_workers, "_PAUSABLE", False)
+        executor._unpause()
+        assert not executor._pause()
+    finally:
+        executor.shutdown()
+
+
+async def test_a_newcomer_stopped_past_the_cap_runs_again_to_its_own_result() -> None:
+    # With 1 slot, one newcomer that gives way waits paused; the next is stopped, queued
+    # again for a slot and made again, so its result is its own check's, not "interrupted".
+    executor = SolverExecutor(1, 0)
+    calls = [0, 0]
+
+    def newcomer(i: int) -> solver_mod.SolverOutcome:
+        calls[i] += 1
+        return Z3Solver(0.5).check_entailment(*UNDECIDABLE)
+
+    try:
+        hold = asyncio.create_task(
+            executor.run(partial(Z3Solver(_WAIT_S).check_entailment, *UNDECIDABLE))
+        )
+        slots = executor._slot()
+        while slots.stuck == 0:
+            await asyncio.sleep(0.005)
+        tasks = [asyncio.create_task(executor.run(partial(newcomer, i))) for i in (0, 1)]
+        while sum(not w.new for w in slots._waiters) < 2:  # both shown hard, queued again
+            await asyncio.sleep(0.005)
+        assert sum(i.frozen() for i in executor._running) == 1
+        hold.cancel()
+        outs = await asyncio.wait_for(asyncio.gather(*tasks), _WAIT_S)
+        await asyncio.gather(hold, return_exceptions=True)
+    finally:
+        executor.shutdown()
+    assert sorted(calls) == [1, 2]
+    assert all(o.reason == "timeout" and o != solver_mod._INTERRUPTED for o, _ in outs), outs
+
+
+def test_one_watchdog_thread_interrupts_each_armed_check_by_its_own_deadline() -> None:
+    # AUDIT-42 #4: one thread, armed per check; none reaches a context once disarmed.
+    hits = {"early": 0, "late": 0}
+
+    def ctx(name: str) -> Any:
+        return SimpleNamespace(interrupt=lambda: hits.__setitem__(name, hits[name] + 1))
+
+    with solver_mod._Watchdog(ctx("late"), solver_mod._now() + _WAIT_S):
+        with solver_mod._Watchdog(ctx("early"), solver_mod._now() + 0.05):
+            _until_sync(lambda: hits["early"] >= 2)
+        seen = hits["early"]
+        time.sleep(3 * solver_mod._INTERRUPT_EVERY_S)
+        assert (hits["early"], hits["late"]) == (seen, 0)
+    assert [t.name for t in threading.enumerate()].count("z3-watchdog") == 1
+
+
+def test_run_time_counts_a_wait_for_a_worker_while_frozen_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Frozen in a lender's turn while it waits for its worker: the overlap was subtracted
+    # twice, and `solver_ms` came out negative under load.
+    now = [0.0]
+    monkeypatch.setattr(solver_mod, "_clock", lambda: now[0])
+    interrupt = solver_mod._Interrupt()
+    interrupt.started = 0.0
+    now[0] = 1.0
+    interrupt.pause()
+    now[0] = 2.0
+    interrupt.freeze()
+    now[0] = 3.0
+    interrupt.resume()
+    now[0] = 4.0
+    assert interrupt.ran_s() == 1.0
+    interrupt.thaw()
+    now[0] = 5.0
+    interrupt.ended = 5.0
+    assert (interrupt.ran_s(), interrupt.frozen_s()) == (2.0, 2.0)
