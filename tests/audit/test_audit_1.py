@@ -1,7 +1,7 @@
 """AUDIT-1: encoding soundness. Wrong traces the verifier currently admits.
 
-Every test asserts the *correct* behavior and is a strict xfail: it fails
-today, and it passing means the finding is fixed. See `AUDIT-1.md`.
+Every test asserts the *correct* behavior. Each was a strict xfail until SG7
+fixed its finding; see `AUDIT-1.md`.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from autolab.verification.formalizer import FormalizationError, Vocabulary, prom
 from autolab.verification.llm import FakeLLMClient, LLMPurpose
 from autolab.verification.solver import SmtFormula
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_failing_trace, register_trivial_trace
+from tests.fixtures.agent_helpers import register_circular_trace, register_failing_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator import test_graph as tg
 
@@ -112,13 +112,12 @@ _TESTED = GoldenStep("K-17 was tested in a cell assay", "premise", "(declare-con
 # AUDIT-1 #1 (critical): the payload claim asserted as a premise, then concluded.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #1")
 async def test_circular_premise_restating_payload_is_not_admitted() -> None:
     fake = FakeLLMClient()
     fake.register(
         "research.hypothesis", build_hypothesis_prompt(QUESTION), HYPOTHESIS.model_dump_json()
     )
-    register_trivial_trace(
+    register_circular_trace(
         fake,
         agent="research",
         trace_purpose="research.trace",
@@ -128,7 +127,7 @@ async def test_circular_premise_restating_payload_is_not_admitted() -> None:
 
     update = await ResearchAgent(verifier=Verifier(fake), llm=fake)(empty_state(QUESTION))
 
-    # Today: confidence 1.0, hitl_pending None, the hypothesis is merged.
+    # Before SG7: confidence 1.0, hitl_pending None, the hypothesis is merged.
     assert update["hitl_pending"] is not None
     assert "hypotheses" not in update
 
@@ -150,7 +149,6 @@ class _RetryFake(FakeLLMClient):
             raise
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #1")
 async def test_retry_loop_does_not_launder_refuted_claim_into_premise() -> None:
     fake = _RetryFake()
     tg._seed_full_run(fake)
@@ -164,15 +162,15 @@ async def test_retry_loop_does_not_launder_refuted_claim_into_premise() -> None:
         conclusion=tg.HYPOTHESIS.statement,
     )
     # Every retry: the same claim moved into a premise and concluded from itself.
-    trivial = FakeLLMClient()
-    register_trivial_trace(
-        trivial,
+    # Registered on `fake` so the verifier finds the circular trace's formalizations.
+    register_circular_trace(
+        fake,
         agent="research",
         trace_purpose="research.trace",
-        trace_prompt="",
+        trace_prompt="<circular>",
         conclusion=tg.HYPOTHESIS.statement,
     )
-    circular = await trivial.call("research.trace", "")
+    circular = await fake.call("research.trace", "<circular>")
     fake.retry[("research.trace", base_trace_prompt)] = circular
     fake.retry[("research.hypothesis", build_hypothesis_prompt(tg.QUESTION))] = (
         tg.HYPOTHESIS.model_dump_json()
@@ -184,7 +182,7 @@ async def test_retry_loop_does_not_launder_refuted_claim_into_premise() -> None:
 
     first = final["verification_history"][0]
     assert any(v.verdict == "INVALID" for v in first.step_verdicts)
-    # Today: no human ever sees it; the refuted hypothesis is admitted on retry.
+    # Before SG7: no human ever sees it; the refuted hypothesis is admitted on retry.
     assert final["hypotheses"] == []
 
 
@@ -192,7 +190,6 @@ async def test_retry_loop_does_not_launder_refuted_claim_into_premise() -> None:
 # AUDIT-1 #2 (critical): SMT commands smuggled inside `declarations`.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #2")
 @pytest.mark.parametrize(
     "decls",
     [
@@ -212,7 +209,7 @@ async def test_declarations_cannot_smuggle_assertions(decls: str) -> None:
 
     result = await Verifier(fake, check_faithfulness=True).verify(trace, context=_BOUND)
 
-    # Today: the conclusion is "entailed" (by itself), score 1.0.
+    # Before SG7: the conclusion is "entailed" (by itself), score 1.0.
     assert result.step_verdicts[1].verdict != "VALID"
     assert not _admitted(result)
 
@@ -228,7 +225,6 @@ def _premises(n: int) -> list[GoldenStep]:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #3")
 async def test_conclusion_that_fails_to_formalize_is_not_admitted() -> None:
     fake = FakeLLMClient()
     trace = _register(fake, [*_premises(1), GoldenStep(CLAIM, "conclusion", "", "(cures", (0,))])
@@ -236,11 +232,10 @@ async def test_conclusion_that_fails_to_formalize_is_not_admitted() -> None:
     result = await Verifier(fake).verify(trace, context=_BOUND)
 
     assert result.step_verdicts[1].reason == "formalization_failed"
-    # Today: (1 + 0.5) / 2 = 0.75 >= 0.7, admitted.
+    # Before SG7: (1 + 0.5) / 2 = 0.75 >= 0.7, admitted.
     assert not _admitted(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #3")
 async def test_conclusion_rejected_by_faithfulness_judge_is_not_admitted() -> None:
     fake = FakeLLMClient()
     steps = [
@@ -252,11 +247,10 @@ async def test_conclusion_rejected_by_faithfulness_judge_is_not_admitted() -> No
     result = await Verifier(fake, check_faithfulness=True).verify(trace, context=_BOUND)
 
     assert result.step_verdicts[2].reason == "formalization_failed"
-    # Today: the judge says the SMT does not state the claim, yet (2 + 0.5) / 3 = 0.83.
+    # Before SG7: the judge says the SMT does not state the claim, yet (2 + 0.5) / 3 = 0.83.
     assert not _admitted(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #3")
 async def test_conclusion_that_times_out_is_not_admitted() -> None:
     fake = FakeLLMClient()
     xyz = "(declare-const x Int)\n(declare-const y Int)\n(declare-const z Int)"
@@ -269,11 +263,10 @@ async def test_conclusion_that_times_out_is_not_admitted() -> None:
     result = await Verifier(fake, solver_timeout_seconds=0.2).verify(trace, context=_BOUND)
 
     assert result.step_verdicts[1].reason == "timeout"
-    # Today: the payload conclusion was never checked (solver gave up), yet it scores 0.75.
+    # Before SG7: the payload conclusion was never checked (solver gave up), yet it scores 0.75.
     assert not _admitted(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #3")
 async def test_conclusion_with_no_premises_is_not_admitted() -> None:
     fake = FakeLLMClient()
     steps = [
@@ -286,7 +279,7 @@ async def test_conclusion_with_no_premises_is_not_admitted() -> None:
     result = await Verifier(fake).verify(trace, context=_BOUND)
 
     assert result.step_verdicts[4].reason == "no_premises"
-    # Today: (3 + 0.5 + 0.5) / 5 = 0.8, and the monitor's no_premises rework rule is
+    # Before SG7: (3 + 0.5 + 0.5) / 5 = 0.8, and the monitor's no_premises rework rule is
     # never reached because PASS is decided on score first.
     assert not _admitted(result)
 
@@ -301,7 +294,6 @@ _RESULT = ExperimentResult(
 )
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #4")
 async def test_premise_contradicting_a_measurement_is_not_valid() -> None:
     fake = FakeLLMClient()
     facts = measurement_facts(_RESULT)
@@ -315,13 +307,12 @@ async def test_premise_contradicting_a_measurement_is_not_valid() -> None:
 
     result = await Verifier(fake).verify(trace, context=context)
 
-    # Today: step 0 contradicts the code-built fact (= absorbance 0.3) but is VALID/assumed,
+    # Before SG7: step 0 contradicts the code-built fact (= absorbance 0.3) but is VALID/assumed,
     # and the trace scores 1.0.
     assert result.step_verdicts[0].verdict != "VALID"
     assert not _admitted(result)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #4")
 async def test_mutually_contradictory_premises_are_not_admitted() -> None:
     fake = FakeLLMClient()
     steps = [
@@ -333,7 +324,7 @@ async def test_mutually_contradictory_premises_are_not_admitted() -> None:
 
     result = await Verifier(fake).verify(trace, context=_BOUND)
 
-    # Today: P and not P are both VALID/assumed and the trace scores 1.0.
+    # Before SG7: P and not P are both VALID/assumed and the trace scores 1.0.
     assert not _admitted(result)
 
 
@@ -341,7 +332,6 @@ async def test_mutually_contradictory_premises_are_not_admitted() -> None:
 # AUDIT-1 #5 (medium): a tautological conclusion is VALID whenever faithfulness is off.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #5")
 @pytest.mark.parametrize("assertion", ["true", "(or t (not t))"])
 async def test_tautological_conclusion_is_not_valid(assertion: str) -> None:
     fake = FakeLLMClient()
@@ -350,7 +340,7 @@ async def test_tautological_conclusion_is_not_valid(assertion: str) -> None:
     # Default construction: faithfulness is off for any client without `live = True`.
     result = await Verifier(fake).verify(trace, context=_BOUND)
 
-    # Today: the payload claim "binds" by text, its formula says nothing, score 1.0.
+    # Before SG7: the payload claim "binds" by text, its formula says nothing, score 1.0.
     assert result.step_verdicts[1].verdict != "VALID"
     assert not _admitted(result)
 
@@ -362,7 +352,6 @@ _PRIOR = Hypothesis(question=QUESTION, statement="K-17 is toxic to human cells",
 _NEW = Hypothesis(question=QUESTION, statement="K-17 is not toxic to human cells", rationale="r")
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #6")
 async def test_contradiction_trigger_fires_when_reformalization_fails() -> None:
     fake = FakeLLMClient()
     trace = contradiction_trace([_PRIOR], _NEW)
@@ -380,12 +369,11 @@ async def test_contradiction_trigger_fires_when_reformalization_fails() -> None:
     state = empty_state(QUESTION)
     state["hypotheses"] = [_PRIOR]
 
-    # Today: steps 0 and 1 are jointly unsat, but the last step never reaches the solver,
+    # Before SG7: steps 0 and 1 are jointly unsat, but the last step never reaches the solver,
     # so the trigger returns None and the contradictory hypothesis is admitted.
     assert await trigger(_NEW, state) is not None
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-1 #6")
 async def test_contradiction_trigger_fails_closed_when_prior_cannot_be_formalized() -> None:
     fake = FakeLLMClient()
     _register(
@@ -400,5 +388,5 @@ async def test_contradiction_trigger_fails_closed_when_prior_cannot_be_formalize
     state = empty_state(QUESTION)
     state["hypotheses"] = [_PRIOR]
 
-    # Today: the prior is silently dropped from the premise pool; the check passes.
+    # Before SG7: the prior is silently dropped from the premise pool; the check passes.
     assert await trigger(_NEW, state) is not None

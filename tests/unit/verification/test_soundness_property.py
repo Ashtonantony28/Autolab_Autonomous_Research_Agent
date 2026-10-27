@@ -100,7 +100,10 @@ def _oracle(
     out: list[Verdict] = []
     for i, (kind, claim, refs) in enumerate(steps):
         if kind == "premise":
-            out.append(("VALID", "assumed"))
+            # Assumed only if consistent with every earlier VALID step (AUDIT-1 #4).
+            prior = [steps[j][1] for j in range(i) if out[j][0] == "VALID"]
+            consistent = any(all(_eval(p, e) for p in (*prior, claim)) for e in envs)
+            out.append(("VALID", "assumed") if consistent else ("INVALID", "premises_inconsistent"))
             continue
         pool = [steps[j][1] for j in (refs or range(i)) if out[j][0] == "VALID"]
         if not pool:
