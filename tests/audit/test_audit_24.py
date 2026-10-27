@@ -99,7 +99,6 @@ class _Held:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #2")
 async def test_a_check_that_ran_long_while_the_loop_was_busy_counts_as_hard() -> None:
     executor = SolverExecutor(1, 0)
     started = threading.Event()
@@ -124,6 +123,9 @@ async def test_a_check_that_ran_long_while_the_loop_was_busy_counts_as_hard() ->
 
 # --------------------------------------------------------------------------
 # #1 (high): since SG27 the AUDIT-14 #1 repros no longer catch the bug they name.
+# Fixed by SG29: checks run in worker processes, the pool is Int (parsed in one
+# call, as before SG27), and the timeout repro times `_solve` in this process, so a
+# kill cannot hide an unbounded check. The mutant is applied to `_solve`.
 # Their 1600-premise pool is now loaded one formula at a time, and on that path the
 # SG19 assumption-based entailment check honours its timeout and cancels: with it
 # restored (AUDIT-20's S01), both repros and AUDIT-20 #3's pass, 3 of 3. The phase
@@ -142,11 +144,10 @@ _ASSUME: Final = (
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #1")
 def test_the_audit_14_1_timeout_repro_fails_with_the_assumption_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _mutant(monkeypatch, Z3Solver, "_check", *_ASSUME)
+    _mutant(monkeypatch, solver_mod, "_solve", *_ASSUME)
     with pytest.raises(AssertionError):
         audit_14.test_a_check_returns_within_its_timeout()
 
@@ -156,7 +157,7 @@ def test_on_the_one_call_path_the_audit_14_1_repro_catches_the_assumption_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The suggested fix: the same repro with its pool kept on the one-call path.
-    _mutant(monkeypatch, Z3Solver, "_check", *_ASSUME)
+    _mutant(monkeypatch, solver_mod, "_solve", *_ASSUME)
     monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 10 * audit_14._POOL)
     with pytest.raises(AssertionError):
         audit_14.test_a_check_returns_within_its_timeout()
@@ -215,7 +216,6 @@ async def test_a_lent_check_never_lends_a_place() -> None:
     assert await _a_lent_check_never_lends() == (1, 1)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #3")
 async def test_a_lent_check_never_lends_a_place_under_s06(monkeypatch: pytest.MonkeyPatch) -> None:
     _mutant(monkeypatch, SolverExecutor, "run", *_S06)
     assert await _a_lent_check_never_lends() == (1, 1)
@@ -254,7 +254,7 @@ def _limits_at_the_first_loading_check(monkeypatch: pytest.MonkeyPatch) -> list[
     monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(solver_mod._LOAD_ABOVE + 20)
-    out = Z3Solver(30.0).check_entailment(premises, claim)
+    out = Z3Solver(30.0)._check_here(premises, claim)  # `_solve`, as its worker runs it
     assert out.reason == "not_entailed"
     return at_first[0]
 
@@ -264,13 +264,14 @@ def test_every_loading_check_runs_under_a_limit(monkeypatch: pytest.MonkeyPatch)
     assert limits and 0 < limits[-1] <= 30_000
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #4")
-def test_every_loading_check_runs_under_a_limit_under_l01(
+def test_every_loading_check_runs_under_a_limit_kills_l01(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # AUDIT-24 #4, pinned: the guard above (and its twin in `test_solver_loading.py`)
+    # fails under L01.
     _mutant(monkeypatch, solver_mod, "_load", *_L01)
     limits = _limits_at_the_first_loading_check(monkeypatch)
-    assert limits and 0 < limits[-1] <= 30_000
+    assert not (limits and 0 < limits[-1] <= 30_000)
 
 
 # --------------------------------------------------------------------------
@@ -319,7 +320,7 @@ def _loading_limits_over_the_time_left(monkeypatch: pytest.MonkeyPatch) -> list[
     monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(solver_mod._LOAD_ABOVE + 20)
-    assert Z3Solver(1.0).check_entailment(premises, claim).reason == "timeout"
+    assert Z3Solver(1.0)._check_here(premises, claim).reason == "timeout"
     return over
 
 
@@ -329,12 +330,13 @@ def test_a_loading_check_never_gets_more_than_the_documented_share(
     assert _loading_limits_over_the_time_left(monkeypatch) == []
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #5")
-def test_a_loading_check_never_gets_more_than_the_documented_share_under_l02(
+def test_a_loading_check_never_gets_more_than_the_documented_share_kills_l02(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # AUDIT-24 #5, pinned: the guard above (and its twin in `test_solver_loading.py`)
+    # fails under L02.
     monkeypatch.setattr(solver_mod, "_RESET_SHARE", 0.1)
-    assert _loading_limits_over_the_time_left(monkeypatch) == []
+    assert _loading_limits_over_the_time_left(monkeypatch) != []
 
 
 # --------------------------------------------------------------------------
@@ -359,7 +361,7 @@ def _loading_checks_for_the_audit_18_3_pool(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(_AUDIT_18_3_POOL, claim="true")
-    assert Z3Solver(30.0).check_entailment(premises, claim).verdict == "VALID"
+    assert Z3Solver(30.0)._check_here(premises, claim).verdict == "VALID"
     return loads[0]
 
 
@@ -369,12 +371,13 @@ def test_the_audit_18_3_pool_is_loaded_one_formula_at_a_time(
     assert _loading_checks_for_the_audit_18_3_pool(monkeypatch) == _AUDIT_18_3_POOL - 1
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-24 #6")
-def test_the_audit_18_3_pool_is_loaded_one_formula_at_a_time_under_l03(
+def test_the_audit_18_3_pool_is_loaded_one_formula_at_a_time_kills_l03(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # AUDIT-24 #6, pinned: the guard above (and its twin in `test_solver_loading.py`)
+    # fails under L03.
     monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 2000)
-    assert _loading_checks_for_the_audit_18_3_pool(monkeypatch) == _AUDIT_18_3_POOL - 1
+    assert _loading_checks_for_the_audit_18_3_pool(monkeypatch) != _AUDIT_18_3_POOL - 1
 
 
 # --------------------------------------------------------------------------
@@ -541,9 +544,7 @@ def test_a_batch_with_a_new_sort_reuses_the_probe_under_f14(
 # consistency check, not the loading before it, so a pool that spent most of its
 # budget loading still gets its entailment check (what the AUDIT-14 #1 timeout repro
 # now relies on). No deterministic test pins which time the guard measures.
-_LOADED: Final = (
-    "consistency = z3.sat if loading is None else _load(solver, loading, deadline, interrupt)\n"
-)
+_LOADED: Final = "consistency = z3.sat if loading is None else _load(solver, loading, deadline)\n"
 _L06: Final = (
     f"    {_LOADED}    started = time.monotonic()\n",
     f"    started = time.monotonic()\n    {_LOADED}",
@@ -564,7 +565,7 @@ def _a_pool_that_loaded_slowly_gets_its_entailment_check(monkeypatch: pytest.Mon
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(solver_mod._LOAD_ABOVE + 20)
-    out = Z3Solver(1.0).check_entailment(premises, claim)
+    out = Z3Solver(1.0)._check_here(premises, claim)
     assert (out.verdict, out.reason) == ("INVALID", "not_entailed")
 
 
@@ -578,5 +579,5 @@ def test_a_pool_that_loaded_slowly_gets_its_entailment_check(
 def test_a_pool_that_loaded_slowly_gets_its_entailment_check_under_l06(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _mutant(monkeypatch, Z3Solver, "_check", *_L06)
+    _mutant(monkeypatch, solver_mod, "_solve", *_L06)
     _a_pool_that_loaded_slowly_gets_its_entailment_check(monkeypatch)
