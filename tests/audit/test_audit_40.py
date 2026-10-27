@@ -5,11 +5,11 @@ Each finding in `AUDIT-40.md` about a mutant the suite lets through has two test
 - a strict xfail, named for the finding, that applies the mutant with `monkeypatch`
   (`_mutant` from AUDIT-24 recompiles one function with one exact-match edit) and
   runs the same check.
-#5 and #6 are about existing tests, not mutants: each strict xfail fixes the
-condition under which that test goes wrong (a machine that slows after the
-calibration; a prestart thread that runs late), so it fails the same way every
-time. Waits are bounded by events, polls of the executor or a fake clock; the one
-`perf` pair compares measurements taken on this machine in the same test.
+#5 and #6 are about existing tests, not mutants: each test fixes the condition
+under which that test went wrong (a machine that slows after the calibration; a
+prestart thread that runs late); both pass since SG36 made those tests robust to it.
+Waits are bounded by events, polls of the executor or a fake clock; the one `perf` pair
+compares measurements taken on this machine in the same test.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from autolab.verification import solver_workers
 from autolab.verification.solver import SmtFormula, SolverExecutor, Z3Solver
 from tests.audit import test_audit_14 as audit_14
 from tests.audit.test_audit_24 import _ASSUME, _Held, _mutant, _until
+from tests.audit.test_audit_36 import _static_mutant
 from tests.unit.verification import test_solver_executor
 
 _WAIT_S: Final = 10.0
@@ -273,8 +274,8 @@ async def test_a_slot_whose_check_waits_for_its_worker_lends_nothing_under_u02(
         monkeypatch,
         SolverExecutor,
         "run",
-        "stuck = not interrupt.paused() and slots.stick(lent)",
-        "stuck = slots.stick(lent)",
+        "stuck = not interrupt.paused() and slots.stick(lent, interrupt)",
+        "stuck = slots.stick(lent, interrupt)",
     )
     assert await _stuck_while_booting_then_running(executors) == (0, 1)
 
@@ -285,7 +286,9 @@ async def test_a_slot_whose_check_waits_for_its_worker_lends_nothing_under_u02(
 # result when its check left its worker between `_yields` and the stop; the old
 # `interrupt.request(); stopped = True` throws it away and runs the check again.
 # The window is a thread race, so here `_yields` itself detaches the check as it
-# decides, as the pool thread would at that instant.
+# decides, as the pool thread would at that instant. Since SG36 the check is paused
+# and queued again rather than stopped: one that has left its worker returns its
+# result at once, without waiting for a place (`_again`).
 # --------------------------------------------------------------------------
 
 
@@ -311,11 +314,14 @@ class _LeavesItsWorker:
 
 async def _late_stop(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, executors: list[SolverExecutor]
-) -> tuple[str, int]:
+) -> tuple[str, int, bool]:
+    """(result, calls, whether it came back before the slot freed)."""
     real_yields = SolverExecutor._yields
 
-    def yields(interrupt: solver_mod._Interrupt, slots: solver_mod._Slots) -> bool:
-        if not real_yields(interrupt, slots):
+    def yields(
+        interrupt: solver_mod._Interrupt, slots: solver_mod._Slots, gave_way: bool = False
+    ) -> bool:
+        if not real_yields(interrupt, slots, gave_way):
             return False
         interrupt.detach()  # the check leaves its worker just as the stop comes
         return True
@@ -333,33 +339,36 @@ async def _late_stop(
     try:
         assert await asyncio.to_thread(check.started.wait, _WAIT_S)
         clock.slices(solver_mod._HARD_SLICES)  # it has shown it is hard
-        await _until(lambda: check.interrupt is not None and check.interrupt.requested())
+        await _until(lambda: check.interrupt is not None and check.interrupt.frozen())
+        check.gate.set()
+        done, _ = await asyncio.wait((newcomer,), timeout=20 * solver_mod._SLICE_S)
     finally:
         check.gate.set()
         blocker.gate.set()
     out, _ = await newcomer
     await slot_task
-    return out, check.calls
+    return out, check.calls, bool(done)
 
 
 async def test_a_stop_after_the_check_left_its_worker_keeps_the_result(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, executors: list[SolverExecutor]
 ) -> None:
-    assert await _late_stop(monkeypatch, clock, executors) == ("kept", 1)
+    assert await _late_stop(monkeypatch, clock, executors) == ("kept", 1, True)
 
 
 @pytest.mark.xfail(strict=True, reason="AUDIT-40 #3")
 async def test_a_stop_after_the_check_left_its_worker_keeps_the_result_under_u01(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, executors: list[SolverExecutor]
 ) -> None:
-    _mutant(
+    # SG36's counterpart of U01: the paused check waits for a place even if it has ended.
+    _static_mutant(
         monkeypatch,
         SolverExecutor,
-        "run",
-        "stopped = interrupt.request()",
-        "interrupt.request()\n                        stopped = True",
+        "_again",
+        "await asyncio.wait((place, future), return_when=asyncio.FIRST_COMPLETED)",
+        "await asyncio.wait((place,))",
     )
-    assert await _late_stop(monkeypatch, clock, executors) == ("kept", 1)
+    assert await _late_stop(monkeypatch, clock, executors) == ("kept", 1, True)
 
 
 # --------------------------------------------------------------------------
@@ -437,7 +446,7 @@ def _calibrated(skew: float) -> Callable[[list[SmtFormula], SmtFormula], tuple[f
 
 
 def _audit_14_1_core_leg_under_assume(monkeypatch: pytest.MonkeyPatch, skew: float) -> None:
-    _mutant(monkeypatch, solver_mod, "_solve", *_ASSUME)
+    _mutant(monkeypatch, solver_mod, "_decide", *_ASSUME)
     monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 10 * audit_14._POOL)
     monkeypatch.setattr(audit_14, "_phases_s", _calibrated(skew))
     # The worker leg cannot catch ASSUME: the kill bounds it (AUDIT-24 #1). Under load
@@ -448,6 +457,7 @@ def _audit_14_1_core_leg_under_assume(monkeypatch: pytest.MonkeyPatch, skew: flo
 
 
 @pytest.mark.perf
+@pytest.mark.timeout(180)  # as the AUDIT-14 #1 repro it runs
 def test_the_audit_14_1_repro_catches_assume_when_calibrated_on_this_machine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -455,7 +465,7 @@ def test_the_audit_14_1_repro_catches_assume_when_calibrated_on_this_machine(
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-40 #5")
+@pytest.mark.timeout(180)
 def test_the_audit_14_1_repro_catches_assume_when_the_machine_slows_after_calibrating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,7 +486,6 @@ def test_the_audit_14_1_repro_catches_assume_when_the_machine_slows_after_calibr
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-40 #6")
 def test_solver_ms_excludes_worker_start_up_whenever_prestart_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

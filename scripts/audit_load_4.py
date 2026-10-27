@@ -88,13 +88,13 @@ def _add_based_check(smt2: str, premises: int, true_claim: bool, timeout_s: floa
         solver.from_string(smt2)
     except z3.Z3Exception as exc:
         return SolverOutcome("UNGROUNDED", "formalization_failed", f"SMT parse error: {exc}")
-    solver.set("timeout", solver_mod._remaining_ms(deadline))
+    solver.set("timeout", max(1, int((deadline - time.monotonic()) * 1000)))
     consistency = solver.check()
     if consistency == z3.unsat:
         return SolverOutcome("INVALID", "premises_inconsistent", "")
     if consistency == z3.sat:
         solver.add(z3.Bool(solver_mod._NEGATED_CLAIM, ctx))
-        solver.set("timeout", solver_mod._remaining_ms(deadline))
+        solver.set("timeout", max(1, int((deadline - time.monotonic()) * 1000)))
         result = solver.check()
         if result == z3.unsat:
             return SolverOutcome("VALID", "entailed", "")

@@ -51,6 +51,7 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
 | SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
 | SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (PR pending); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
+| SG36 | Pause the lending check's worker (AUDIT-34 #2, #3, AUDIT-38 #1, #2, AUDIT-40 #5, #6) | owner's choice after audit round 10 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/` | done (PR pending) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -470,6 +471,13 @@ Medium and low round-9 findings not folded in above stay in the AUDIT files, amo
 Round 10 (AUDIT-37..40, fresh agents, base `1e537af`) found 0 critical and 0 high findings, so the audit loop ends here. Soundness held: no stopped, kept or forked check returned a wrong verdict in stress runs. SG35 fixed AUDIT-34 #1 (a stopped 150 ms check waits 3.4–8.4 s, the pre-SG34 spread) and the fork-exit kill; all five flipped repros fail on `6c16dce`. Coverage on `verification/` is 97.7%.
 
 Open for the owner: AUDIT-34 #2 / AUDIT-38 #2 (lent places run 5.1–5.6 Z3 checks on 4 CPUs). SG35 found no CPU bound that keeps AUDIT-30 #1 and SG30's aging; AUDIT-38 prototyped pausing the lender's worker (SIGSTOP), which kept both at a mean of 3.9–4.0 but spends paused checks' wall-clock budget. Other medium findings stay in the AUDIT files: a newcomer that gave way waits the pre-SG34 time (AUDIT-38 #1), untested waiting-slot rule (AUDIT-40 #2), two load-sensitive tests (AUDIT-40 #5, #6), fork during a worker start (AUDIT-33 #1, #2, AUDIT-37 #1, AUDIT-38 #3, AUDIT-39 #2), AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1.
+
+### Owner's choice after round 10 → SG36
+
+- **SG36 Pause the lending check's worker.** The owner chose AUDIT-38's prototype for AUDIT-34 #2 / AUDIT-38 #2: while a place is lent, SIGSTOP the worker of the stuck slot check that lent it, so Z3 checks never outnumber slots plus slow places, keeping AUDIT-30 #1 and SG30's aging. Exclude paused time from the paused check's budget; pause rather than kill a newcomer that gives way, if practical; keep a newcomer that gave way lendable (AUDIT-38 #1); make AUDIT-40 #5 and #6 robust. **Flip:** AUDIT-38 #1, #2, AUDIT-34 #2, #3, AUDIT-40 #5, #6. **Verify:** `make lint typecheck test` · `make test` green 5 times under 4 CPU burners · error injection (34/34, 26/26) · bench · the AUDIT-38 #2 /proc test 3 of 3.
+
+Result: done (ADR 0009, SG36 amendment). One lender is frozen per lent place, longest stuck first. Z3's own timeout is wall-clock and runs on through a SIGSTOP, so a watchdog thread in the worker interrupts the check on a clock that excludes paused time. A newcomer that gives way is paused, not killed, so `fn` runs once (AUDIT-35 #2, AUDIT-39 #3 pass too). Until it shows it is hard it stays lendable, and it gives way again as soon as a short caller queues. Measured (`audit_load_10`, 2 + 2 places): 3.0–3.8 Z3 processes run on average, over 4 in 0–1 % of samples (5.1–5.6 before); a 150 ms newcomer at 5 s waits 0.17–0.18 s (3.4–8.4 s before); no check is re-run and no worker restarted. AUDIT-34 #2's in-flight repros were adapted to count calls whose worker is not paused, not retired; AUDIT-38 #2's /proc test passes 3 of 3. AUDIT-40 #2's test already exists in `test_audit_40.py` and passes. Costs: a frozen check holds a worker process and a pool thread; a step's `bench_verifier` p50 is 6.10 ms (5.83 ms before). Without SIGSTOP (not POSIX), nothing is paused.
+
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -492,6 +500,7 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 
 ## Log
 
+- 2026-10-27: SG36 done (PR pending): a lending slot's worker is paused (SIGSTOP), so Z3 checks stay within slots plus slow places; paused time is not budget.
 - 2026-10-22: audit round 10 done (0 critical, 0 high); the audit loop ends. Soundness held; CPU oversubscription from lent places (AUDIT-34 #2) waits on the owner.
 - 2026-10-22: audit round 9 done (0 critical, 1 high); SG35 added. Soundness held; the high is a stopped newcomer going to the back of the hard queue.
 - 2026-10-21: audit round 8 done (0 critical, 1 high); SG34 added. Soundness held; the high is newcomers queueing behind runs that started together.

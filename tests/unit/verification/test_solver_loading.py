@@ -23,7 +23,6 @@ from tests.fixtures.golden_traces import ALL, build
 
 _LONG: Final = solver_mod._LOAD_ABOVE + 20
 """Premises in a pool that is loaded one formula at a time."""
-_DOCUMENTED_RESET_SHARE: Final = 0.9
 
 
 def _chain(n: int, claim: str = "(> r0 0.0)") -> tuple[list[SmtFormula], SmtFormula]:
@@ -163,63 +162,20 @@ def test_only_long_real_pools_are_loaded() -> None:
     assert not solver_mod._loaded("(declare-const Reals Int)", solver_mod._LOAD_ABOVE + 1)
 
 
-def test_a_loading_check_never_gets_much_more_than_the_time_left(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Each loading check "takes" 1% of the budget; the limit Z3 runs under is set again
-    # once less than `_RESET_SHARE` of it is left, so it never exceeds what is left by more.
-    clock = _Clock()
-    timeout_s = 1.0
-    deadline = clock.now + timeout_s
-    limit = [0]
-    sets = [0]
-    over: list[tuple[int, int]] = []
-    real_set, real_load = z3.Solver.set, z3.Z3_solver_check
-
-    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
-        if args and args[0] == "timeout":
-            limit[0] = int(str(args[1]))
-            sets[0] += 1
-        real_set(self, *args, **kwargs)
-
-    def load(ctx: object, solver: object) -> int:
-        left_ms = int((deadline - clock.now) * solver_mod._MS_PER_S)
-        if limit[0] > left_ms / _DOCUMENTED_RESET_SHARE + 1:  # not the constant (AUDIT-24 #5)
-            over.append((limit[0], left_ms))
-        clock.now += timeout_s / 100
-        return int(real_load(ctx, solver))
-
-    monkeypatch.setattr(solver_mod, "time", clock)
-    monkeypatch.setattr(z3.Solver, "set", record)
-    monkeypatch.setattr(z3, "Z3_solver_check", load)
-    premises, claim = _chain(_LONG)
-    out = Z3Solver(timeout_s)._check_here(premises, claim)
-    assert out.reason == "timeout"
-    assert over == []
-    assert sets[0] < 30  # about log(100) / log(1 / 0.9), not one per check
-
-
 def test_every_loading_check_runs_under_a_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    # AUDIT-24 #4: a limit is set before the first loading check, and every later one.
-    limits: list[int] = []
-    unlimited: list[int] = []
-    real_set, real_load = z3.Solver.set, z3.Z3_solver_check
-
-    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
-        if args and args[0] == "timeout":
-            limits.append(int(str(args[1])))
-        real_set(self, *args, **kwargs)
+    # AUDIT-24 #4: since SG36 the limit is `_Watchdog`'s, armed for the whole of `_solve`.
+    unwatched: list[int] = []
+    real_load = z3.Z3_solver_check
 
     def load(ctx: object, solver: object) -> int:
-        if not (limits and 0 < limits[-1] <= 30_000):
-            unlimited.append(1)
+        if not any(t.name == "z3-watchdog" for t in threading.enumerate()):
+            unwatched.append(1)
         return int(real_load(ctx, solver))
 
-    monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(_LONG)
     assert Z3Solver(30.0)._check_here(premises, claim).reason == "not_entailed"
-    assert limits and unlimited == []
+    assert unwatched == []
 
 
 def test_the_audit_18_3_pool_is_loaded_one_formula_at_a_time(counts: _Counts) -> None:

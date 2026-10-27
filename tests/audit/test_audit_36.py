@@ -350,12 +350,14 @@ async def test_a_short_caller_is_lent_a_place_before_a_newcomer_under_r03(
 # a stopped check's result when `_closed` is set: its caller is in flight, and
 # `shutdown` promises it a result, not RuntimeError (AUDIT-6 #7). Without the
 # `or self._closed` the stopped newcomer queues again and gets "cannot schedule
-# new futures after shutdown"; nothing tests the branch.
+# new futures after shutdown"; nothing tests the branch. Since SG36 the check is
+# paused, never run again, so P04's line is gone; the plain test still pins it.
 # --------------------------------------------------------------------------
 
 
 class _StoppedAsShutdownStarts:
-    """A newcomer's check on a lent place: stopped as hard, while shutdown begins."""
+    """A newcomer's check on a lent place: stopped as hard (paused since SG36), while
+    shutdown begins."""
 
     def __init__(self, executor: SolverExecutor) -> None:
         self.executor = executor
@@ -365,6 +367,12 @@ class _StoppedAsShutdownStarts:
 
     def interrupt(self) -> None:
         self._stop.set()
+
+    def pause(self) -> None:
+        self._stop.set()
+
+    def resume(self) -> None:
+        """Nothing to continue: it ends once shutdown has begun."""
 
     def __call__(self) -> str:
         interrupt: solver_mod._Interrupt = solver_mod._worker.interrupt
@@ -411,20 +419,6 @@ async def _stopped_newcomer_at_shutdown(monkeypatch: pytest.MonkeyPatch) -> str:
 async def test_a_newcomer_stopped_as_shutdown_starts_gets_its_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert await _stopped_newcomer_at_shutdown(monkeypatch) == "stopped"
-
-
-@pytest.mark.xfail(strict=True, reason="AUDIT-36 #4")
-async def test_a_newcomer_stopped_as_shutdown_starts_gets_its_result_under_p04(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _mutant(
-        monkeypatch,
-        SolverExecutor,
-        "run",
-        "if not stopped or self._closed:",
-        "if not stopped:",
-    )
     assert await _stopped_newcomer_at_shutdown(monkeypatch) == "stopped"
 
 
@@ -499,7 +493,7 @@ async def test_a_lent_newcomer_yields_only_as_documented(monkeypatch: pytest.Mon
 
 
 _Y03: Final = ("w.short and not w.future.done()", "(w.short or w.new) and not w.future.done()")
-_Y09: Final = ("ran >= _SLICE_S and", "ran >= 0 and")
+_Y09: Final = ("(gave_way or ran >= _SLICE_S)", "(gave_way or ran >= 0)")
 _Y11: Final = ("if not interrupt.attached():\n        return False\n    ", "")
 
 
@@ -532,13 +526,13 @@ def _static_mutant(
         namespace,
     )
     compiled = namespace[name].__func__
-    mutated = types.FunctionType(compiled.__code__, func.__globals__, name)
+    mutated = types.FunctionType(compiled.__code__, func.__globals__, name, compiled.__defaults__)
     monkeypatch.setattr(owner, name, staticmethod(mutated))
 
 
 async def _calls_of_a_check_that_runs_hard(monkeypatch: pytest.MonkeyPatch, kind: str) -> int:
-    """How often a check is called that runs `_HARD_SLICES` as `kind`: a newcomer in the
-    slot, or a short caller on a lent place. Neither may be stopped."""
+    """How often a check is called, or paused, that runs `_HARD_SLICES` as `kind`: a
+    newcomer in the slot, or a short caller on a lent place. Neither may be stopped."""
     now = [0.0]
     monkeypatch.setattr(solver_mod, "_clock", lambda: now[0])
     executor = SolverExecutor(1, 0)
@@ -552,10 +546,18 @@ async def _calls_of_a_check_that_runs_hard(monkeypatch: pytest.MonkeyPatch, kind
     monkeypatch.setattr(executor, "_to_slow", counted)
     calls = [0]
     check = _Held()
+    freeze = solver_mod._Interrupt.freeze
 
     def counting() -> str:
         calls[0] += 1
         return check()
+
+    def counted_freeze(interrupt: solver_mod._Interrupt) -> None:
+        if interrupt is check.interrupt:  # paused since SG36, rather than stopped
+            calls[0] += 1
+        freeze(interrupt)
+
+    monkeypatch.setattr(solver_mod._Interrupt, "freeze", counted_freeze)
 
     async def drive() -> None:
         assert await asyncio.to_thread(check.started.wait, _WAIT_S)
@@ -564,7 +566,13 @@ async def _calls_of_a_check_that_runs_hard(monkeypatch: pytest.MonkeyPatch, kind
         seen = polls.get(id(interrupt), 0)
         now[0] += solver_mod._HARD_SLICES * solver_mod._SLICE_S
         # `_yields` has been asked twice since, or the check was stopped.
-        await _until(lambda: polls.get(id(interrupt), 0) >= seen + 2 or interrupt.requested())
+        await _until(
+            lambda: (
+                polls.get(id(interrupt), 0) >= seen + 2
+                or interrupt.requested()
+                or interrupt.frozen()
+            )
+        )
         check.gate.set()
 
     blocker, blocked = _Held(), None
