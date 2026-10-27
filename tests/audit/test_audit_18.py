@@ -81,7 +81,6 @@ async def test_formalizing_a_wide_function_makes_a_bounded_number_of_parses(
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #2")
 async def test_an_easy_check_never_queues_behind_a_check_that_gave_up_its_slot() -> None:
     # One stale idle permit (the worker had not marked itself idle when the next job was
     # submitted; forced here, natural under load) makes the pool skip the thread
@@ -106,10 +105,9 @@ def _real_premise_check() -> tuple[list[SmtFormula], SmtFormula, float]:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 def test_a_real_premise_check_returns_within_its_timeout() -> None:
-    # 999 chained `>` premises: Z3's consistency check never polls its limit, so a
-    # timeout at a fifth of the check's run time is overrun ~5x. Over Int it holds.
+    # 999 chained `>` premises: one simplex run never polls its limit, so before SG27 a
+    # timeout at a fifth of the check's run time was overrun ~5x.
     premises, claim, alone_s = _real_premise_check()
     timeout_s = alone_s / _SHARE
     reason, wall_s = timed_check(premises, claim, timeout_s)
@@ -118,20 +116,17 @@ def test_a_real_premise_check_returns_within_its_timeout() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 async def test_cancelling_a_real_premise_check_frees_its_worker_promptly() -> None:
-    # Same check, cancelled a tenth of the way in: the re-send thread interrupts every
-    # 5 ms, and the worker stays busy until the consistency check ends by itself.
+    # Same check, cancelled a tenth of the way in: before SG27 the worker stayed busy
+    # until the consistency check ended by itself, whatever the interrupts.
     premises, claim, alone_s = _real_premise_check()
     freed_s, sent, _ = await cancel_release_s(premises, claim, after_s=alone_s / (2 * _SHARE))
     assert freed_s < alone_s / _SHARE, f"freed after {freed_s:.2f} s, {sent} interrupts"
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #3")
 def test_a_real_premise_pool_costs_no_more_than_its_int_twin() -> None:
-    # The premise check re-checks all 999 earlier premises from scratch. Over Int it
-    # takes ~0.2 s; over Real ~2.1 s (9-11x).
+    # Before SG27 the premise check over Real cost 9-11x its Int twin.
     real_ms, int_ms = real_int_ratio(_REAL_POOL)
     assert real_ms <= 4 * int_ms, f"Real {real_ms:.0f} ms, Int {int_ms:.0f} ms"
 
@@ -140,7 +135,6 @@ def test_a_real_premise_pool_costs_no_more_than_its_int_twin() -> None:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #4")
 async def test_hard_runs_above_the_slow_cap_do_not_starve_an_easy_verify() -> None:
     # 1 worker, room for 1 slow check, 3 hard runs whose checks run to a 0.5 s timeout.
     # The check that cannot go slow keeps the slot until a slow check ends, so every
@@ -154,12 +148,12 @@ async def test_hard_runs_above_the_slow_cap_do_not_starve_an_easy_verify() -> No
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #5")
 def test_concurrent_checks_reach_the_verdict_they_reach_alone() -> None:
     # A child pinned to one CPU while os.cpu_count() says 4, as in a 1-CPU container on a
-    # 4-CPU host: 2 workers, 8 slow. The timeout is 4x one lia_chain(1600) check's run
-    # time alone. Ten at once all run (2 slots + 8 slow), share the CPU, and each reaches
-    # its wall-clock deadline first. With slow_workers=0 all ten decide.
+    # 4-CPU host. The timeout is 4x one lia_chain(1600) check's run time alone. Before
+    # SG26 the pool was sized from os.cpu_count() (2 workers, 8 slow): ten at once all
+    # ran, shared the CPU, and each reached its wall-clock deadline first. Sized from
+    # the affinity (1 worker, no slow lane), all ten decide.
     alone_s = oversubscribed(0, cpus=4, n=1600, timeout_s=60.0)["alone_s"]
     report = oversubscribed(10, cpus=4, n=1600, timeout_s=4 * alone_s)
     assert report["alone"] == "not_entailed"
@@ -181,7 +175,6 @@ async def test_a_checkpoint_write_waits_out_a_lock_like_the_store_does(tmp_path:
 # --- #7 (low): `_SETUP_SHARE` skips entailment checks that need no time ---------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-18 #7")
 def test_a_premise_check_finishes_when_its_entailment_step_needs_no_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,7 +205,7 @@ def test_a_premise_check_finishes_when_its_entailment_step_needs_no_time(
     monkeypatch.setattr(solver_mod, "time", Clock)
     monkeypatch.setattr(z3.Solver, "check", check)
     premises, claim = bool_chain(10, claim="true")
-    outcome = Z3Solver(timeout_s).check_entailment(premises, claim)
+    outcome = Z3Solver(timeout_s)._check_here(premises, claim)
     assert outcome.verdict == "VALID", outcome.details
 
 
