@@ -178,8 +178,7 @@ class Worker:
     def pause(self) -> None:
         """Stop the process (SIGSTOP) until `resume`; a no-op where there is no SIGSTOP."""
         with self._lock:
-            if self._paused_at is None and _PAUSABLE and self.process.exitcode is None:
-                os.kill(self.process.pid, signal.SIGSTOP)
+            if self._paused_at is None and _PAUSABLE and self._signal(signal.SIGSTOP):
                 self._paused_at = time.monotonic()
 
     def resume(self) -> None:
@@ -189,8 +188,17 @@ class Worker:
                 self._paused_s += time.monotonic() - self._paused_at
                 self._paused_at = None
                 self._shared.value = self._paused_s  # read by the worker once it runs again
-                if self.process.exitcode is None:
-                    os.kill(self.process.pid, signal.SIGCONT)
+                self._signal(signal.SIGCONT)
+
+    def _signal(self, signum: int) -> bool:
+        """Send `signum` to the process; False if it has ended."""
+        try:
+            if self.process.exitcode is None:
+                os.kill(self.process.pid, signum)
+                return True
+        except ProcessLookupError:  # it died and was reaped since `exitcode` was read
+            pass
+        return False
 
     def _paused(self) -> float:
         """How long the process has been paused in all, a pause in progress included."""

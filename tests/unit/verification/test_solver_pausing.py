@@ -9,6 +9,7 @@ wait is bounded by an event, a poll or a lower bound on wall time.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import multiprocessing
 import os
@@ -94,7 +95,23 @@ def test_a_paused_worker_that_dies_is_reported_dead(sleeper: solver_workers.Work
     os.kill(sleeper.process.pid, 9)  # e.g. the OOM killer
     thread.join(_WAIT_S)
     sleeper.resume()  # no SIGCONT to a process that is gone
-    assert (out, sleeper.fault) == ([None], solver_workers.DIED)
+    assert (out, sleeper.fault) == ([None], solver_workers.DIED), thread.is_alive()
+
+
+def test_a_worker_reaped_behind_its_exit_code_is_not_signalled() -> None:
+    # Another thread's `Process.start` reaps dead children: between reading `exitcode`
+    # and `os.kill`, the pid can be gone (ProcessLookupError, seen under load).
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    worker = solver_workers.Worker.__new__(solver_workers.Worker)
+    worker.process = SimpleNamespace(exitcode=None, pid=gone.pid)
+    worker._shared = ctypes.c_double(0.0)
+    worker._lock, worker._paused_at, worker._paused_s = threading.Lock(), None, 0.0
+    worker.pause()
+    assert worker._paused_at is None
+    worker._paused_at = time.monotonic()
+    worker.resume()
+    assert worker._paused_at is None
 
 
 def test_a_paused_worker_is_continued_before_it_is_killed(
@@ -116,10 +133,14 @@ def test_a_paused_worker_is_continued_before_it_is_killed(
     assert sent[:2] == [signal.SIGCONT, signal.SIGKILL]
 
 
-def test_a_check_paused_past_its_timeout_keeps_its_budget() -> None:
+def test_a_check_paused_past_its_timeout_keeps_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Z3's own `timeout` is wall-clock and would run out while the worker is stopped;
     # `_Watchdog` runs on the worker's clock, which stops with it. So the check runs its
-    # whole budget after the pause and ends by its own timeout, not the parent's kill.
+    # whole budget after the pause and ends by its own timeout, not the parent's kill
+    # (whose grace is widened here, so load cannot bring it first).
+    monkeypatch.setattr(solver_mod, "_KILL_GRACE_SHARE", 10.0)
     interrupt = solver_mod._Interrupt()
     out: list[solver_mod.SolverOutcome] = []
 
@@ -140,7 +161,9 @@ def test_a_check_paused_past_its_timeout_keeps_its_budget() -> None:
     interrupt.thaw()
     thread.join(_WAIT_S)
     wall_s = time.perf_counter() - started
-    assert (out[0].reason, out[0].details) == ("timeout", "solver returned unknown")
+    # Its own deadline, in whichever check it passes under load: not killed, not stopped.
+    assert out[0].reason == "timeout", out
+    assert out[0] not in (solver_mod._KILLED, solver_mod._INTERRUPTED), out
     assert wall_s >= 3 * _PAUSE_S
 
 
