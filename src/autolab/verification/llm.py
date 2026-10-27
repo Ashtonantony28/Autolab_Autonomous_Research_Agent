@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
-from autolab.state.models import AnalysisReport, ExperimentDesign, Hypothesis, ReasoningStep
+from autolab.state.models import ReasoningStep
 
 if TYPE_CHECKING:
     from anthropic import AsyncAnthropic
@@ -84,7 +84,7 @@ _AGENT_ROLES: Final[dict[str, str]] = {
     "design": (
         "You are the Design agent of AutoLab. Turn the given hypothesis into one concrete, "
         "safe experiment: protocol, parameters with units, honest cost (USD) and duration "
-        "(minutes) estimates, and success criteria. Copy the given hypothesis_id exactly."
+        "(minutes) estimates, and success criteria."
     ),
     "execute": (
         "You are the Execute agent of AutoLab. The experiment has already been run on the lab "
@@ -94,7 +94,7 @@ _AGENT_ROLES: Final[dict[str, str]] = {
     "analysis": (
         "You are the Analysis agent of AutoLab. Interpret the experiment result with several "
         "ranked candidate interpretations (rank 0 is the most likely) and likelihoods in "
-        "[0, 1]. Copy the given result_id exactly."
+        "[0, 1]."
     ),
 }
 
@@ -131,21 +131,18 @@ class _TraceReply(BaseModel):
     steps: tuple[ReasoningStep, ...]
 
 
-_REPLY_SCHEMAS: Final[dict[str, type[BaseModel]]] = {
-    "research.hypothesis": Hypothesis,
-    "design.experiment": ExperimentDesign,
-    "analysis.report": AnalysisReport,
-}
-
-
 def system_prompt(purpose: LLMPurpose) -> str:
     """Return the system prompt for `purpose` (looked up by its family)."""
     return SYSTEM_PROMPTS.get(purpose.split(".", 1)[0], DEFAULT_SYSTEM_PROMPT)
 
 
 def reply_schema(purpose: LLMPurpose) -> type[BaseModel] | None:
-    """The schema a JSON-replying `call` purpose must satisfy, if any."""
-    return _TraceReply if purpose.endswith(".trace") else _REPLY_SCHEMAS.get(purpose)
+    """The schema a JSON-replying `call` purpose must satisfy, if any.
+
+    Agent payloads use `call_structured` with content-only schemas
+    (`agents.common`), so the model never sees ids or timestamps.
+    """
+    return _TraceReply if purpose.endswith(".trace") else None
 
 
 class StructuredOutputError(RuntimeError):

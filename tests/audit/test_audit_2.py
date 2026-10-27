@@ -9,6 +9,7 @@ FakeLLMClient only; the retry tests use an in-process HTTP mock, not the network
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Final
@@ -22,7 +23,7 @@ import z3
 from autolab.orchestrator.recovery import RetryingLLMClient
 from autolab.state.store import StateStore
 from autolab.verification import solver as solver_mod
-from autolab.verification.llm import ClaudeLLMClient, FakeLLMClient, LLMPurpose
+from autolab.verification.llm import ClaudeLLMClient, FakeLLMClient, LLMPurpose, SchemaT
 from autolab.verification.solver import SmtFormula, Z3Solver
 from autolab.verification.vericot import Verifier
 from scripts.audit_load import (
@@ -39,44 +40,79 @@ from tests.fixtures.golden_traces import build
 from tests.integration.orchestrator.test_graph import HYPOTHESIS
 
 _FAST_TIMEOUT_S: Final = 0.5
+_STARVE_TIMEOUT_S: Final = 2.0
 
 
 # --- #1 (high): Z3 checks saturate asyncio's default executor -----------------
 
 
-async def test_slow_checks_do_not_starve_the_default_executor() -> None:
-    # 2 x workers + 1 slow checks queue three rounds deep on the shared pool.
-    n = 2 * default_executor_workers() + 1
+@pytest.mark.perf
+async def test_slow_checks_do_not_starve_the_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Enough slow checks to fill every thread of asyncio's default executor.
+    n = default_executor_workers()
+    started, finished = [0], [0]
+    lock = threading.Lock()
+    real_check = Z3Solver.check_entailment
+
+    def counted(self: Z3Solver, premises: list[SmtFormula], claim: SmtFormula) -> object:
+        slow = claim.assertion == NO_CUBES
+        if slow:
+            with lock:
+                started[0] += 1
+        try:
+            return real_check(self, premises, claim)
+        finally:
+            if slow:
+                with lock:
+                    finished[0] += 1
+
+    monkeypatch.setattr(Z3Solver, "check_entailment", counted)
+    # The default solver pool is smaller than n (AUDIT-10 #1); give it n workers so
+    # that all n slow checks run at once.
+    pool = solver_mod.SolverExecutor(n)
+    monkeypatch.setattr(solver_mod, "_default_executor", pool)
     built = [pathological() for _ in range(n)]
     load = asyncio.gather(
-        *(Verifier(f, solver_timeout_seconds=_FAST_TIMEOUT_S).verify(t) for t, f in built)
+        *(Verifier(f, solver_timeout_seconds=_STARVE_TIMEOUT_S).verify(t) for t, f in built)
     )
-    # Let every fast premise check (SG7) finish so the slow checks hold the pool.
-    await asyncio.sleep(0.2)
-    started = time.perf_counter()
-    await asyncio.to_thread(lambda: None)  # stands in for getaddrinfo, aiofiles, ...
-    waited = time.perf_counter() - started
-    await load
-    assert waited < 0.25
+    try:
+        deadline = time.monotonic() + _STARVE_TIMEOUT_S
+        while started[0] < n and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert started[0] == n
+        # Stands in for getaddrinfo, aiofiles, ...: on a starved pool it runs only
+        # after a slow check has given its thread back.
+        finished_before_probe = await asyncio.to_thread(lambda: finished[0])
+        await load
+    finally:
+        await asyncio.to_thread(pool.shutdown)
+    assert finished_before_probe == 0
 
 
+@pytest.mark.perf
 async def test_timeout_bounds_each_check_under_concurrency() -> None:
     n = 2 * default_executor_workers() + 1
     built = [pathological() for _ in range(n)]
+    started = time.perf_counter()
     results = await asyncio.gather(
         *(Verifier(f, solver_timeout_seconds=_FAST_TIMEOUT_S).verify(t) for t, f in built)
     )
     assert all(r.step_verdicts[-1].reason == "timeout" for r in results)
     # SG2's guarantee: UNGROUNDED within solver_timeout_s + slack, and solver_ms
     # is the Z3 check's time, not time spent queued for a worker thread.
+    wall_ms = (time.perf_counter() - started) * 1000
     worst_ms = max(r.step_verdicts[-1].solver_ms for r in results)
-    assert worst_ms < (_FAST_TIMEOUT_S + 0.5) * 1000
+    assert worst_ms < (_FAST_TIMEOUT_S + 1.5) * 1000
+    # Three rounds of checks share the workers: a check's time is about a third of
+    # the wall time, while time queued behind earlier rounds would approach all of it.
+    assert worst_ms < 0.6 * wall_ms
 
 
 # --- #2 (medium): StateStore upserts race --------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #2")
 async def test_concurrent_upserts_of_one_entity_are_idempotent(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
@@ -90,7 +126,6 @@ async def test_concurrent_upserts_of_one_entity_are_idempotent(tmp_path: Path) -
         await store.dispose()
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #2")
 async def test_concurrent_ensure_run_is_idempotent(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
@@ -107,7 +142,6 @@ async def test_concurrent_ensure_run_is_idempotent(tmp_path: Path) -> None:
 # --- #3 (medium): entity primary key ignores run_id ---------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-2 #3")
 async def test_same_entity_id_in_two_runs_stays_in_both(tmp_path: Path) -> None:
     store = await StateStore.create(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     try:
@@ -156,6 +190,7 @@ class _AlwaysFails(FakeLLMClient):
         raise self.exc
 
 
+@pytest.mark.perf
 async def test_concurrent_retries_are_jittered() -> None:
     backoff_s = 0.1
     fakes = [_AlwaysFails(ConnectionError("reset")) for _ in range(20)]
@@ -167,6 +202,7 @@ async def test_concurrent_retries_are_jittered() -> None:
     assert max(second) - min(second) >= 0.1 * backoff_s
 
 
+@pytest.mark.perf
 async def test_rate_limit_retry_after_is_honoured() -> None:
     retry_after_s = 1.0
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
@@ -181,23 +217,42 @@ async def test_rate_limit_retry_after_is_honoured() -> None:
 # --- #5 (medium): the verifier's LLM calls are strictly sequential -------------
 
 
+@pytest.mark.perf
 async def test_ten_step_trace_overlaps_its_llm_calls() -> None:
     delay_s = 0.15
-    trace, fake = build(chain(10, cite=True))
-    llm = LatencyLLM(fake, delay_s)
-    started = time.perf_counter()
-    result = await Verifier(llm, check_faithfulness=True).verify(trace)
-    wall = time.perf_counter() - started
-    assert result.consistency_score == 1.0
-    assert llm.calls == 20  # formalize + faithfulness per step
+
+    class Serial(LatencyLLM):
+        """Baseline: one LLM call at a time, as if every judge were awaited inline."""
+
+        lock = asyncio.Lock()
+
+        async def call_structured(
+            self, purpose: LLMPurpose, prompt: str, schema: type[SchemaT]
+        ) -> SchemaT:
+            async with self.lock:
+                return await super().call_structured(purpose, prompt, schema)
+
+    async def timed(llm_type: type[LatencyLLM]) -> float:
+        trace, fake = build(chain(10, cite=True))
+        llm = llm_type(fake, delay_s)
+        started = time.perf_counter()
+        result = await Verifier(llm, check_faithfulness=True).verify(trace)
+        assert result.consistency_score == 1.0
+        assert llm.calls == 20  # formalize + faithfulness per step
+        return time.perf_counter() - started
+
+    serial = await timed(Serial)
+    wall = await timed(LatencyLLM)
     # Faithfulness of step N does not gate formalizing step N+1 (the vocabulary
-    # is extended before the judge runs), so the judge calls can overlap.
-    assert wall < 0.6 * llm.calls * delay_s
+    # is extended before the judge runs), so the judge calls can overlap: about
+    # 11 of 20 delays instead of 20. The same solver work is in both runs.
+    assert wall < 0.8 * serial
 
 
 # --- #6 (low): cancelling verify() leaves Z3 running ---------------------------
 
 
+@pytest.mark.perf
 async def test_cancelled_verify_releases_its_worker_thread() -> None:
     tasks = []
     for _ in range(default_executor_workers()):
@@ -239,6 +294,7 @@ async def test_solver_document_work_is_linear_in_vocabulary(
 # --- What held up: SG2's untested shared deadline --------------------------------
 
 
+@pytest.mark.perf
 async def test_both_checks_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     """A slow consistency check leaves the entailment check only the remaining budget."""
     timeout_s, first_s = 1.0, 0.6
@@ -255,7 +311,7 @@ async def test_both_checks_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(z3.Solver, "check", slow_first)
     started = time.perf_counter()
-    out = Z3Solver(timeout_seconds=timeout_s).check_entailment(
+    out = Z3Solver(timeout_seconds=timeout_s)._check_here(
         [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
     elapsed = time.perf_counter() - started

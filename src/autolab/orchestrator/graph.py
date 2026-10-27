@@ -4,11 +4,14 @@
           → analysis → monitor → END
 
 `monitor` (the VerificationMonitor) can also send control back to the same
-agent (RETRY) or to `hitl`; `hitl` resumes to the next agent, the same agent
-or END. See `routing.py` and `checkpoints.py`.
+agent (RETRY) or to `hitl`; `hitl` resumes to the next agent, the same agent,
+END, or itself (an approved verification escalation whose policy trigger
+fires). See `routing.py` and `checkpoints.py`.
 
 Every agent node is wrapped by `_observed`, which feeds an optional
-`Metrics` and `RunTracer` one `TraceEvent` per execution.
+`Metrics` and `RunTracer` one `TraceEvent` per execution. The `hitl` node's
+observer does the same for each human decision and policy re-pause, and
+persists the payload an approval merges.
 """
 
 from __future__ import annotations
@@ -33,9 +36,12 @@ from autolab.monitoring.events import NodeDecision, TraceEvent
 from autolab.monitoring.metrics import Metrics
 from autolab.monitoring.tracer import RunTracer
 from autolab.orchestrator.checkpoints import (
+    HITLObserver,
+    HITLOutcome,
     contradiction_trigger,
     cost_trigger,
-    hitl_node,
+    make_hitl_node,
+    merged_policy,
     new_in_process_saver,
 )
 from autolab.orchestrator.recovery import (
@@ -45,6 +51,7 @@ from autolab.orchestrator.recovery import (
     escalate_permanent_errors,
 )
 from autolab.orchestrator.routing import AGENTS, MonitorNode, make_monitor_node
+from autolab.state.models import HITLRequest
 from autolab.state.schema import AutoLabState
 from autolab.tools.lab_hardware.simulator import LabSimulator
 from autolab.verification.llm import LLMClient
@@ -85,11 +92,11 @@ def build_graph(
         "llm": llm,
         "hitl_threshold": cfg.pass_threshold,
     }
+    contradiction = contradiction_trigger(verifier)
+    cost = cost_trigger(cfg.hitl_cost_usd, cfg.hitl_duration_min)
     agents: dict[str, BaseAgent[Any]] = {
-        "research": ResearchAgent(**common, hitl_trigger=contradiction_trigger(verifier)),
-        "design": DesignAgent(
-            **common, hitl_trigger=cost_trigger(cfg.hitl_cost_usd, cfg.hitl_duration_min)
-        ),
+        "research": ResearchAgent(**common, hitl_trigger=contradiction),
+        "design": DesignAgent(**common, hitl_trigger=cost),
         "execute": ExecuteAgent(**common, simulator=simulator or LabSimulator()),
         "analysis": AnalysisAgent(**common),
     }
@@ -105,7 +112,14 @@ def build_graph(
         graph.add_node(name, _observed(name, node, route, tracer, metrics))
         graph.add_edge(name, "monitor")
     graph.add_node("monitor", route, destinations=(*AGENTS, "hitl", END))
-    graph.add_node("hitl", hitl_node, destinations=(*AGENTS, END))
+    hitl = make_hitl_node(
+        {
+            "research": merged_policy(contradiction, "hypotheses"),
+            "design": merged_policy(cost, "current_experiment"),
+        },
+        observer=_hitl_observer(tracer, metrics),
+    )
+    graph.add_node("hitl", hitl, destinations=(*AGENTS, "hitl", END))
     graph.add_edge(START, "research")
 
     return graph.compile(checkpointer=checkpointer or new_in_process_saver())
@@ -176,6 +190,58 @@ def _observed(
         return update
 
     return observed
+
+
+def _hitl_observer(tracer: RunTracer | None, metrics: Metrics | None) -> HITLObserver | None:
+    """Record each human decision, then any policy re-pause, as `hitl` `TraceEvent`s.
+
+    The update an approval merges is persisted with the decision, so a payload
+    approved at the last agent still reaches the store.
+    """
+    if tracer is None and metrics is None:
+        return None
+
+    async def observe(outcome: HITLOutcome, state: AutoLabState, config: RunnableConfig) -> None:
+        # The `hitl` node always returns a dict update.
+        update = cast(dict[str, Any], outcome.command.update)
+        repause: HITLRequest | None = update.get("hitl_pending")
+        decisions: list[NodeDecision] = [outcome.resolution.action]
+        if repause is not None:
+            decisions.append("escalate")
+        if metrics is not None:
+            for decision in decisions:
+                metrics.observe_hitl(decision)
+        if tracer is None:
+            return
+        request = outcome.request
+        decided = TraceEvent(
+            run_id=UUID(config["configurable"]["thread_id"]),
+            node="hitl",
+            attempt=1,
+            started_at=outcome.started_at,
+            latency_ms=outcome.latency_ms,
+            decision=outcome.resolution.action,
+            trigger=request.payload.get("trigger") if request else None,
+            hitl_reason=request.reason if request else None,
+            agent=request.agent if request else None,
+            note=outcome.resolution.note,
+        )
+        question = state.get("research_question", "")
+        await tracer.record_node(decided, question, cast(AutoLabState, update))
+        if repause is not None:
+            again = TraceEvent(
+                run_id=decided.run_id,
+                node="hitl",
+                attempt=1,
+                latency_ms=0.0,
+                decision="escalate",
+                trigger=repause.payload.get("trigger"),
+                hitl_reason=repause.reason,
+                agent=repause.agent,
+            )
+            await tracer.record_node(again, question)
+
+    return observe
 
 
 __all__ = ["build_graph"]

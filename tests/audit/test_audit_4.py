@@ -20,7 +20,7 @@ from autolab.config import PASS_THRESHOLD
 from autolab.orchestrator.checkpoints import (
     contradiction_trace,
     contradiction_trigger,
-    hitl_node,
+    make_hitl_node,
     new_in_process_saver,
 )
 from autolab.state.models import HITLRequest, HITLResolution, Hypothesis
@@ -28,7 +28,7 @@ from autolab.state.schema import AutoLabState, empty_state
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, Z3Solver
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_trace, register_trivial_trace
+from tests.fixtures.agent_helpers import content, register_trace, register_trivial_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator.test_graph import (
     FAILING_SUMMARY,
@@ -73,7 +73,7 @@ def test_solver_unknown_is_never_valid(
     """Z3 `unknown` on either check is UNGROUNDED/timeout, whatever the claim (kills M02)."""
     _unknown_on_call(monkeypatch, which)
 
-    out = Z3Solver().check_entailment([_PQ], SmtFormula(_PQ.declarations, claim))
+    out = Z3Solver()._check_here([_PQ], SmtFormula(_PQ.declarations, claim))
 
     assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
 
@@ -106,7 +106,7 @@ async def test_agent_score_equal_to_threshold_passes() -> None:
 
     assert update["confidence"] == 1.0
     assert update["hitl_pending"] is None
-    assert update["hypotheses"] == [HYPOTHESIS]
+    assert content(*update["hypotheses"]) == content(HYPOTHESIS)
 
 
 async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
@@ -150,7 +150,7 @@ async def test_agent_and_monitor_agree_at_the_default_pass_threshold() -> None:
     assert verdict.consistency_score == PASS_THRESHOLD
     assert VerificationMonitor().decide(verdict) is AgentDecision.PASS
     assert update["hitl_pending"] is None
-    assert update["hypotheses"] == [HYPOTHESIS]
+    assert content(*update["hypotheses"]) == content(HYPOTHESIS)
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +191,7 @@ async def test_contradiction_trigger_ignores_non_contradiction_failures() -> Non
 
 
 # --------------------------------------------------------------------------
-# M16: hitl_node no longer resets `retry_count`.
+# M16: the hitl node no longer resets `retry_count`.
 # --------------------------------------------------------------------------
 
 
@@ -218,14 +218,14 @@ async def test_human_retry_restores_the_automatic_retry_budget() -> None:
 
 
 # --------------------------------------------------------------------------
-# M21: hitl_node `retry` no longer checks the agent is a graph node.
+# M21: the hitl node `retry` no longer checks the agent is a graph node.
 # --------------------------------------------------------------------------
 
 
 async def test_hitl_retry_for_unknown_agent_ends_the_run() -> None:
     """A retry for a request whose agent is not a node ends the run (kills M21)."""
     graph: StateGraph[AutoLabState, AutoLabState, AutoLabState] = StateGraph(AutoLabState)
-    graph.add_node("hitl", hitl_node, destinations=(END,))
+    graph.add_node("hitl", make_hitl_node({}), destinations=(END,))
     graph.add_edge(START, "hitl")
     app: Any = graph.compile(checkpointer=new_in_process_saver())
     config = {"configurable": {"thread_id": str(uuid4())}}

@@ -188,7 +188,9 @@ async def test_exhausted_transient_api_errors_propagate(
 
 async def test_permanent_api_error_pauses_the_graph() -> None:
     class Rejecting(_Failing):
-        async def call(self, purpose: LLMPurpose, prompt: str) -> str:
+        async def call_structured(
+            self, purpose: LLMPurpose, prompt: str, schema: type[SchemaT]
+        ) -> SchemaT:
             self.calls += 1
             raise _status_error(anthropic.NotFoundError, 404)
 
