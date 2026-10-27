@@ -115,7 +115,7 @@ def check_phases(
     try:
         for _ in range(rounds):
             stamps.clear()
-            reason = Z3Solver(30.0).check_entailment(premises, claim).reason
+            reason = Z3Solver(30.0)._check_here(premises, claim).reason
             entail = stamps[3] - stamps[2] if len(stamps) == 4 else 0.0
             got = (stamps[1] - stamps[0], entail, reason)
             best = got if best is None or got < best else best
