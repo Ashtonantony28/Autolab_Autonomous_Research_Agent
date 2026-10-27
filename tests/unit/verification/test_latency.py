@@ -7,6 +7,8 @@ import json
 import time
 from typing import Final
 
+import pytest
+
 from autolab.config import SOLVER_TIMEOUT_S, STEP_BUDGET_MS
 from autolab.state.models import ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import Vocabulary, prompt_for
@@ -62,6 +64,7 @@ def test_verifier_defaults_to_configured_timeout() -> None:
     assert Verifier(FakeLLMClient())._solver.timeout_seconds == SOLVER_TIMEOUT_S
 
 
+@pytest.mark.perf
 async def test_solver_ms_excludes_formalization() -> None:
     delay_s = 0.2
     golden = next(g for g in ALL if g.expected_overall == "VALID")
@@ -72,6 +75,7 @@ async def test_solver_ms_excludes_formalization() -> None:
     assert all(0 < ms < delay_s * 1000 for ms in timed)
 
 
+@pytest.mark.perf
 async def test_pathological_formula_times_out_to_ungrounded() -> None:
     trace, fake = _pathological_trace()
     started = time.perf_counter()
@@ -83,6 +87,7 @@ async def test_pathological_formula_times_out_to_ungrounded() -> None:
     assert last.solver_ms >= _SLOW_TIMEOUT_S * 1000 * 0.9
 
 
+@pytest.mark.perf
 def test_hard_premise_consistency_check_times_out() -> None:
     hard = f"(and {_POSITIVE} (= (+ (* x x x) (* y y y)) (* z z z)))"
     started = time.perf_counter()
@@ -94,6 +99,7 @@ def test_hard_premise_consistency_check_times_out() -> None:
     assert elapsed < _SLOW_TIMEOUT_S + _SLACK_S
 
 
+@pytest.mark.perf
 async def test_event_loop_stays_responsive_during_slow_check() -> None:
     tick_s = 0.05
     ticks = 0
@@ -113,6 +119,7 @@ async def test_event_loop_stays_responsive_during_slow_check() -> None:
     assert ticks >= (_SLOW_TIMEOUT_S / tick_s) / 2
 
 
+@pytest.mark.perf
 async def test_concurrent_traces_do_not_serialize() -> None:
     (t1, f1), (t2, f2) = _pathological_trace(), _pathological_trace()
     started = time.perf_counter()
@@ -126,6 +133,7 @@ async def test_concurrent_traces_do_not_serialize() -> None:
     assert elapsed < 0.75 * sequential_s
 
 
+@pytest.mark.perf
 async def test_bench_run_reports_within_budget() -> None:
     report = await bench_verifier.run(1)
     assert report.runs == 1
@@ -136,6 +144,7 @@ async def test_bench_run_reports_within_budget() -> None:
     assert "p50" in text and "p95" in text and "max" in text
 
 
+@pytest.mark.perf
 async def test_bench_main_exit_code() -> None:
     assert await bench_verifier.amain(["--runs", "1"]) == 0
     assert await bench_verifier.amain(["--runs", "1", "--budget-ms", "0.000001"]) == 1

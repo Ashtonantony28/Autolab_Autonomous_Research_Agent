@@ -50,6 +50,8 @@
 - Alternatively, catch an exhausted transient error at the node boundary and turn it into an `error` HITL request. The `retry` resolution then exists already.
 - Correct the docstring either way.
 
+**Resolution (SG13).** `autolab run` prints `Run <thread_id> started.` and flushes stdout before the graph runs, so a crash leaves the id on screen. `autolab resume <thread_id> [approve|retry|abort]` reads `aget_state` first. A thread paused at an interrupt still needs an action (exit 2 without one) and takes `Command(resume=HITLResolution)`. A thread with pending nodes and no interrupt continues from its last checkpoint with `ainvoke(None, config)`. A given action is ignored there, with a note on stderr. A finished or unknown thread exits 2 with "no paused run ... (it is finished or unknown)". The `escalate_permanent_errors` docstring now says an exhausted transient error ends the run and `autolab resume <thread_id>` continues it. The repro is flipped. Not done: the node boundary still does not turn an exhausted transient error into an `error` HITL request, so the run still ends with a traceback.
+
 ## 2. Medium: the `(run_id, id)` key breaks every write to an existing database
 
 **Impact.**
