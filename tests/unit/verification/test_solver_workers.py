@@ -497,7 +497,7 @@ async def test_shutting_down_the_default_executor_stops_idle_workers() -> None:
 # --- a process forked after the pool started (AUDIT-29 #1, AUDIT-30 #2) ------------------
 
 _FORKING: Final = """
-import asyncio, json, os, time
+import asyncio, json, os, sys, time
 from multiprocessing import forkserver
 from autolab.verification import solver as solver_mod
 from autolab.verification.solver import SmtFormula, Z3Solver, default_executor
@@ -530,6 +530,9 @@ if __name__ == "__main__":
         except BaseException as exc:
             got = {"error": repr(exc)}
         os.write(write, json.dumps(got).encode())
+        os.close(write)
+        if sys.argv[1] == "exit":
+            sys.exit(0)  # atexit hooks run, multiprocessing's among them
         os._exit(0)
     os.close(write)
     os.waitpid(pid, 0)
@@ -542,9 +545,12 @@ if __name__ == "__main__":
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork")
-def test_a_forked_child_starts_its_own_workers_and_leaves_the_parents_alone() -> None:
+@pytest.mark.parametrize("ending", ["_exit", "exit"])
+def test_a_forked_child_starts_its_own_workers_and_leaves_the_parents_alone(ending: str) -> None:
+    # A child that exits normally runs multiprocessing's atexit hook, which terminates
+    # the daemons it lists as its children (AUDIT-35 #1, AUDIT-36 #1).
     proc = subprocess.run(
-        [sys.executable, "-c", _FORKING],
+        [sys.executable, "-c", _FORKING, ending],
         cwd=_ROOT,
         capture_output=True,
         text=True,
