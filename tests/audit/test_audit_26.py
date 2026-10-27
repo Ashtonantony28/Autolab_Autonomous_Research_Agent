@@ -27,7 +27,6 @@ from scripts.audit_load_7 import (
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #1")
 async def test_a_new_tasks_first_check_does_not_queue_behind_every_hard_run() -> None:
     # 2 slots + 2 slow places, 12 hard runs: 4 checking, 8 queued. A new task's first
     # (easy) check should wait at most about one hard check, not for the queue (~3).
@@ -36,7 +35,6 @@ async def test_a_new_tasks_first_check_does_not_queue_behind_every_hard_run() ->
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #2")
 def test_probing_a_reply_of_many_declarations_costs_a_few_parses_of_it() -> None:
     # 100 declarations at MAX_ARITY: ~15 KB, well under the client's max_tokens.
     decls = wide_reply(100)
@@ -56,21 +54,18 @@ def _merge_or_refuse_s(decls: str) -> float:
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #2")
 def test_probing_a_nested_sort_is_linear_in_its_depth() -> None:
     half = min(_merge_or_refuse_s(deep_sort_decl(400)) for _ in range(2))
     full = min(_merge_or_refuse_s(deep_sort_decl(800)) for _ in range(2))
     assert full <= 2.5 * half, f"twice the depth costs {full / half:.1f}x"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #3")
 def test_workers_start_before_a_fresh_process_requests_its_first_check() -> None:
     # 6-step verify with 100 ms LLM calls: 0.7 s of formalization before any check.
     result = cold_start(inline=True)
     assert result["start_before_check"], result
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-26 #4")
 def test_worker_boots_do_not_rerun_the_main_scripts_imports() -> None:
     # The parent and the forkserver import the main's modules; a worker should not.
     assert main_imports_per_boot(3) <= 2
