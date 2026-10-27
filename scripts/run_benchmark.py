@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from typing import TypedDict
 from uuid import uuid4
 
+from langgraph.types import Command
+
 from autolab.agents.analysis import build_analysis_prompt, build_analysis_trace_prompt
+from autolab.agents.common import measurement_facts, result_claim
 from autolab.agents.design import build_design_prompt, build_design_trace_prompt
 from autolab.agents.execute import build_execute_trace_prompt
 from autolab.agents.research import build_hypothesis_prompt, build_trace_prompt
@@ -24,6 +27,7 @@ from autolab.state.models import (
     ExperimentDesign,
     ExperimentParameter,
     ExperimentResult,
+    HITLResolution,
     Hypothesis,
     Interpretation,
     Measurement,
@@ -124,6 +128,7 @@ def _seed(fake: FakeLLMClient, sc: Scenario) -> ExperimentResult:
         agent="research",
         trace_purpose="research.trace",
         trace_prompt=build_trace_prompt(sc.question, sc.hypothesis),
+        conclusion=sc.hypothesis.statement,
     )
 
     fake.register(
@@ -134,6 +139,7 @@ def _seed(fake: FakeLLMClient, sc: Scenario) -> ExperimentResult:
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=build_design_trace_prompt(sc.hypothesis, sc.design),
+        conclusion=sc.design.protocol,
     )
 
     result = ExperimentResult(
@@ -147,6 +153,8 @@ def _seed(fake: FakeLLMClient, sc: Scenario) -> ExperimentResult:
         agent="execute",
         trace_purpose="execute.trace",
         trace_prompt=build_execute_trace_prompt(sc.design, result),
+        conclusion=result_claim(result),
+        facts=measurement_facts(result),
     )
 
     report = AnalysisReport(
@@ -160,6 +168,8 @@ def _seed(fake: FakeLLMClient, sc: Scenario) -> ExperimentResult:
         agent="analysis",
         trace_purpose="analysis.trace",
         trace_prompt=build_analysis_trace_prompt(result, report),
+        conclusion=report.interpretations[0].statement,
+        facts=measurement_facts(result),
     )
     return result
 
@@ -171,14 +181,20 @@ class ScenarioRow(TypedDict):
     results: int
     traces: int
     verifications: int
+    hitl: list[str]
 
 
 async def run_one(scenario: Scenario) -> ScenarioRow:
+    """Run one scenario, approving every HITL pause (recorded in `hitl`)."""
     fake = FakeLLMClient()
     result = _seed(fake, scenario)
     graph = build_graph(llm=fake, simulator=FixedResultSimulator(result))
     config = {"configurable": {"thread_id": str(uuid4())}}
     final = await graph.ainvoke(empty_state(scenario.question), config=config)
+    pauses: list[str] = []
+    while "__interrupt__" in final:
+        pauses.append(final["hitl_pending"].reason)
+        final = await graph.ainvoke(Command(resume=HITLResolution(action="approve")), config=config)
     return ScenarioRow(
         scenario=scenario.id,
         confidence=final["confidence"],
@@ -186,6 +202,7 @@ async def run_one(scenario: Scenario) -> ScenarioRow:
         results=len(final["results"]),
         traces=len(final["reasoning_traces"]),
         verifications=len(final["verification_history"]),
+        hitl=pauses,
     )
 
 

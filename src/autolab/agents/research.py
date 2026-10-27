@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
-from autolab.state.models import Hypothesis, ReasoningStep, ReasoningTrace
+from autolab.agents.common import conclusion_instruction, parse_trace, with_feedback
+from autolab.state.models import Hypothesis, VerificationContext
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
 from autolab.verification.vericot import Verifier
@@ -31,12 +31,18 @@ class ResearchAgent(BaseAgent[Hypothesis]):
 
     async def _produce(self, state: AutoLabState) -> AgentOutput[Hypothesis]:
         question = state.get("research_question", "")
-        raw = await self._llm.call("research.hypothesis", build_hypothesis_prompt(question))
+        feedback = state.get("feedback", "")
+        raw = await self._llm.call(
+            "research.hypothesis", with_feedback(build_hypothesis_prompt(question), feedback)
+        )
         payload = Hypothesis.model_validate_json(raw)
 
-        trace_raw = await self._llm.call("research.trace", build_trace_prompt(question, payload))
-        trace = _parse_trace(self.name, trace_raw)
-        return AgentOutput(payload=payload, reasoning_trace=trace)
+        trace_raw = await self._llm.call(
+            "research.trace", with_feedback(build_trace_prompt(question, payload), feedback)
+        )
+        trace = parse_trace(self.name, trace_raw)
+        context = VerificationContext(payload_claim=payload.statement)
+        return AgentOutput(payload=payload, reasoning_trace=trace, context=context)
 
     def _merge_payload(self, payload: Hypothesis) -> dict[str, Any]:
         return {"hypotheses": [payload]}
@@ -55,14 +61,9 @@ def build_trace_prompt(question: str, hypothesis: Hypothesis) -> str:
     return (
         "Explain the reasoning that led from the research question to the hypothesis. "
         'Reply with JSON: {"steps": [{index, claim, claim_type, referenced_step_indices}]}.\n\n'
-        f"research_question: {question}\nhypothesis_statement: {hypothesis.statement}"
+        f"research_question: {question}\nhypothesis_statement: {hypothesis.statement}\n"
+        f"{conclusion_instruction(hypothesis.statement)}"
     )
-
-
-def _parse_trace(agent: str, raw: str) -> ReasoningTrace:
-    data = json.loads(raw)
-    steps = tuple(ReasoningStep.model_validate(s) for s in data["steps"])
-    return ReasoningTrace(agent=agent, steps=steps)
 
 
 __all__ = ["ResearchAgent", "build_hypothesis_prompt", "build_trace_prompt"]

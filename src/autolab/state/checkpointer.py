@@ -4,15 +4,23 @@ The brief asks for a Redis-backed checkpointer for LangGraph. We define a
 small `Checkpointer` protocol so the rest of the codebase doesn't care which
 backend is in use. Phase 1 ships an in-memory implementation (used by tests
 and dev runs) and a Redis implementation (exercised under RUN_LIVE_TESTS=1).
-LangGraph's own checkpoint integration is wired in Phase 4 (ADR-0004).
+LangGraph's own checkpoint integration is wired in Phase 4 (ADR-0004);
+`sqlite_saver` opens the durable LangGraph checkpointer that lets a run
+paused at HITL resume in a new process.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import aiosqlite
 import redis.asyncio as aioredis
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from autolab.state.schema import AutoLabState
 
@@ -63,6 +71,20 @@ class RedisCheckpointer:
             return None
         assert isinstance(raw, str)
         return _loads(raw)
+
+
+@asynccontextmanager
+async def sqlite_saver(path: str | Path) -> AsyncIterator[AsyncSqliteSaver]:
+    """Open a LangGraph `AsyncSqliteSaver` on `path`, allowlisting the state models."""
+    # Lazy: the orchestrator package imports `autolab.state`.
+    from autolab.orchestrator.checkpoints import CHECKPOINT_TYPES
+
+    async with aiosqlite.connect(str(path)) as conn:
+        saver = AsyncSqliteSaver(
+            conn, serde=JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_TYPES)
+        )
+        await saver.setup()
+        yield saver
 
 
 def _dumps(state: AutoLabState) -> str:
@@ -143,4 +165,4 @@ def _to_jsonable(value: object) -> object:
     return value
 
 
-__all__ = ["Checkpointer", "InMemoryCheckpointer", "RedisCheckpointer"]
+__all__ = ["Checkpointer", "InMemoryCheckpointer", "RedisCheckpointer", "sqlite_saver"]
