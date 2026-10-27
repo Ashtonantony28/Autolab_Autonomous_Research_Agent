@@ -36,6 +36,9 @@ dependencies = [
   "structlog>=24.1",
   # YAML — golden traces for the verifier are authored in YAML for readability.
   "pyyaml>=6.0",
+  # Durable LangGraph checkpoints — AsyncSqliteSaver lets a run paused at HITL resume
+  # after a process restart (`autolab resume`).
+  "langgraph-checkpoint-sqlite>=3.0",
 ]
 
 [project.optional-dependencies]

@@ -484,41 +484,42 @@ INVALID: tuple[GoldenTrace, ...] = (
 _AS, _EN, _NE, _PI = "assumed", "entailed", "not_entailed", "premises_inconsistent"
 _NP, _FF = "no_premises", "formalization_failed"
 
+# The premise that makes the premise set unsat is INVALID itself (AUDIT-1 #4).
 EXPLOSION: tuple[GoldenTrace, ...] = (
     _g(
         "e01-explosion-bool",
         "P and not P must not entail an unrelated Q.",
-        (_V, _V, _I),
+        (_V, _I, _I),
         _p(_PQ, "P"),
         _p("", "(not P)"),
         _c("Q"),
-        reasons=(_AS, _AS, _PI),
+        reasons=(_AS, _PI, _NE),
     ),
     _g(
         "e02-explosion-arith",
         "x > 5 and x < 3 must not entail x = 100.",
-        (_V, _V, _I),
+        (_V, _I, _I),
         _p(_X_INT, "(> x 5)"),
         _p("", "(< x 3)"),
         _c("(= x 100)", 0, 1),
-        reasons=(_AS, _AS, _PI),
+        reasons=(_AS, _PI, _NE),
     ),
     _g(
         "e03-explosion-quantifier",
         "forall x. H(x) together with not H(a) must not entail M(a).",
-        (_V, _V, _I),
+        (_V, _I, _I),
         _p(_PRED, "(forall ((x Int)) (H x))"),
         _p("", "(not (H a))"),
         _c("(M a)"),
-        reasons=(_AS, _AS, _PI),
+        reasons=(_AS, _PI, _NE),
     ),
     _g(
         "e04-explosion-parity",
         "2x = 7 has no integer solution, so it must not entail x > 1000.",
-        (_V, _I),
+        (_I, _U),
         _p(_X_INT, "(= (* 2 x) 7)"),
         _c("(> x 1000)", 0),
-        reasons=(_AS, _PI),
+        reasons=(_PI, _NP),
     ),
 )
 
