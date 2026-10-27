@@ -33,6 +33,12 @@ class Metrics:
     """Collection of per-agent metrics, keyed by agent name."""
 
     by_agent: dict[str, AgentMetrics] = field(default_factory=dict)
+    hitl_decisions: dict[str, int] = field(default_factory=dict)
+    """Human resolutions and policy re-pauses, keyed by `TraceEvent.decision`."""
+
+    def observe_hitl(self, decision: str) -> None:
+        """Count one `hitl` decision (`approve`, `retry`, `abort` or `escalate`)."""
+        self.hitl_decisions[decision] = self.hitl_decisions.get(decision, 0) + 1
 
     def observe_agent(
         self,

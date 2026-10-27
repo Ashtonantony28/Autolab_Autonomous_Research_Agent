@@ -108,6 +108,7 @@ async def _drive(
     from autolab.state.checkpointer import sqlite_saver
     from autolab.state.store import StateStore
 
+    aborted = False
     store = await StateStore.create(get_settings().database_url)
     try:
         async with sqlite_saver(checkpoints) as saver:
@@ -123,6 +124,7 @@ async def _drive(
                         )
                         raise SystemExit(2)
                     graph_input = Command(resume=resolution)
+                    aborted = resolution.action == "abort"
                 elif snapshot.next:
                     if resolution is not None:
                         sys.stderr.write(
@@ -145,6 +147,9 @@ async def _drive(
             f"Paused for human review ({pending.agent}): {pending.reason}\n"
             f"Resume with: autolab resume {thread_id} approve|retry|abort [--note ...]\n"
         )
+        return
+    if aborted:
+        sys.stdout.write(f"Run {thread_id} aborted at human review; it will not resume.\n")
         return
     sys.stdout.write(
         f"Run {thread_id} complete. confidence={final.get('confidence', 0.0):.2f}, "
