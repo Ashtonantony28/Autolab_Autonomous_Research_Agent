@@ -184,7 +184,8 @@ async def step_p95(make: Callable[[int], GoldenTrace], n: int, k: int) -> tuple[
 
 @contextmanager
 def one_call_loading() -> Iterator[None]:
-    """Load every pool in one call, as before SG27 (comparison only)."""
+    """Load every pool in one call, as before SG27 (comparison only; since SG29 checks run
+    in worker processes, so this reaches only `_check_here`)."""
     real = solver_mod._LOAD_ABOVE
     solver_mod._LOAD_ABOVE = 1 << 30  # type: ignore[misc]
     try:
