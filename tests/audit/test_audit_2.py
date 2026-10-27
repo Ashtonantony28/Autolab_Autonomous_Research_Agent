@@ -69,18 +69,25 @@ async def test_slow_checks_do_not_starve_the_default_executor(
                     finished[0] += 1
 
     monkeypatch.setattr(Z3Solver, "check_entailment", counted)
+    # The default solver pool is smaller than n (AUDIT-10 #1); give it n workers so
+    # that all n slow checks run at once.
+    pool = solver_mod.SolverExecutor(n)
+    monkeypatch.setattr(solver_mod, "_default_executor", pool)
     built = [pathological() for _ in range(n)]
     load = asyncio.gather(
         *(Verifier(f, solver_timeout_seconds=_STARVE_TIMEOUT_S).verify(t) for t, f in built)
     )
-    deadline = time.monotonic() + _STARVE_TIMEOUT_S
-    while started[0] < n and time.monotonic() < deadline:
-        await asyncio.sleep(0.005)
-    assert started[0] == n
-    # Stands in for getaddrinfo, aiofiles, ...: on a starved pool it runs only
-    # after a slow check has given its thread back.
-    finished_before_probe = await asyncio.to_thread(lambda: finished[0])
-    await load
+    try:
+        deadline = time.monotonic() + _STARVE_TIMEOUT_S
+        while started[0] < n and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert started[0] == n
+        # Stands in for getaddrinfo, aiofiles, ...: on a starved pool it runs only
+        # after a slow check has given its thread back.
+        finished_before_probe = await asyncio.to_thread(lambda: finished[0])
+        await load
+    finally:
+        await asyncio.to_thread(pool.shutdown)
     assert finished_before_probe == 0
 
 
@@ -304,7 +311,7 @@ async def test_both_checks_share_one_deadline(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(z3.Solver, "check", slow_first)
     started = time.perf_counter()
-    out = Z3Solver(timeout_seconds=timeout_s).check_entailment(
+    out = Z3Solver(timeout_seconds=timeout_s)._check_here(
         [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
     elapsed = time.perf_counter() - started

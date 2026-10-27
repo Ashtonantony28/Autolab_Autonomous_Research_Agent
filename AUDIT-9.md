@@ -76,6 +76,18 @@ check through any builtin that a premise uses.
 3. Defence in depth: give each check only the declarations of the formulas it contains,
    and drop the declarations of a step the judge rejects.
 
+**Resolution (SG15).** `Vocabulary.merged` now checks each declared name in three steps.
+`RESERVED_SYMBOLS` comes first, so its "reserved symbol" message is unchanged. The name
+must then match `[A-Za-z_][A-Za-z0-9_]*`, which rules out `str.len`, `~`, `^0`, `as-array`
+and every other dotted or punctuated name. Finally `_is_z3_builtin` asks Z3. It parses
+`(assert (= N N))` and `(declare-const x N)` with no declarations, in the thread's parse
+context. If either parse succeeds, or fails with anything but "unknown constant N" or
+"unknown sort 'N'", the name is a builtin (`sin`, `subset`, `bvult`, `fp`, `RNE`, `Float32`,
+`pbeq`, `div0`, …). Results are cached per name. A rejected name is a `FormalizationError`,
+so the step is UNGROUNDED/`formalization_failed`. Both repros are flipped and their
+assertions are unchanged. Not done: item 3 (per-check declarations, dropping a
+judge-rejected step's declarations). That is in `vericot.py`, outside SG15.
+
 ---
 
 ## High
@@ -137,6 +149,19 @@ shape check (AUDIT-1 #2) and the reserved-name check (AUDIT-5 #1) inspect only
 4. As a backstop, call `z3.reset_params()` or re-assert the solver options before each
    check.
 
+**Resolution (SG15).** `Formalizer.formalize` rejects the assertion before any parse
+unless `_is_single_term` accepts it. That means exactly one atom or balanced
+S-expression, with nothing after it, depth never below 0, no `|` or `;`, and no SMT
+command head (`assert`, `declare-*`, `define-*`, `set-option`, `reset-assertions`,
+`push`, `pop`, …) after any `(`. String literals are skipped, so `"a) (b"` inside a
+string is allowed. No `set-option` reaches Z3, not even through the formalizer's own
+parse check. Both repros are flipped and their assertions are unchanged. The
+`_register` helper in `test_audit_9.py` now skips a step whose parse yields more than
+one assertion, as the formalizer does. Without that, its prompts assumed the poisoned
+step had extended the vocabulary. Not done: item 4, resetting global parameters before
+each check. That is in `solver.py` (SG19). It is not needed while every formula
+reaches the solver through the formalizer, and `context.facts` are built in code.
+
 ### #3 A premise that was INVALID in pass 1 is assumed in the pass-2 re-check and is never checked for circularity
 
 **Impact.** `_payload_overrides` examines only premises that were VALID in pass 1. A
@@ -175,6 +200,8 @@ overridden. A premise whose verdict changed between passes should never escape t
 check. Alternatively, make an inconclusive circularity check blocking, with reason
 `no_premises` and "could not rule out a circular premise". That keeps "fail closed" true
 for the trace and not just for the premise. Doing both is cheap.
+
+**Resolution (SG16).** `_payload_overrides` now applies both halves of the fix, without iterating. A premise that is not VALID in pass 1 keeps its pass-1 verdict as an override, so pass 2 never assumes it. Dropping the premise it conflicted with therefore cannot turn it into VALID/`assumed`. Every other pass-1 premise was VALID and has already been checked for circularity, so a fixed point adds nothing. An inconclusive circularity check is now UNGROUNDED/`no_premises` ("could not rule out a circular premise"), which `blocking_reason` blocks, even when the remaining premises prove the conclusion. The pass-1 verdicts are carried over only when some premise is dropped, so a trace with no circular premise is still checked once. The repro passes as a plain test: [UNGROUNDED/no_premises, INVALID/premises_inconsistent, INVALID].
 
 ---
 

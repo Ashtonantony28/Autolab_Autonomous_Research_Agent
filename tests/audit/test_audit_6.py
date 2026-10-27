@@ -14,25 +14,30 @@ import sqlite3
 import threading
 import time
 import tracemalloc
+from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from types import SimpleNamespace
+from typing import Final, TypeVar
 from uuid import uuid4
 
 import pytest
 
+from autolab.orchestrator import recovery
 from autolab.orchestrator.graph import build_graph
+from autolab.orchestrator.recovery import RetryingLLMClient
 from autolab.state.schema import empty_state
 from autolab.state.store import StateStore
 from autolab.verification import solver as solver_mod
 from autolab.verification.llm import FakeLLMClient
-from autolab.verification.solver import SolverExecutor
+from autolab.verification.solver import SolverExecutor, _Interrupt
 from autolab.verification.vericot import Verifier
 from scripts import bench_verifier
 from scripts.audit_load import chain
 from scripts.audit_load_2 import (
     CountingExecutor,
     JudgeLLM,
-    retry_attempt_spreads,
+    RateLimited,
     slow_check,
     stress_returncode,
 )
@@ -45,8 +50,13 @@ from tests.integration.orchestrator.test_graph import (
     _seed_full_run,
 )
 
+_WAIT_S: Final = 60.0
+"""Upper bound on waiting for a repro's precondition; reached only if the setup hangs."""
+
 _LOCK_HOLD_S: Final = 5.5
-"""Longer than the 5 s SQLite busy timeout the store's driver uses by default."""
+"""Longer than the 5 s SQLite busy timeout the store's driver used by default."""
+
+T = TypeVar("T")
 
 
 # --- #1 (critical): verifies on two threads crash the interpreter -------------
@@ -63,7 +73,6 @@ def test_verifies_on_several_threads_do_not_crash_the_interpreter() -> None:
 # --- #2 (medium): SQLite store fails a run instead of waiting for a writer ----
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #2")
 async def test_store_append_waits_out_a_concurrent_writer(tmp_path: Path) -> None:
     path = tmp_path / "s.db"
     store = await StateStore.create(f"sqlite+aiosqlite:///{path}")
@@ -95,11 +104,31 @@ async def test_store_append_waits_out_a_concurrent_writer(tmp_path: Path) -> Non
 # --- #3 (medium): retry-after waits are not jittered ---------------------------
 
 
-@pytest.mark.perf
 @pytest.mark.xfail(strict=True, reason="AUDIT-6 #3")
-async def test_retry_after_waits_are_jittered() -> None:
+async def test_retry_after_waits_are_jittered(monkeypatch: pytest.MonkeyPatch) -> None:
     retry_after_s = 0.2
-    (_, spread_ms), _ = await retry_attempt_spreads(20, str(retry_after_s), 0.05)
+    # Each client's waits are recorded instead of slept, so the spread of attempt 2's
+    # start is that of the first waits, whatever the event loop's scheduling delay.
+    waits: dict[asyncio.Task[object] | None, list[float]] = defaultdict(list)
+
+    async def record(delay: float) -> None:
+        waits[asyncio.current_task()].append(delay)
+
+    monkeypatch.setattr(recovery, "asyncio", SimpleNamespace(sleep=record))
+    await asyncio.gather(
+        *(
+            asyncio.ensure_future(
+                RetryingLLMClient(
+                    RateLimited([], str(retry_after_s)), initial_backoff_seconds=0.05
+                ).call("p", "q")
+            )
+            for _ in range(20)
+        ),
+        return_exceptions=True,
+    )
+    firsts = [w[0] for w in waits.values()]
+    assert len(firsts) == 20
+    spread_ms = (max(firsts) - min(firsts)) * 1000
     # 20 clients rate-limited together should not all retry in the same instant.
     assert spread_ms >= 0.1 * retry_after_s * 1000
 
@@ -147,9 +176,27 @@ async def test_bench_times_every_solver_check(monkeypatch: pytest.MonkeyPatch) -
 # --- #7 (low): executor shutdown cancels callers on other event loops ---------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #7")
+class _ObservedExecutor(SolverExecutor):
+    """A 1-slot `SolverExecutor` with no slow lane that signals once a check is running.
+
+    With no slow lane the pool never grows, so a second loop's check always waits
+    in the pool's queue (AUDIT-20 #1).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(1, slow_workers=0)
+        self.running = threading.Event()
+
+    def _call(self, fn: Callable[[], T], interrupt: _Interrupt) -> tuple[T, float]:
+        def observed() -> T:
+            self.running.set()
+            return fn()
+
+        return super()._call(observed, interrupt)
+
+
 async def test_shutdown_does_not_cancel_callers_on_other_loops() -> None:
-    executor = SolverExecutor(1)
+    executor = _ObservedExecutor()
     outcomes: list[str] = []
 
     def caller() -> None:
@@ -161,11 +208,13 @@ async def test_shutdown_does_not_cancel_callers_on_other_loops() -> None:
 
         asyncio.run(main())
 
-    # Each loop's semaphore admits one check: one runs, the other waits in the pool.
+    # Each loop's slots admit one check: one runs, the other waits in the pool.
     threads = [threading.Thread(target=caller) for _ in range(2)]
-    for t in threads:
-        t.start()
-    await asyncio.sleep(0.3)
+    threads[0].start()
+    assert await asyncio.to_thread(executor.running.wait, _WAIT_S)
+    threads[1].start()
+    while executor._pool._work_queue.qsize() == 0:
+        await asyncio.sleep(0.01)
     await asyncio.to_thread(executor.shutdown)
     for t in threads:
         await asyncio.to_thread(t.join)
