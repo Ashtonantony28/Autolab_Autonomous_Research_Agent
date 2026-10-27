@@ -198,6 +198,7 @@ None.
 - *Measured:* with S10 applied, 15 runs of the cancel and shutdown pair. `test_cancelling_a_caller_interrupts_its_z3_context` passed once (run 0); the other 14 runs failed both tests after the full 20 s `_HANG_S`.
 - This is not "tested only by timing", because the AUDIT-12 #2 repro and now `test_audit_16` kill S10 deterministically. But the SG19 comment ("The first interrupt lands before the check starts, where Z3 drops it") is not guaranteed.
 - *Suggested:* in `z3_spy`, call `real_interrupt(self)` first and then `spy.interrupted.set()`. Better, wait for a count of sent interrupts, as `_HeldCheck` in `test_audit_16.py` does.
+- **Resolution (SG22).** The `z3_spy` interrupt wrapper calls the real `Context.interrupt()` first and sets `interrupted` after it. The repro passes as a plain test with its assertion unchanged. The #4 kill tests are unchanged and pass.
 
 **#5. A premise UNGROUNDED in pass 1 can be assumed in pass 2 (V08 survived).**
 - SG16's contract: "A premise that was not VALID keeps its verdict". Both SG16 tests use INVALID premises. Changing the check to `== "INVALID"` lets a premise whose pass-1 consistency check was inconclusive drop its UNGROUNDED verdict.
@@ -220,6 +221,7 @@ None.
 - `test_audit_6::test_shutdown_does_not_cancel_callers_on_other_loops`, a **strict xfail** (AUDIT-6 #7), **XPASSed** in 2 of 2 mutant runs at 3 parallel suites, which fails the suite. Its 0.3 s sleep assumes that both callers have submitted by then. Under load they have not, so `shutdown` runs first and no `CancelledError` is seen. The repro is timing-dependent in the *passing* direction. I had to deselect it for the harness.
 - `test_audit_10::test_the_default_solver_pool_does_not_inflate_solver_ms_under_concurrency` (`perf`) failed for A07, which cannot affect it.
 - *Suggested:* AUDIT-6 #7 should wait for both submissions (for example on the pool's work queue) before calling `shutdown`. Run `perf` in a separate, retried CI job (AUDIT-8 H1, still open).
+- **Resolution (SG23).** The store's SQLite lock is fixed by a 30 s busy timeout and WAL (AUDIT-6 #2). The AUDIT-6 #7 repro now waits until both checks are in the pool and one is running before it calls `shutdown`, using a semaphore on the pool's `submit` and an event in the worker. It gives `['CancelledError', 'timeout']` on every run. The two AUDIT-14 #1 repros, which also XPASSed under load, now set the timeout (or the time before the cancel) to 3x the measured consistency check. So the deadline always falls inside the assumption check. The AUDIT-10 #1 perf test now alternates serial and pooled measurements within a round and keeps the best of up to 3 rounds; the 2x bound is unchanged. AUDIT-6 #3 now records the requested retry waits instead of wall-clock starts. A 20-run sweep of `tests/audit` under load found no other XPASS. `make test` was green 5 times in a row with a second suite running alongside.
 
 **#9. Carried over:** coverage targets are still not enforced in `make test` or CI (AUDIT-8 M5). `state/checkpointer.py` is still at 80% with no `RedisCheckpointer` test (AUDIT-8 M6).
 

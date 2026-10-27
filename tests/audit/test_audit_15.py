@@ -103,7 +103,6 @@ def test_measurement_fact_symbols_are_plain_identifiers() -> None:
 # --- #2 (medium): the formalize prompt does not state SG15's rules -----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #2")
 def test_formalize_prompt_states_the_identifier_and_single_term_rules() -> None:
     step = ReasoningStep(index=0, claim="the sample is hot", claim_type="premise")
     text = f"{SYSTEM_PROMPTS['formalize']}\n{prompt_for(step, Vocabulary())}".lower()
@@ -156,7 +155,6 @@ async def test_a_cost_stated_in_a_string_parameter_is_not_admitted() -> None:
 # --- #5 (medium): a premise whose head starts with "assert" is dropped ------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-15 #5")
 def test_a_premise_whose_predicate_starts_with_assert_is_kept() -> None:
     decl = "(declare-fun assertive (Int) Bool)"
     Vocabulary().merge(decl)  # the formalizer accepts the name and the term

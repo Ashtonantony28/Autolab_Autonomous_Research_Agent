@@ -16,7 +16,12 @@ from autolab.state.schema import empty_state
 from autolab.verification.formalizer import Vocabulary
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import content, register_trace, register_trivial_trace
+from tests.fixtures.agent_helpers import (
+    content,
+    register_estimate,
+    register_trace,
+    register_trivial_trace,
+)
 from tests.fixtures.golden_traces import GoldenStep
 
 HYPOTHESIS = Hypothesis(question="Q?", statement="S", rationale="R")
@@ -39,6 +44,7 @@ async def test_design_agent_emits_experiment_design() -> None:
         conclusion=design_claim(DESIGN),
         facts=design_facts(DESIGN),
     )
+    register_estimate(fake, DESIGN)
 
     state = empty_state("Q?")
     state["hypotheses"] = [HYPOTHESIS]
@@ -82,6 +88,7 @@ async def test_design_agent_uses_latest_hypothesis() -> None:
         conclusion=design_claim(design_for_newer),
         facts=design_facts(design_for_newer),
     )
+    register_estimate(fake, design_for_newer)
 
     state = empty_state("Q?")
     state["hypotheses"] = [older, newer]
@@ -101,6 +108,7 @@ async def test_design_agent_rejects_trace_concluding_the_hypothesis_not_the_prot
         trace_prompt=build_design_trace_prompt(HYPOTHESIS, DESIGN),
         conclusion=HYPOTHESIS.statement,
     )
+    register_estimate(fake, DESIGN)
     state = empty_state("Q?")
     state["hypotheses"] = [HYPOTHESIS]
 
@@ -126,6 +134,7 @@ async def test_design_agent_ignores_a_model_supplied_id_and_hypothesis_id() -> N
         conclusion=design_claim(stray),
         facts=design_facts(stray),
     )
+    register_estimate(fake, stray)
     state = empty_state("Q?")
     state["hypotheses"] = [other, HYPOTHESIS]
 
@@ -188,6 +197,7 @@ def _sweep_agent(fake: FakeLLMClient, *steps: GoldenStep) -> DesignAgent:
         steps=steps,
         facts=design_facts(SWEEP),
     )
+    register_estimate(fake, SWEEP)
     return DesignAgent(verifier=Verifier(fake), llm=fake, hitl_trigger=cost_trigger(10.0, 60.0))
 
 
@@ -274,8 +284,8 @@ async def test_design_trace_stating_other_values_is_premises_inconsistent(stated
         "2 more minutes",
         "five hours",
         "twenty-four hours",
-        "harvest on day 14",
         "minutes: 240",
+        "hours = 4",
         "5k USD",
         "2M EUR",
         "5 thousand Canadian dollars",
@@ -311,6 +321,13 @@ def test_protocol_figures_flags_currency_and_durations(protocol: str) -> None:
         "grow a 3D culture",
         "run 2 MS scans",
         "order 10 Eurofins primers",
+        # SG25 (AUDIT-19 #1): genes, ages, day labels, per cent and metres. Durations
+        # these forms imply are the independent estimate's to catch.
+        "clone into TOP10 cells and normalize to PGK1",
+        "dose 8 weeks old mice",
+        "harvest on day 14",
+        "a 2 per cent gel, 2 m from the source",
+        "min 3 replicates",
     ],
 )
 def test_protocol_figures_allows_non_cost_non_duration_numbers(protocol: str) -> None:
@@ -366,6 +383,7 @@ async def test_design_whose_protocol_states_figures_is_escalated_not_admitted() 
     pending = update["hitl_pending"]
     assert pending.payload["trigger"] == "verification"
     assert "240 minutes" in pending.reason and "$500" in pending.reason
+    assert pending.payload["feedback"] == pending.reason  # retried with it first
     assert content(update["hitl_payload"]["current_experiment"]) == content(priced)
 
 

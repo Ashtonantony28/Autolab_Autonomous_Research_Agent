@@ -57,6 +57,8 @@
 
 **Fix.** Add one sentence to `SYSTEM_PROMPTS["formalize"]`: "Name every symbol with a plain identifier `[A-Za-z_][A-Za-z0-9_]*` that is not an SMT-LIB or Z3 builtin (for example not `map`, `union`, `default`); never use `|quoted|` symbols or `;` comments."
 
+**Resolution (SG20).** `prompt_for` now lists what the formalizer rejects: names that are not plain identifiers `[A-Za-z_][A-Za-z0-9_]*`, `|quoted|` symbols, SMT-LIB reserved words and Z3 builtins with or without arguments (with examples), a name an earlier step used, anything but declare-const/declare-fun/declare-sort lines, and in the assertion SMT commands, a second term, `!` annotations, `|` and `;`. `SYSTEM_PROMPTS["formalize"]` is in `verification/llm.py` (an SG0 interface) and is unchanged. The repro passes as a plain test.
+
 ## 3. Medium: `protocol_figures` reads Svedberg units as durations
 
 **Impact.**
@@ -94,6 +96,8 @@
 **Repro.** `test_a_premise_whose_predicate_starts_with_assert_is_kept`: `(assertive 1)` does not entail `(assertive 1)`.
 
 **Fix.** Always wrap: `_wrap_assert` should return `f"(assert {body})"`. The `(assert` branch is dead for every formalized step since SG15, and `vericot` never passes one.
+
+**Resolution (SG22).** `_wrap_assert` always returns `(assert <body>)`. The repro passes as a plain test with its assertion unchanged.
 
 ## 6. Low: the dashboard drops the `hitl` event's agent and note
 

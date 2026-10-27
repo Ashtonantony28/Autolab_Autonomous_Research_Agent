@@ -23,7 +23,7 @@ from autolab.state.schema import empty_state
 from autolab.tools.lab_hardware.simulator import LabSimulator
 from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import CODE_OWNED, register_trivial_trace
+from tests.fixtures.agent_helpers import CODE_OWNED, register_estimate, register_trivial_trace
 from tests.integration.orchestrator.test_graph import (
     QUESTION,
     RESULT,
@@ -105,6 +105,7 @@ async def test_identical_model_replies_get_distinct_ids_and_independent_noise() 
         conclusion=design_claim(reply),
         facts=design_facts(reply),
     )
+    register_estimate(fake, reply)
     state = empty_state("Q?")
     state["hypotheses"] = [hypothesis]
     agent = DesignAgent(verifier=Verifier(fake), llm=fake)
