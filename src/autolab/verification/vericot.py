@@ -86,7 +86,8 @@ class Verifier:
     ) -> None:
         """`check_faithfulness=None` turns the check on only for a live LLM (`is_live`).
 
-        `solver_executor` defaults to the process-wide `default_executor()`.
+        `solver_executor` defaults to the process-wide `default_executor()`, obtained
+        here so its workers start while the trace is formalized (AUDIT-26 #3).
 
         The thresholds are the configured ones; a blocked trace's score is capped below
         both (`confidence.score_cap`).
@@ -99,6 +100,8 @@ class Verifier:
         self._pass_threshold = pass_threshold
         self._retry_threshold = retry_threshold
         self._executor = solver_executor
+        if solver_executor is None:
+            default_executor()
 
     async def verify(
         self,

@@ -36,6 +36,7 @@ from autolab.tools.lab_hardware.simulator import LabSimulator
 from autolab.verification.llm import FakeLLMClient, LLMPurpose
 from tests.fixtures.agent_helpers import (
     content,
+    register_estimate,
     register_failing_trace,
     register_trace,
     register_trivial_trace,
@@ -112,6 +113,7 @@ def _seed_design(fake: FakeLLMClient, design: ExperimentDesign, feedback: str = 
         conclusion=design_claim(design),
         facts=design_facts(design),
     )
+    register_estimate(fake, design)
 
 
 def _seed_full_run(fake: FakeLLMClient, design: ExperimentDesign = DESIGN) -> None:
@@ -160,6 +162,7 @@ def _fail_design_trace(fake: FakeLLMClient, feedback: str = "") -> None:
         conclusion=design_claim(DESIGN),
         facts=design_facts(DESIGN),
     )
+    register_estimate(fake, DESIGN)
 
 
 def _graph(fake: FakeLLMClient) -> tuple[Any, dict[str, Any]]:
@@ -316,7 +319,17 @@ async def test_hitl_retry_reruns_agent_with_human_note() -> None:
     fake = FakeLLMClient()
     _seed_full_run(fake, EXPENSIVE)
     note = "find a protocol under $10"
-    _seed_design(fake, DESIGN, feedback=note)
+    # A new protocol: the independent estimate reads the protocol, not the figures.
+    cheap = DESIGN.model_copy(update={"protocol": "run a single small measurement"})
+    _seed_design(fake, cheap, feedback=note)
+    register_trivial_trace(
+        fake,
+        agent="execute",
+        trace_purpose="execute.trace",
+        trace_prompt=build_execute_trace_prompt(cheap, RESULT),
+        conclusion=result_claim(RESULT),
+        facts=measurement_facts(RESULT),
+    )
     graph, config = _graph(fake)
 
     await graph.ainvoke(empty_state(QUESTION), config=config)

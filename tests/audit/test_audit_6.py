@@ -16,10 +16,9 @@ import time
 import tracemalloc
 from collections import defaultdict
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Final, ParamSpec, TypeVar
+from typing import Final, TypeVar
 from uuid import uuid4
 
 import pytest
@@ -55,9 +54,8 @@ _WAIT_S: Final = 60.0
 """Upper bound on waiting for a repro's precondition; reached only if the setup hangs."""
 
 _LOCK_HOLD_S: Final = 5.5
-"""Longer than the 5 s SQLite busy timeout the store's driver uses by default."""
+"""Longer than the 5 s SQLite busy timeout the store's driver used by default."""
 
-P = ParamSpec("P")
 T = TypeVar("T")
 
 
@@ -75,7 +73,6 @@ def test_verifies_on_several_threads_do_not_crash_the_interpreter() -> None:
 # --- #2 (medium): SQLite store fails a run instead of waiting for a writer ----
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #2")
 async def test_store_append_waits_out_a_concurrent_writer(tmp_path: Path) -> None:
     path = tmp_path / "s.db"
     store = await StateStore.create(f"sqlite+aiosqlite:///{path}")
@@ -179,26 +176,15 @@ async def test_bench_times_every_solver_check(monkeypatch: pytest.MonkeyPatch) -
 # --- #7 (low): executor shutdown cancels callers on other event loops ---------
 
 
-class _SubmitCountingPool(ThreadPoolExecutor):
-    """A pool that signals each submission, so a test can wait until both callers are in."""
-
-    def __init__(self, workers: int) -> None:
-        super().__init__(max_workers=workers, thread_name_prefix="z3")
-        self.submitted = threading.Semaphore(0)
-
-    def submit(self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
-        future = super().submit(fn, *args, **kwargs)
-        self.submitted.release()
-        return future
-
-
 class _ObservedExecutor(SolverExecutor):
-    """A `SolverExecutor` that signals once a check is running on its worker."""
+    """A 1-slot `SolverExecutor` with no slow lane that signals once a check is running.
+
+    With no slow lane the pool never grows, so a second loop's check always waits
+    in the pool's queue (AUDIT-20 #1).
+    """
 
     def __init__(self) -> None:
-        super().__init__(1)
-        self._pool.shutdown()
-        self._pool = self.pool = _SubmitCountingPool(1)
+        super().__init__(1, slow_workers=0)
         self.running = threading.Event()
 
     def _call(self, fn: Callable[[], T], interrupt: _Interrupt) -> tuple[T, float]:
@@ -209,7 +195,6 @@ class _ObservedExecutor(SolverExecutor):
         return super()._call(observed, interrupt)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-6 #7")
 async def test_shutdown_does_not_cancel_callers_on_other_loops() -> None:
     executor = _ObservedExecutor()
     outcomes: list[str] = []
@@ -223,13 +208,13 @@ async def test_shutdown_does_not_cancel_callers_on_other_loops() -> None:
 
         asyncio.run(main())
 
-    # Each loop's semaphore admits one check: one runs, the other waits in the pool.
+    # Each loop's slots admit one check: one runs, the other waits in the pool.
     threads = [threading.Thread(target=caller) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for _ in threads:
-        assert await asyncio.to_thread(executor.pool.submitted.acquire, timeout=_WAIT_S)
+    threads[0].start()
     assert await asyncio.to_thread(executor.running.wait, _WAIT_S)
+    threads[1].start()
+    while executor._pool._work_queue.qsize() == 0:
+        await asyncio.sleep(0.01)
     await asyncio.to_thread(executor.shutdown)
     for t in threads:
         await asyncio.to_thread(t.join)
