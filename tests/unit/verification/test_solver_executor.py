@@ -94,7 +94,7 @@ async def test_default_pool_stays_responsive_under_fifty_slow_checks(
 async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> None:
     executor = make_executor(1)
     executor.slow_workers = 0  # every check holds the only slot, so the others queue
-    # Fresh callers with no short check behind them, so no stuck slot lends them a place.
+    # Fresh callers: the stuck slot lends one of them a place, so at most two run at once.
     hard = partial(
         Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
@@ -102,36 +102,73 @@ async def test_solver_ms_excludes_queueing(make_executor: ExecutorFactory) -> No
     results = await asyncio.gather(*(executor.run(hard) for _ in range(4)))
     wall_ms = (time.perf_counter() - started) * 1000
     slow = [ms for _, ms in results]
-    assert wall_ms >= 4 * _SLOW_S * 1000  # one worker: the checks queued
+    assert wall_ms >= 2 * _SLOW_S * 1000  # one worker and one lent place: the checks queued
     assert all(_SLOW_S * 1000 * 0.9 <= ms < (_SLOW_S + _SLACK_S) * 1000 for ms in slow)
 
 
-async def test_solver_ms_excludes_worker_start_up(
-    make_executor: ExecutorFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ready, stop = solver_workers.Worker.ready, solver_workers.Worker.stop
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
 
-    def slow_boot(worker: solver_workers.Worker) -> bool:
-        if not worker._ready:
-            time.sleep(_SLACK_S)
-        return ready(worker)
+    def __call__(self) -> float:
+        return self.now
 
-    def slow_stop(worker: solver_workers.Worker) -> None:
-        time.sleep(_SLACK_S)
-        stop(worker)
 
-    monkeypatch.setattr(solver_workers.Worker, "ready", slow_boot)
-    monkeypatch.setattr(solver_workers.Worker, "stop", slow_stop)
-    executor = make_executor(1)
-    quick = partial(
-        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, POSITIVE)
-    )
+def test_solver_ms_excludes_worker_start_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fresh pool, so the check starts and boots its worker; no grace, so the worker
+    # is killed and replaced. On a fake clock starting costs 1000 s, booting 100 s,
+    # the call 1 s and stopping 10 s: only the call's second is `solver_ms` (AUDIT-28 #5).
+    clock = _FakeClock()
+    monkeypatch.setattr(solver_mod, "time", SimpleNamespace(perf_counter=clock))
+    monkeypatch.setattr(solver_mod, "_clock", clock)
+    monkeypatch.setattr(solver_mod, "_grace_s", lambda timeout_s: -timeout_s)
+    pool = solver_workers.Workers(solver_mod._solve, idle_max=1)
+    monkeypatch.setattr(solver_mod, "_workers", lambda: pool)
+    worker_type = solver_workers.Worker
+    booted: list[bool] = []
+    used: list[solver_workers.Worker] = []
+    real_start, real_ready = pool._start, worker_type.ready
+    real_call, real_stop = worker_type.call, worker_type.stop
+
+    def start() -> solver_workers.Worker:
+        clock.now += 1000.0
+        return real_start()
+
+    def ready(worker: solver_workers.Worker) -> bool:
+        booted.append(worker._ready)
+        clock.now += 0.0 if worker._ready else 100.0
+        return real_ready(worker)
+
+    def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        used.append(worker)
+        clock.now += 1.0
+        return real_call(worker, args, budget_s)
+
+    def stop(worker: solver_workers.Worker) -> None:
+        clock.now += 10.0
+        real_stop(worker)
+
+    monkeypatch.setattr(pool, "_start", start)
+    monkeypatch.setattr(worker_type, "ready", ready)
+    monkeypatch.setattr(worker_type, "call", call)
+    monkeypatch.setattr(worker_type, "stop", stop)
+    executor = SolverExecutor(1, 0)
     hard = partial(
-        Z3Solver(_SLOW_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
+        Z3Solver(_HANG_S).check_entailment, [SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES)
     )
-    (_, quick_ms), (_, hard_ms) = [await executor.run(check) for check in (quick, hard)]
-    assert quick_ms < _SLACK_S * 1000  # booting the worker is not counted
-    assert hard_ms < (_SLOW_S + _SLACK_S) * 1000  # nor is replacing the timed-out one
+    try:
+        outcome, ms = executor._call(hard, solver_mod._Interrupt())
+        spent = clock.now
+        (replacement,) = pool._idle
+        replaced = replacement is not used[0] and replacement.alive() and not used[0].alive()
+    finally:
+        executor.shutdown()
+        pool.close()
+    assert outcome == solver_mod._KILLED
+    assert booted[0] is False  # the check started and booted its worker
+    assert replaced
+    assert spent == 1000 + 100 + 1 + 10 + 1000  # its kill and replacement ran
+    assert ms == pytest.approx(1000.0)
 
 
 @pytest.mark.perf
@@ -224,12 +261,22 @@ async def test_hard_runs_do_not_starve_an_easy_verify_on_one_worker() -> None:
 async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     executor = SolverExecutor(1, slow_workers=1)
     lock = threading.Lock()
-    running, peak = 0, 0
+    running, peak, calls, slow_peak = 0, 0, 0, 0
+    to_slow = executor._to_slow
+
+    def counted(interrupt: solver_mod._Interrupt) -> bool:
+        nonlocal slow_peak
+        moved = to_slow(interrupt)
+        slow_peak = max(slow_peak, executor._slow)
+        return moved
+
+    executor._to_slow = counted  # type: ignore[method-assign]
 
     def hard() -> solver_mod.SolverOutcome:
-        nonlocal running, peak
+        nonlocal running, peak, calls
         with lock:
             running += 1
+            calls += 1
             peak = max(peak, running)
         try:
             return Z3Solver(0.3).check_entailment(
@@ -245,9 +292,12 @@ async def test_slow_checks_are_bounded_by_slow_workers() -> None:
     finally:
         executor.shutdown()
     assert [o.reason for o, _ in outs] == ["timeout"] * 3
-    # One check in the slot and one slow check; the third waits for a slow one to end.
-    assert peak == 2
-    assert threads <= 2
+    # One check in the slot and one slow check. The third, a newcomer, is lent a place
+    # by the stuck slot until its check shows it is hard, then waits as a hard caller.
+    assert slow_peak == 1  # the cap, never above it (AUDIT-34 #3, AUDIT-36 #9)
+    assert peak <= 3
+    assert calls in (3, 4)  # 4 if the lent check was stopped and run again
+    assert threads <= 3  # slot, slow check and lent place
     assert executor._slow == 0
 
 
@@ -293,9 +343,27 @@ async def test_default_executor_is_lazy_and_replaceable() -> None:
     assert (await Verifier(fake).verify(trace)).consistency_score == 1.0
 
 
-@pytest.mark.perf
-async def test_judges_overlap_but_formalization_stays_ordered() -> None:
-    delay_s = 0.1
+def test_a_verifier_starts_the_default_workers_when_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AUDIT-26 #3: start-up overlaps the formalization instead of the first check.
+    shutdown_default_executor()
+    asked: list[int] = []
+    done = threading.Event()
+
+    def prestart(_: solver_workers.Workers, n: int) -> None:
+        asked.append(n)
+        done.set()
+
+    monkeypatch.setattr(solver_workers.Workers, "prestart", prestart)
+    Verifier(FakeLLMClient())
+    assert done.wait(_WAIT_S)
+    assert solver_mod._default_executor is not None
+    assert asked == [solver_mod.SOLVER_WORKERS + solver_mod.SOLVER_SLOW_WORKERS]
+
+
+async def _judged_verify(delay_s: float) -> tuple[float, list[str], int]:
+    """(wall s, formalize order, LLM calls) of a 6-step verify with `delay_s` per call."""
     trace, fake = build(chain(6, cite=True))
     order: list[str] = []
 
@@ -312,8 +380,20 @@ async def test_judges_overlap_but_formalization_stays_ordered() -> None:
     result = await Verifier(llm, check_faithfulness=True).verify(trace)
     wall = time.perf_counter() - started
     assert result.consistency_score == 1.0
+    return wall, order, llm.calls
+
+
+@pytest.mark.perf
+async def test_judges_overlap_but_formalization_stays_ordered() -> None:
+    # AUDIT-28 #3: calibrated on the same run with no latency, not on absolute seconds.
+    await _judged_verify(0.0)  # starts the worker processes
+    base = min([(await _judged_verify(0.0))[0] for _ in range(2)])
+    delay_s = max(0.1, 2 * base)
+    wall, order, calls = await _judged_verify(delay_s)
     assert order == [str(i) for i in range(6)]
-    assert wall < (6 + 2) * delay_s
+    overlapped = 6 + 1  # formalize in turn, the last judge after them
+    assert calls > overlapped + 2  # so the bound below tells overlap from none
+    assert wall - base < (overlapped + calls) / 2 * delay_s, (wall, base, delay_s, calls)
 
 
 @pytest.mark.perf
@@ -474,7 +554,8 @@ def test_a_check_whose_worker_dies_is_never_valid(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(solver_workers.Worker, "call", dying)
     decls = "(declare-const p Bool)"
     out = Z3Solver().check_entailment([SmtFormula(decls, "p")], SmtFormula(decls, "p"))
-    assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
+    # Not a timeout: the worker died (SIGKILL) well inside its budget (AUDIT-25 #2).
+    assert out == solver_mod.SolverOutcome("UNGROUNDED", "worker_died", "worker died (signal 9)")
 
 
 def test_a_check_that_raises_in_its_worker_raises_in_the_caller(

@@ -30,7 +30,6 @@ _JOIN_S = 30.0
 # --- #1 (medium): a worker that died or never started is reported as killed past the timeout
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-27 #1")
 def test_a_worker_that_dies_is_not_reported_as_killed_past_the_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -48,7 +47,6 @@ def test_a_worker_that_dies_is_not_reported_as_killed_past_the_timeout(
     assert "past the timeout" not in out.details, out.details
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-27 #1")
 def test_a_script_without_a_main_guard_is_not_told_its_checks_timed_out(tmp_path: Path) -> None:
     # The quickstart in `vericot`'s docstring, as a plain script: no `__main__` guard.
     # Every worker re-runs the script and dies starting a process of its own.
@@ -80,7 +78,6 @@ def test_a_script_without_a_main_guard_is_not_told_its_checks_timed_out(tmp_path
 # --- #2 (low): a long configured timeout raises OverflowError on the worker path ---------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-27 #2")
 def test_a_long_timeout_is_decided_in_a_worker_as_it_is_here() -> None:
     # `Settings.solver_timeout_s` accepts any value > 0 (config.py:49). About 26 days.
     solver = Z3Solver(timeout_seconds=2.25e6)

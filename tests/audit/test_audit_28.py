@@ -86,7 +86,7 @@ def _verdict_after_a_check_cut_short(monkeypatch: pytest.MonkeyPatch) -> str:
 
     def cut_short(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
         assert worker.ready()
-        worker.conn.send(args)
+        worker._send(args)
         assert worker.conn.poll(_WAIT_S)  # its reply is waiting, unread
         raise _CutShort
 
@@ -103,12 +103,12 @@ def test_a_check_cut_short_never_answers_the_next_one(
     assert _verdict_after_a_check_cut_short(monkeypatch) == "INVALID"
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-28 #1")
 def test_a_check_cut_short_never_answers_the_next_one_under_w06(
     monkeypatch: pytest.MonkeyPatch, pool: solver_workers.Workers
 ) -> None:
+    # SG31: the reply's sequence number no longer matches, so the worker counts as lost.
     _mutant(monkeypatch, Z3Solver, "check_entailment", *_W06)
-    assert _verdict_after_a_check_cut_short(monkeypatch) == "INVALID"
+    assert _verdict_after_a_check_cut_short(monkeypatch) == "UNGROUNDED"
 
 
 # --------------------------------------------------------------------------
@@ -212,7 +212,12 @@ def test_a_worker_killed_after_its_reply_is_replaced_under_w04(
 # (it is killed), stopping the worker 100 s.
 # --------------------------------------------------------------------------
 
-_W09: Final = ("        + (time.perf_counter() - checked)\n", "")
+# SG35 counts this time with `_Interrupt.pause`; W09 and W10 drop a pause.
+_W09: Final = (
+    "    interrupt.pause()\n    interrupt.detach()\n    if reply",
+    "    interrupt.detach()\n    if reply",
+)
+_W10: Final = ("    interrupt.pause()\n    worker = pool.acquire()", "    worker = pool.acquire()")
 
 
 class _Clock:
@@ -265,7 +270,7 @@ def test_solver_ms_excludes_starting_and_replacing_a_killed_worker(
 def test_solver_ms_excludes_starting_a_worker_under_w10(
     monkeypatch: pytest.MonkeyPatch, pool: solver_workers.Workers
 ) -> None:
-    _mutant(monkeypatch, Z3Solver, "check_entailment", "        + (checking - setup)\n", "")
+    _mutant(monkeypatch, Z3Solver, "check_entailment", *_W10)
     assert _ms_of_a_killed_check(monkeypatch, pool) == pytest.approx(1000.0)
 
 
@@ -462,8 +467,8 @@ async def test_a_check_past_the_documented_run_time_under_a09(
 
 # --------------------------------------------------------------------------
 # L4: code that runs only in the worker process. Coverage cannot see it (workers
-# end by SIGKILL, so a child's data is never saved: `_serve`, `_die_with_parent`
-# and `_forkserver_init` show 0% even with multiprocessing coverage), and no test
+# end by SIGKILL, so a child's data is never saved: `_serve` and `_die_with_parent`
+# show 0% even with multiprocessing coverage), and no test
 # checks that a worker ignores Ctrl-C (W26) or asks to die with its parent (W27):
 # both pass the suite. `_serve` is run here in this process on the main thread,
 # where a mutant can reach it, with `prctl` replaced by a recorder.
@@ -482,8 +487,8 @@ def _serve_here(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], int, boo
             assert parent.poll(_WAIT_S)
             replies.append(parent.recv())  # ready
             signal.raise_signal(signal.SIGINT)  # Ctrl-C reaches the whole process group
-            for args in ((6, 3), (1, 0)):
-                parent.send(args)
+            for request in ((1, (6, 3)), (2, (1, 0))):
+                parent.send(request)
                 if parent.poll(_WAIT_S):
                     replies.append(parent.recv())
         except (EOFError, OSError):  # the loop ended early (the mutants)
@@ -506,7 +511,11 @@ def _serve_here(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], int, boo
     return replies, len(died), interrupted
 
 
-_SERVED: Final = ([None, (True, 2.0), (False, "ZeroDivisionError: division by zero")], 1, False)
+_SERVED: Final = (
+    [None, (1, (True, 2.0)), (2, (False, "ZeroDivisionError: division by zero"))],
+    1,
+    False,
+)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT semantics")
@@ -539,9 +548,8 @@ def test_a_worker_asks_to_die_with_its_parent_under_w27(monkeypatch: pytest.Monk
 # --------------------------------------------------------------------------
 # L5: three `Workers` details no test reaches. `close` must stop the idle
 # processes, not only forget them (W36: `live()` is 0 while they run on);
-# `acquire` must forget a dead idle worker (W37: `live()` counts it for ever);
-# `_main_imports` must name a `-m` main module for the forkserver to preload
-# (W33: every worker start then re-imports it).
+# `acquire` must forget a dead idle worker (W37: `live()` counts it for ever).
+# W33's `_main_imports` is gone: since SG32 a worker never re-runs the main module.
 # --------------------------------------------------------------------------
 
 
@@ -607,32 +615,6 @@ def test_a_dead_idle_worker_is_no_longer_counted_under_w37(
         "",
     )
     assert _live_after_skipping_a_dead_worker() == 1
-
-
-def _preloaded_for(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    out: list[list[str]] = []
-    for spec in (SimpleNamespace(name="autolab.cli"), SimpleNamespace(name="pkg.__main__"), None):
-        monkeypatch.setitem(sys.modules, "__main__", SimpleNamespace(__spec__=spec))
-        out.append(solver_workers._main_imports())
-    return out
-
-
-def test_a_main_module_run_with_dash_m_is_preloaded(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _preloaded_for(monkeypatch) == [["autolab.cli"], [], []]
-
-
-@pytest.mark.xfail(strict=True, reason="AUDIT-28 L5")
-def test_a_main_module_run_with_dash_m_is_preloaded_under_w33(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _mutant(
-        monkeypatch,
-        solver_workers,
-        "_main_imports",
-        'return [name] if isinstance(name, str) and not name.endswith("__main__") else []',
-        "return []",
-    )
-    assert _preloaded_for(monkeypatch) == [["autolab.cli"], [], []]
 
 
 def _idle_places(monkeypatch: pytest.MonkeyPatch) -> int:

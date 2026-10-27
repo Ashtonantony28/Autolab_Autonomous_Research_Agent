@@ -82,7 +82,6 @@ def test_a_guarded_script_checks_once_and_gets_valid(tmp_path: Path) -> None:
     assert out.startswith("VALID")
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-25 #1")
 def test_an_unguarded_script_is_not_rerun_in_the_workers(tmp_path: Path) -> None:
     body, out = _run_script(tmp_path, guarded=False)
 
@@ -132,7 +131,6 @@ def _check_with_worker_killed(monkeypatch: pytest.MonkeyPatch, timeout_s: float)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="SIGKILL")
-@pytest.mark.xfail(strict=True, reason="AUDIT-25 #2")
 def test_a_crashed_worker_is_not_reported_as_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     timeout_s = 20.0
     outcome, elapsed = _check_with_worker_killed(monkeypatch, timeout_s)
@@ -184,7 +182,6 @@ def test_a_check_returns_its_worker_to_the_pool(monkeypatch: pytest.MonkeyPatch)
     assert worker in solver_mod._workers()._idle
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-25 #3")
 def test_an_error_while_a_worker_boots_does_not_leak_it(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = solver_mod._workers()
     acquired = _record_acquire(monkeypatch)

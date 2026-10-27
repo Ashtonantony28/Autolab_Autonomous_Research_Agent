@@ -10,7 +10,7 @@ import asyncio
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from functools import partial
 from typing import Final
 
@@ -271,8 +271,8 @@ async def test_a_caller_cancelled_while_waiting_leaves_the_queue() -> None:
     assert not slots._waiters
 
 
-async def _queued(slots: _Slots, short: bool) -> asyncio.Task[bool]:
-    task = asyncio.create_task(slots.acquire(short))
+async def _queued(slots: _Slots, short: bool, new: bool = False) -> asyncio.Task[bool]:
+    task = asyncio.create_task(slots.acquire(short, new))
     await asyncio.sleep(0)
     return task
 
@@ -332,6 +332,68 @@ async def test_a_lent_place_does_not_overtake_a_caller_that_could_not_take_it() 
     assert await hard is False
 
 
+async def test_newcomers_are_lent_places_latest_first() -> None:
+    # AUDIT-30 #1: runs that start together are all newcomers. The latest is lent the next
+    # place, so a newcomer never waits for the newcomers queued before it.
+    slots = _Slots(1)
+    assert await slots.acquire(short=False) is False
+    burst = [await _queued(slots, short=False, new=True) for _ in range(2)]
+    hard = await _queued(slots, short=False)
+    latest = await _queued(slots, short=False, new=True)
+    assert slots.stick(lent=False)
+    assert await latest is True
+    for expected in reversed(burst):
+        assert not expected.done()
+        slots.release(lent=True)
+        assert await expected is True
+    slots.release(lent=True)
+    assert not hard.done()  # a hard caller is lent nothing
+    slots.unstick()
+    slots.release(lent=False)
+    assert await hard is False
+
+
+async def test_a_newcomer_overtaken_for_every_lent_place_twice_is_lent_the_next() -> None:
+    slots = _Slots(1)
+    assert await slots.acquire(short=False) is False
+    first = await _queued(slots, short=False, new=True)
+    later = await _queued(slots, short=False, new=True)
+    assert slots.stick(lent=False)
+    for _ in range(solver_mod._LENT_AGING):
+        assert await later is True
+        later = await _queued(slots, short=False, new=True)
+        slots.release(lent=True)
+    assert await first is True  # served before the latest newcomer
+    assert not later.done()
+    slots.release(lent=True)
+    assert await later is True
+    slots.release(lent=True)
+    slots.unstick()
+    slots.release(lent=False)
+    assert (slots.held, slots.lent, slots.stuck, len(slots._waiters)) == (0, 0, 0, 0)
+
+
+async def test_a_caller_queued_again_keeps_its_arrival_and_is_lent_nothing() -> None:
+    # AUDIT-34 #1: a stopped check queues again with its first arrival number, ahead of
+    # callers that arrived after it; `lend=False` keeps it off lent places.
+    slots = _Slots(1)
+    stopped = slots.arrive()
+    assert await slots.acquire(short=False) is False
+    later = await _queued(slots, short=False)
+    again = asyncio.create_task(slots.acquire(False, True, stopped, lend=False))
+    await asyncio.sleep(0)
+    assert [w.arrival for w in slots._waiters] == [stopped, stopped + 1]
+    assert slots.stick(lent=False)
+    await asyncio.sleep(0)
+    assert not again.done() and slots.lent == 0
+    slots.unstick()
+    slots.release(lent=False)
+    assert await again is False
+    assert not later.done()
+    slots.release(lent=False)
+    assert await later is False
+
+
 def test_a_lent_place_never_sticks_or_lends() -> None:
     # AUDIT-24 #3, in `_Slots` itself, whatever `run` asks.
     slots = _Slots(1)
@@ -341,30 +403,38 @@ def test_a_lent_place_never_sticks_or_lends() -> None:
     assert slots._grant(short=True) is None
 
 
-def _served_within_bound(workers: int, ops: list[tuple[str, bool]]) -> None:
+def _served_within_bound(workers: int, ops: list[tuple[str, str]]) -> None:
     """Replay `ops` on `_Slots(workers)`, then drain; no caller is overtaken for more
-    than `workers` slot grants by callers that arrived after it."""
+    than `workers` slot grants by callers that arrived after it, nor, if it may be lent
+    a place, for more than `_LENT_AGING` lent places per slot."""
 
     async def main() -> None:
         slots = _Slots(workers)
         arrived: list[tuple[asyncio.Task[bool], int]] = []  # (task, slot grants before it)
         grants: list[asyncio.Task[bool]] = []  # slot grants, in order; one per op at most
         served: dict[asyncio.Task[bool], int] = {}  # slot grants before it was served
+        lent_before: dict[asyncio.Task[bool], int] = {}
+        lent_served: dict[asyncio.Task[bool], int] = {}
         held: list[asyncio.Task[bool]] = []
         lent: list[asyncio.Task[bool]] = []
+        lent_grants: list[asyncio.Task[bool]] = []
+        kinds: dict[asyncio.Task[bool], str] = {}
 
         async def step() -> None:
             await asyncio.sleep(0)
             for task, _ in arrived:
                 if task.done() and task not in served:
                     served[task] = len(grants)
+                    lent_served[task] = len(lent_grants)
                     (lent if task.result() else held).append(task)
-                    if not task.result():
-                        grants.append(task)
+                    (lent_grants if task.result() else grants).append(task)
 
-        for op, short in ops:
+        for op, kind in ops:
             if op == "arrive":
-                arrived.append((asyncio.create_task(slots.acquire(short)), len(grants)))
+                task = asyncio.create_task(slots.acquire(kind == "short", kind == "new"))
+                kinds[task] = kind
+                arrived.append((task, len(grants)))
+                lent_before[task] = len(lent_grants)
             elif op == "release" and held:
                 held.pop(0)
                 slots.release(lent=False)
@@ -391,6 +461,10 @@ def _served_within_bound(workers: int, ops: list[tuple[str, bool]]) -> None:
         for task, before in arrived:
             overtaken = sum(1 for g in grants[before : served[task]] if order[g] > order[task])
             assert overtaken <= workers, (order[task], overtaken)
+            if kinds[task] != "hard":
+                lent_by = lent_grants[lent_before[task] : lent_served[task]]
+                overtaken = sum(1 for g in lent_by if order[g] > order[task])
+                assert overtaken <= solver_mod._LENT_AGING * workers, (order[task], overtaken)
 
     loop = asyncio.new_event_loop()  # not `asyncio.run`, which unsets pytest-asyncio's loop
     try:
@@ -402,7 +476,7 @@ def _served_within_bound(workers: int, ops: list[tuple[str, bool]]) -> None:
 _OPS: Final = st.lists(
     st.tuples(
         st.sampled_from(["arrive", "arrive", "release", "release_lent", "stick", "unstick"]),
-        st.booleans(),
+        st.sampled_from(["hard", "short", "new"]),
     ),
     max_size=60,
 )
@@ -411,122 +485,12 @@ _OPS: Final = st.lists(
 @settings(max_examples=200, deadline=None)
 @given(workers=st.integers(1, 3), ops=_OPS)
 def test_no_caller_is_overtaken_for_more_than_every_slot(
-    workers: int, ops: list[tuple[str, bool]]
+    workers: int, ops: list[tuple[str, str]]
 ) -> None:
     _served_within_bound(workers, ops)
 
 
 # --- `SolverExecutor` scheduling ------------------------------------------------------
-
-
-async def test_a_new_runs_first_check_is_served_within_a_grant_per_slot(
-    executors: list[SolverExecutor],
-) -> None:
-    # AUDIT-22 #4 without wall clocks: 1 slot, two runs whose checks are short take turns
-    # in it. A new run (no last check, so not short) is overtaken by one later caller,
-    # then served before the short run that re-queued behind it.
-    executor = _executor(executors, 1, 0)
-    slots = executor._slots.setdefault(asyncio.get_running_loop(), _Slots(1))
-    order: list[str] = []
-    gates: dict[str, threading.Event] = {}
-
-    def check(name: str) -> None:
-        order.append(name)
-        assert gates.setdefault(name, threading.Event()).wait(_WAIT_S)
-
-    async def busy(names: list[str]) -> None:
-        for name in names:
-            await executor.run(partial(check, name))
-
-    def end(name: str) -> None:
-        gates.setdefault(name, threading.Event()).set()
-
-    a = asyncio.create_task(busy(["a1", "a2", "a3"]))
-    await _until(lambda: order == ["a1"])
-    b = asyncio.create_task(busy(["b1", "b2"]))
-    await _until(lambda: len(slots._waiters) == 1)
-    newcomer = asyncio.create_task(executor.run(partial(check, "n")))
-    await _until(lambda: len(slots._waiters) == 2)
-    for name, served in [("a1", 2), ("b1", 3), ("a2", 4), ("n", 5), ("b2", 6), ("a3", 6)]:
-        end(name)
-        await _until(lambda served=served: len(order) == served)  # type: ignore[misc]
-    await asyncio.gather(a, b, newcomer)
-    assert order == ["a1", "b1", "a2", "n", "b2", "a3"]
-
-
-async def test_slow_checks_never_exceed_slow_workers(executors: list[SolverExecutor]) -> None:
-    # The slow-worker cap (AUDIT-20 #5): 1 slot, 2 slow. Of four held Z3 calls from fresh
-    # callers, two go slow, the third stays stuck in the slot and the fourth waits.
-    executor = _executor(executors, 1, 2)
-    held = [_Held() for _ in range(4)]
-    tasks: list[asyncio.Task[tuple[str, float]]] = []
-    for h in held[:3]:
-        tasks.append(asyncio.create_task(executor.run(h)))
-        assert await asyncio.to_thread(h.started.wait, _WAIT_S)
-        await _until(lambda: executor._slow == min(len(tasks), 2))
-    tasks.append(asyncio.create_task(executor.run(held[3])))
-    slots = executor._slots[asyncio.get_running_loop()]
-    await _until(lambda: slots.stuck == 1 and len(slots._waiters) == 1)
-    assert executor._slow == 2
-    assert not held[3].started.is_set()
-    assert len(executor._pool._threads) == 3
-    held[0].gate.set()  # a slow check ends; the stuck one takes its place, the slot frees
-    assert await asyncio.to_thread(held[3].started.wait, _WAIT_S)
-    for h in held:
-        h.gate.set()
-    assert [r for r, _ in await asyncio.gather(*tasks)] == ["held"] * 4
-    assert (executor._slow, executor._pool._max_workers, slots.held, slots.stuck) == (0, 1, 0, 0)
-
-
-async def test_a_short_caller_overtakes_hard_checks_above_the_slow_cap(
-    executors: list[SolverExecutor],
-) -> None:
-    # AUDIT-18 #4 without wall clocks: no slow room, the slot is stuck and a fresh caller
-    # waits. A caller whose last check was short runs at once; a fresh one does not.
-    executor = _executor(executors, 1, 0)
-    await executor.run(lambda: None)  # this task's last check was short
-    hard, other = _Held(), _Held()
-    hard_task = asyncio.create_task(executor.run(hard))
-    assert await asyncio.to_thread(hard.started.wait, _WAIT_S)
-    other_task = asyncio.create_task(executor.run(other))
-    slots = executor._slots[asyncio.get_running_loop()]
-    await _until(lambda: slots.stuck == 1)
-    assert (await executor.run(lambda: "easy"))[0] == "easy"
-    assert not other.started.is_set() and not hard.gate.is_set()
-
-    async def fresh() -> str:
-        return (await executor.run(lambda: "fresh"))[0]
-
-    fresh_task = asyncio.create_task(fresh())
-    await _until(lambda: len(slots._waiters) == 2)
-    hard.gate.set()
-    other.gate.set()
-    assert await fresh_task == "fresh"
-    await asyncio.gather(hard_task, other_task)
-    assert (slots.held, slots.lent, slots.stuck, executor._pool._max_workers) == (0, 0, 0, 1)
-
-
-async def test_a_lent_place_gets_its_own_thread(executors: list[SolverExecutor]) -> None:
-    executor = _executor(executors, 1, 0)
-    await executor.run(lambda: None)  # this task's last check was short
-    hard, lent = _Held(), _Held()
-    hard_task = asyncio.create_task(executor.run(hard))
-    assert await asyncio.to_thread(hard.started.wait, _WAIT_S)
-    slots = executor._slots[asyncio.get_running_loop()]
-    await _until(lambda: slots.stuck == 1)
-    seen: list[tuple[int, int, int]] = []
-
-    async def drive() -> None:
-        assert await asyncio.to_thread(lent.started.wait, _WAIT_S)
-        seen.append((slots.lent, executor._pool._max_workers, len(executor._pool._threads)))
-        lent.gate.set()
-        hard.gate.set()
-
-    driver = asyncio.create_task(drive())
-    assert (await executor.run(lent))[0] == "held"
-    await asyncio.gather(driver, hard_task)
-    assert seen == [(1, 2, 2)]
-    assert executor._pool._max_workers == 1
 
 
 class _FakeClock:
@@ -550,6 +514,238 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     fake = _FakeClock()
     monkeypatch.setattr(solver_mod, "_clock", fake)
     return fake
+
+
+async def test_a_new_runs_first_check_is_served_before_hard_runs(
+    executors: list[SolverExecutor], clock: _FakeClock
+) -> None:
+    # AUDIT-26 #1 without wall clocks: 1 slot, two runs whose checks are hard take turns
+    # in it. A new run (no check yet) arrives behind a queued hard check and is served
+    # before it; SG30 served it in arrival order, behind every hard caller.
+    executor = _executor(executors, 1, 0)
+    slots = executor._slots.setdefault(asyncio.get_running_loop(), _Slots(1))
+    order: list[str] = []
+    gates: dict[str, threading.Event] = {}
+
+    def check(name: str, slices: float) -> None:
+        order.append(name)
+        assert gates.setdefault(name, threading.Event()).wait(_WAIT_S)
+        clock.now += slices * solver_mod._SLICE_S
+
+    async def hard(names: list[str]) -> None:
+        for name in names:
+            await executor.run(partial(check, name, solver_mod._HARD_SLICES))
+
+    def end(name: str) -> None:
+        gates.setdefault(name, threading.Event()).set()
+
+    a = asyncio.create_task(hard(["a1", "a2", "a3"]))
+    await _until(lambda: order == ["a1"])
+    b = asyncio.create_task(hard(["b1", "b2"]))
+    await _until(lambda: len(slots._waiters) == 1)
+    end("a1")
+    await _until(lambda: order == ["a1", "b1"] and len(slots._waiters) == 1)  # a2 queued
+    newcomer = asyncio.create_task(executor.run(partial(check, "n", 0)))
+    await _until(lambda: len(slots._waiters) == 2)
+    for name, served in [("b1", 3), ("n", 4), ("a2", 5), ("b2", 6), ("a3", 6)]:
+        end(name)
+        await _until(lambda served=served: len(order) == served)  # type: ignore[misc]
+    await asyncio.gather(a, b, newcomer)
+    assert order == ["a1", "b1", "n", "a2", "b2", "a3"]
+
+
+async def _result(run: Awaitable[tuple[str, float]]) -> str:
+    return (await run)[0]
+
+
+async def _hard_run(
+    executor: SolverExecutor, clock: _FakeClock, call: _Held
+) -> tuple[asyncio.Task[str], asyncio.Event]:
+    """A task that makes a hard check, then `call` once its event is set."""
+    go = asyncio.Event()
+
+    async def run() -> str:
+        await executor.run(clock.ran(solver_mod._HARD_SLICES))
+        await go.wait()
+        return await _result(executor.run(call))
+
+    task = asyncio.create_task(run())
+    await _until(lambda: task in executor._hard)
+    return task, go
+
+
+async def test_slow_checks_never_exceed_slow_workers(
+    executors: list[SolverExecutor], clock: _FakeClock
+) -> None:
+    # The slow-worker cap (AUDIT-20 #5): 1 slot, 2 slow. Of four held Z3 calls, two go
+    # slow, the third stays stuck in the slot and the fourth, from a hard run, waits.
+    executor = _executor(executors, 1, 2)
+    held = [_Held() for _ in range(4)]
+    last, go = await _hard_run(executor, clock, held[3])
+    tasks: list[asyncio.Task[str]] = []
+    for h in held[:3]:
+        tasks.append(asyncio.create_task(_result(executor.run(h))))
+        assert await asyncio.to_thread(h.started.wait, _WAIT_S)
+        await _until(lambda: executor._slow == min(len(tasks), 2))
+    tasks.append(last)
+    go.set()
+    slots = executor._slots[asyncio.get_running_loop()]
+    await _until(lambda: slots.stuck == 1 and len(slots._waiters) == 1)
+    assert executor._slow == 2
+    assert not held[3].started.is_set()
+    assert len(executor._pool._threads) == 3
+    held[0].gate.set()  # a slow check ends; the stuck one takes its place, the slot frees
+    assert await asyncio.to_thread(held[3].started.wait, _WAIT_S)
+    for h in held:
+        h.gate.set()
+    assert await asyncio.gather(*tasks) == ["held"] * 4
+    assert (executor._slow, executor._pool._max_workers, slots.held, slots.stuck) == (0, 1, 0, 0)
+
+
+async def test_a_short_caller_overtakes_hard_checks_above_the_slow_cap(
+    executors: list[SolverExecutor], clock: _FakeClock
+) -> None:
+    # AUDIT-18 #4, AUDIT-26 #1 without wall clocks: no slow room, the slot is stuck and a
+    # hard run waits. A caller whose last check was short runs at once on a lent place,
+    # and so does a new one (stopped only if its check shows it is hard, AUDIT-30 #1).
+    executor = _executor(executors, 1, 0)
+    await executor.run(lambda: None)  # this task's last check was short
+    hard, other = _Held(), _Held()
+    other_task, go = await _hard_run(executor, clock, other)
+    hard_task = asyncio.create_task(executor.run(hard))
+    assert await asyncio.to_thread(hard.started.wait, _WAIT_S)
+    slots = executor._slots[asyncio.get_running_loop()]
+    await _until(lambda: slots.stuck == 1)
+    go.set()
+    await _until(lambda: len(slots._waiters) == 1)
+    assert (await executor.run(lambda: "easy"))[0] == "easy"
+    assert not other.started.is_set() and not hard.gate.is_set()
+
+    async def new() -> tuple[int, bool]:
+        lent, _ = await executor.run(lambda: slots.lent)
+        return lent, other.started.is_set()
+
+    # Lent a place, as the short one, before the slot frees (AUDIT-36 #9).
+    assert await asyncio.create_task(new()) == (1, False)
+    assert not hard.gate.is_set()
+    hard.gate.set()
+    other.gate.set()
+    assert await other_task == "held"
+    await hard_task
+    assert (slots.held, slots.lent, slots.stuck, executor._pool._max_workers) == (0, 0, 0, 1)
+
+
+class _HardUntilStopped:
+    """A check that runs until its worker is killed; run again, it decides at once."""
+
+    def __init__(self, name: str, order: list[str]) -> None:
+        self.name = name
+        self.order = order
+        self.started = threading.Event()
+        self._stop = threading.Event()
+
+    def interrupt(self) -> None:
+        self._stop.set()
+
+    def __call__(self) -> str:
+        self.order.append(self.name)
+        if self._stop.is_set():
+            return "decided"
+        interrupt = solver_mod._worker.interrupt
+        assert interrupt.attach(self)
+        self.started.set()
+        try:
+            assert self._stop.wait(_WAIT_S)
+        finally:
+            interrupt.detach()
+        return "stopped"
+
+
+async def test_runs_that_start_together_do_not_hold_up_a_later_newcomer(
+    executors: list[SolverExecutor], clock: _FakeClock
+) -> None:
+    # AUDIT-30 #1, AUDIT-32 #8: 1 slot, no slow room, its check stuck. Three runs start
+    # together, all newcomers; the one lent the place shows it is hard and is stopped
+    # and queued again as hard. An easy newcomer arriving after them is served next, and
+    # every stopped run is decided once the slot frees, in arrival order (AUDIT-34 #1).
+    executor = _executor(executors, 1, 0)
+    blocker = _Held()
+    slot_task = asyncio.create_task(executor.run(blocker))
+    assert await asyncio.to_thread(blocker.started.wait, _WAIT_S)
+    slots = executor._slots[asyncio.get_running_loop()]
+    await _until(lambda: slots.stuck == 1)
+    order: list[str] = []
+    runs = [_HardUntilStopped(f"r{i}", order) for i in range(3)]
+    tasks = [asyncio.create_task(executor.run(r)) for r in runs]
+    await _until(lambda: runs[0].started.is_set() and len(slots._waiters) == 2)
+    easy = asyncio.create_task(executor.run(lambda: order.append("easy")))
+    await _until(lambda: len(slots._waiters) == 3)
+    clock.now += solver_mod._HARD_SLICES * solver_mod._SLICE_S
+    await easy
+    assert order == ["r0", "easy"]
+    for run in (runs[2], runs[1]):  # the latest newcomer first
+        await _until(run.started.is_set)
+        clock.now += solver_mod._HARD_SLICES * solver_mod._SLICE_S
+    await _until(lambda: len(slots._waiters) == 3)
+    assert all(not w.new and not w.short for w in slots._waiters)
+    blocker.gate.set()
+    assert [r for r, _ in await asyncio.gather(*tasks)] == ["decided"] * 3
+    await slot_task
+    assert order == ["r0", "easy", "r2", "r1", "r0", "r1", "r2"]
+    assert all(t in executor._short for t in tasks)  # each decided at once when run again
+    assert (slots.held, slots.lent, slots.stuck, executor._pool._max_workers) == (0, 0, 0, 1)
+
+
+async def test_a_short_caller_takes_a_lent_place_from_a_newcomer_after_a_slice(
+    executors: list[SolverExecutor], clock: _FakeClock
+) -> None:
+    # AUDIT-18 #4 with newcomers lent places: a newcomer's check that has run a slice gives
+    # its lent place to a waiting short caller and is queued again for a slot only, so
+    # it cannot take the place back between the short caller's checks.
+    executor = _executor(executors, 1, 0)
+    await executor.run(lambda: None)  # this task's last check was short
+    blocker = _Held()
+    slot_task = asyncio.create_task(executor.run(blocker))
+    assert await asyncio.to_thread(blocker.started.wait, _WAIT_S)
+    slots = executor._slots[asyncio.get_running_loop()]
+    await _until(lambda: slots.stuck == 1)
+    order: list[str] = []
+    run = _HardUntilStopped("new", order)
+    newcomer = asyncio.create_task(executor.run(run))
+    assert await asyncio.to_thread(run.started.wait, _WAIT_S)
+    clock.now += solver_mod._SLICE_S
+    for _ in range(2):
+        await executor.run(lambda: order.append("short"))
+    await _until(lambda: len(slots._waiters) == 1)
+    assert newcomer not in executor._hard  # stopped after a slice: not counted as hard
+    blocker.gate.set()
+    await slot_task
+    assert (await newcomer)[0] == "decided"
+    assert order == ["new", "short", "short", "new"]
+    assert (slots.held, slots.lent, slots.stuck) == (0, 0, 0)
+
+
+async def test_a_lent_place_gets_its_own_thread(executors: list[SolverExecutor]) -> None:
+    executor = _executor(executors, 1, 0)
+    await executor.run(lambda: None)  # this task's last check was short
+    hard, lent = _Held(), _Held()
+    hard_task = asyncio.create_task(executor.run(hard))
+    assert await asyncio.to_thread(hard.started.wait, _WAIT_S)
+    slots = executor._slots[asyncio.get_running_loop()]
+    await _until(lambda: slots.stuck == 1)
+    seen: list[tuple[int, int, int]] = []
+
+    async def drive() -> None:
+        assert await asyncio.to_thread(lent.started.wait, _WAIT_S)
+        seen.append((slots.lent, executor._pool._max_workers, len(executor._pool._threads)))
+        lent.gate.set()
+        hard.gate.set()
+
+    driver = asyncio.create_task(drive())
+    assert (await executor.run(lent))[0] == "held"
+    await asyncio.gather(driver, hard_task)
+    assert seen == [(1, 2, 2)]
+    assert executor._pool._max_workers == 1
 
 
 @pytest.mark.parametrize(
@@ -699,6 +895,25 @@ async def test_a_lent_check_that_goes_slow_returns_its_place(
     await asyncio.gather(driver, *tasks)
     assert seen == [(1, 1, 1), (1, 1, 0), (0, 1, 0)]
     assert (executor._slow, slots.held, slots.lent, slots.stuck) == (0, 0, 0, 0)
+    assert executor._pool._max_workers == 1
+
+
+async def test_a_cancelled_slow_check_keeps_its_place_until_it_ends(
+    executors: list[SolverExecutor],
+) -> None:
+    # AUDIT-28 #2: the held call ignores the interrupt, as a worker whose kill is still
+    # in progress does. Its caller is gone, but the slow place frees only when it ends.
+    executor = _executor(executors, 1, 1)
+    held = _Held()
+    task = asyncio.create_task(executor.run(held))
+    assert await asyncio.to_thread(held.started.wait, _WAIT_S)
+    await _until(lambda: executor._slow == 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert executor._slow == 1
+    held.gate.set()
+    await _until(lambda: executor._slow == 0)
     assert executor._pool._max_workers == 1
 
 
