@@ -9,7 +9,13 @@ import pytest
 from anthropic.lib._parse._transform import transform_schema
 from pydantic import BaseModel
 
-from autolab.agents.common import DESIGN_REPLY, HYPOTHESIS_REPLY, REPORT_REPLY
+from autolab.agents.common import (
+    DESIGN_REPLY,
+    HYPOTHESIS_REPLY,
+    REPORT_REPLY,
+    design_claim,
+    design_facts,
+)
 from autolab.agents.design import DesignAgent, build_design_prompt, build_design_trace_prompt
 from autolab.orchestrator.graph import build_graph
 from autolab.state.models import ExperimentDesign, ExperimentParameter, Hypothesis
@@ -17,7 +23,7 @@ from autolab.state.schema import empty_state
 from autolab.tools.lab_hardware.simulator import LabSimulator
 from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import CODE_OWNED, register_trivial_trace
+from tests.fixtures.agent_helpers import CODE_OWNED, register_estimate, register_trivial_trace
 from tests.integration.orchestrator.test_graph import (
     QUESTION,
     RESULT,
@@ -96,8 +102,10 @@ async def test_identical_model_replies_get_distinct_ids_and_independent_noise() 
         agent="design",
         trace_purpose="design.trace",
         trace_prompt=build_design_trace_prompt(hypothesis, reply),
-        conclusion=reply.protocol,
+        conclusion=design_claim(reply),
+        facts=design_facts(reply),
     )
+    register_estimate(fake, reply)
     state = empty_state("Q?")
     state["hypotheses"] = [hypothesis]
     agent = DesignAgent(verifier=Verifier(fake), llm=fake)

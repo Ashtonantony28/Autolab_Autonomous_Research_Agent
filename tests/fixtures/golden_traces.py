@@ -68,7 +68,7 @@ def build(golden: GoldenTrace, agent: str = "golden") -> tuple[ReasoningTrace, F
         )
         try:
             candidate = vocab.merged(gs.declarations)
-            z3.parse_smt2_string(f"{candidate.smt()}\n(assert {gs.assertion})")
+            z3.parse_smt2_string(f"{candidate.smt()}\n(assert {gs.assertion})", ctx=z3.Context())
         except (FormalizationError, z3.Z3Exception):
             continue
         vocab = candidate
