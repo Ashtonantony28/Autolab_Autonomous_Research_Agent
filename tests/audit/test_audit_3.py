@@ -18,14 +18,13 @@ from anthropic._exceptions import OverloadedError  # not re-exported from `anthr
 from anthropic.lib._parse._transform import transform_schema
 from pydantic import BaseModel
 
+from autolab.agents.common import DESIGN_REPLY, HYPOTHESIS_REPLY, REPORT_REPLY
 from autolab.agents.verification_monitor import AgentDecision, VerificationMonitor
 from autolab.config import Settings
 from autolab.orchestrator.graph import build_graph
 from autolab.orchestrator.recovery import RetryingLLMClient
 from autolab.state.checkpointer import InMemoryCheckpointer
 from autolab.state.models import (
-    AnalysisReport,
-    ExperimentDesign,
     Hypothesis,
     ReasoningStep,
     StepVerdict,
@@ -102,7 +101,6 @@ async def test_formalizer_turns_a_refusal_into_formalization_error() -> None:
         await formalizer.formalize(step)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #2")
 async def test_llm_refusal_pauses_at_hitl_instead_of_crashing_the_graph() -> None:
     graph = build_graph(llm=_RefusingLLM(), retry_backoff_seconds=0.0)
     config = {"configurable": {"thread_id": str(uuid4())}}
@@ -113,17 +111,17 @@ async def test_llm_refusal_pauses_at_hitl_instead_of_crashing_the_graph() -> Non
 # --- #3 (high): the LLM authors entity ids and timestamps ---------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #3")
-@pytest.mark.parametrize("schema", [Hypothesis, ExperimentDesign, AnalysisReport])
+@pytest.mark.parametrize("schema", [HYPOTHESIS_REPLY, DESIGN_REPLY, REPORT_REPLY])
 def test_structured_output_schema_does_not_let_the_model_pick_ids(
     schema: type[BaseModel],
 ) -> None:
+    # The agents send these content-only schemas, not the domain models
+    # (`tests/unit/agents/test_identity.py` checks what each agent sends).
     sent = transform_schema(schema)  # what `messages.parse(output_format=schema)` sends
     assert "id" not in sent["properties"]
     assert "created_at" not in sent["properties"]
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #3")
 async def test_an_id_reused_by_another_run_does_not_move_this_runs_row(
     store: StateStore,
 ) -> None:
@@ -155,7 +153,6 @@ class _OverloadedOnce:
         raise NotImplementedError
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #4")
 async def test_overloaded_error_is_retried() -> None:
     inner = _OverloadedOnce()
     client = RetryingLLMClient(inner, initial_backoff_seconds=0.0)
@@ -196,7 +193,6 @@ class _PassThrough:
         return await self._inner.call_structured(purpose, prompt, schema)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-3 #8")
 def test_faithfulness_stays_on_for_a_wrapped_live_client() -> None:
     verifier = Verifier(_PassThrough(_refusing_claude()))
     assert verifier._check_faithfulness is True

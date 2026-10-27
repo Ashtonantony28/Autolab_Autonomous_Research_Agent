@@ -2,7 +2,10 @@
 
 Each domain model (`Hypothesis`, `ExperimentDesign`, ...) is stored as a JSON
 blob on its own row, plus a few projected columns for querying (id, run_id,
-created_at, optional status). Querying detail beyond projection happens in
+created_at, optional status). Rows are keyed by `(run_id, id)`, so one run
+never moves or overwrites another run's row, and every write is a single
+`INSERT ... ON CONFLICT`, so concurrent writers of one key do not race.
+Querying detail beyond projection happens in
 application code by deserializing the blob — fine for the volumes AutoLab
 deals with (thousands of rows, not millions).
 
@@ -12,14 +15,17 @@ The persistence backend is selected via `Settings.database_url`. SQLite +
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, DateTime, ForeignKey, String, select
+from sqlalchemy import JSON, DateTime, ForeignKey, String, event, select
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine import make_url
+from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -27,6 +33,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import ConnectionPoolEntry
 
 from autolab.monitoring.events import TraceEvent
 from autolab.state.models import (
@@ -39,6 +46,9 @@ from autolab.state.models import (
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+SQLITE_BUSY_TIMEOUT_S: Final[float] = 30.0
+"""How long a SQLite writer waits for another writer's lock before failing."""
 
 
 class Base(DeclarativeBase):
@@ -56,8 +66,8 @@ class RunRow(Base):
 class _EntityRow(Base):
     __abstract__ = True
 
+    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("runs.id"), primary_key=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    run_id: Mapped[str] = mapped_column(String(36), ForeignKey("runs.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
@@ -107,6 +117,53 @@ _ROW_FOR_MODEL: dict[type[BaseModel], type[_EntityRow]] = {
 }
 
 
+_INSERTS: Final[dict[str, Callable[[Any], sqlite.Insert | postgresql.Insert]]] = {
+    "sqlite": sqlite.insert,
+    "postgresql": postgresql.insert,
+}
+"""Per-dialect `insert` constructs that support `ON CONFLICT`."""
+
+
+def upsert_statement(
+    dialect: str, row_cls: type[Base], values: dict[str, Any]
+) -> sqlite.Insert | postgresql.Insert:
+    """One atomic `INSERT ... ON CONFLICT` for `dialect`.
+
+    A run row is never overwritten; an entity row is updated in place by `(run_id, id)`.
+
+    Raises:
+        ValueError: if `dialect` has no `ON CONFLICT` support here.
+    """
+    if dialect not in _INSERTS:
+        raise ValueError(f"unsupported database dialect {dialect!r}")
+    stmt = _INSERTS[dialect](row_cls).values(**values)
+    if row_cls is RunRow:
+        return stmt.on_conflict_do_nothing(index_elements=["id"])
+    return stmt.on_conflict_do_update(
+        index_elements=["run_id", "id"],
+        set_={k: stmt.excluded[k] for k in values if k not in ("run_id", "id")},
+    )
+
+
+def _create_engine(url: str, *, echo: bool) -> AsyncEngine:
+    """An engine whose SQLite writers wait out each other's locks instead of failing."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return create_async_engine(url, echo=echo, future=True)
+    engine = create_async_engine(
+        url, echo=echo, future=True, connect_args={"timeout": SQLITE_BUSY_TIMEOUT_S}
+    )
+    if parsed.database not in (None, "", ":memory:"):
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _wal(dbapi_conn: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+    return engine
+
+
 class StateStore:
     """Thin async wrapper around an `AsyncEngine` for AutoLab state.
 
@@ -117,11 +174,12 @@ class StateStore:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
         self._sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        self._dialect = engine.dialect.name
 
     @classmethod
     async def create(cls, url: str, *, echo: bool = False) -> StateStore:
         """Create a store and ensure the schema is initialized."""
-        engine = create_async_engine(url, echo=echo, future=True)
+        engine = _create_engine(url, echo=echo)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         return cls(engine)
@@ -150,10 +208,14 @@ class StateStore:
 
     async def ensure_run(self, run_id: UUID, research_question: str) -> None:
         """Create the run row unless it already exists (e.g. a resumed run)."""
+        values = {
+            "id": str(run_id),
+            "research_question": research_question,
+            "created_at": datetime.now(tz=UTC),
+        }
         async with self.session() as session:
-            if await session.get(RunRow, str(run_id)) is not None:
-                return
-        await self.create_run(research_question, run_id=run_id)
+            await session.execute(upsert_statement(self._dialect, RunRow, values))
+            await session.commit()
 
     async def list_runs(self) -> list[tuple[UUID, str]]:
         """Return `(run_id, research_question)` for every run, newest first."""
@@ -164,8 +226,9 @@ class StateStore:
     async def append(self, run_id: UUID, model: BaseModel) -> None:
         """Persist any supported domain model under the given run.
 
-        Idempotent: rows are upserted by id (`VerificationResult` by `trace_id`),
-        so re-recording an entity after a restart does not duplicate it.
+        Idempotent: rows are upserted by `(run_id, id)` (`VerificationResult` by
+        `trace_id`), so re-recording an entity after a restart does not duplicate
+        it, and the same id under another run is a separate row.
         """
         row_cls = _ROW_FOR_MODEL.get(type(model))
         if row_cls is None:
@@ -201,7 +264,7 @@ class StateStore:
             kwargs["node"] = getattr(model, "node", "")
 
         async with self.session() as session:
-            await session.merge(row_cls(**kwargs))
+            await session.execute(upsert_statement(self._dialect, row_cls, kwargs))
             await session.commit()
 
     async def load_hypotheses(self, run_id: UUID) -> list[Hypothesis]:
@@ -240,4 +303,5 @@ __all__ = [
     "StateStore",
     "TraceEventRow",
     "VerificationResultRow",
+    "upsert_statement",
 ]

@@ -7,7 +7,11 @@ from dataclasses import dataclass
 import pytest
 
 from autolab.agents.research import ResearchAgent, build_hypothesis_prompt, build_trace_prompt
-from autolab.agents.verification_monitor import AgentDecision, VerificationMonitor
+from autolab.agents.verification_monitor import (
+    AgentDecision,
+    VerificationMonitor,
+    blocking_reason,
+)
 from autolab.config import PASS_THRESHOLD
 from autolab.state.models import (
     Citation,
@@ -21,7 +25,7 @@ from autolab.state.schema import empty_state
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, SolverOutcome, Z3Solver
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_trace
+from tests.fixtures.agent_helpers import content, register_trace
 from tests.fixtures.golden_traces import GoldenStep
 
 CLAIM = "C holds"
@@ -207,8 +211,62 @@ async def test_inconclusive_circularity_check_fails_closed() -> None:
     verifier = Verifier(fake)
     verifier._solver = _InconclusiveCircular()
     result = await verifier.verify(trace, context=BOUND)
-    assert _reasons(result)[:2] == ["UNGROUNDED:timeout", "UNGROUNDED:timeout"]
+    assert _reasons(result)[:2] == ["UNGROUNDED:no_premises", "UNGROUNDED:no_premises"]
     assert "could not rule out a circular premise" in result.step_verdicts[0].details
+    assert blocking_reason(result) is not None and not _passes(result)
+
+
+async def test_inconclusive_circularity_check_blocks_even_if_the_rest_proves_the_claim() -> None:
+    # Q => C alone is decided (INVALID), so only Q's check is inconclusive; Q is dropped
+    # and the trace still proves C from P and P => C, but it must not pass.
+    trace, fake = _trace(
+        _P,
+        _P_IMPLIES_C,
+        GoldenStep("Q holds", "premise", "(declare-const q Bool)", "q"),
+        GoldenStep(CLAIM, "conclusion", "", "c", (0, 1)),
+    )
+    verifier = Verifier(fake)
+    verifier._solver = _InconclusiveOn(assertion="q")
+    result = await verifier.verify(trace, context=BOUND)
+    assert _reasons(result) == [
+        "VALID:assumed",
+        "VALID:assumed",
+        "UNGROUNDED:no_premises",
+        "VALID:entailed",
+    ]
+    assert blocking_reason(result) is not None and not _passes(result)
+
+
+@dataclass
+class _InconclusiveOn(Z3Solver):
+    """Times out when the single premise `assertion` is checked against the conclusion."""
+
+    assertion: str = ""
+
+    def check_entailment(self, premises: list[SmtFormula], claim: SmtFormula) -> SolverOutcome:
+        if premises == [SmtFormula("", self.assertion)] and claim.assertion == "c":
+            return SolverOutcome(verdict="UNGROUNDED", reason="timeout", details="unknown")
+        return super().check_entailment(premises, claim)
+
+
+async def test_premise_invalid_in_pass_one_is_not_assumed_in_pass_two() -> None:
+    # Step 1 is dropped (its circularity check is inconclusive). Step 2 contains the
+    # claim and was INVALID only because it contradicted step 1; it stays INVALID.
+    trace, fake = _trace(
+        GoldenStep("not P", "premise", _PC + "\n(declare-const q Bool)", "(not p)"),
+        GoldenStep("not Q and (C or P)", "premise", "", "(and (not q) (or c p))"),
+        GoldenStep("Q and C", "premise", "", "(and q c)"),
+        GoldenStep(CLAIM, "conclusion", "", "c", (0, 1, 2)),
+    )
+    verifier = Verifier(fake)
+    verifier._solver = _InconclusiveOn(assertion="(and (not q) (or c p))")
+    result = await verifier.verify(trace, context=BOUND)
+    assert _reasons(result) == [
+        "VALID:assumed",
+        "UNGROUNDED:no_premises",
+        "INVALID:premises_inconsistent",
+        "INVALID:not_entailed",
+    ]
     assert not _passes(result)
 
 
@@ -247,4 +305,4 @@ async def test_agent_gate_withholds_a_high_scoring_trace_with_an_unproven_conclu
     assert update["hitl_pending"] is not None
     assert update["hitl_pending"].reason == "final step 4 is UNGROUNDED (formalization_failed)"
     assert "hypotheses" not in update
-    assert update["hitl_payload"] == {"hypotheses": [HYPOTHESIS]}
+    assert content(*update["hitl_payload"]["hypotheses"]) == content(HYPOTHESIS)

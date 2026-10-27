@@ -64,6 +64,8 @@ dev = [
   # Stubs for typed third-party packages.
   "types-redis",
   "types-PyYAML",
+  # Per-test time limit: a hung solver check fails and names the test (AUDIT-8 H1).
+  "pytest-timeout>=2.4.0",
 ]
 
 [build-system]
@@ -78,9 +80,11 @@ minversion = "8.0"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
+timeout = 60
 filterwarnings = ["error"]
 markers = [
   "live: hits real external services; gated on RUN_LIVE_TESTS=1",
+  "perf: asserts on wall-clock time; deselect with -m 'not perf'",
 ]
 
 [tool.coverage.run]

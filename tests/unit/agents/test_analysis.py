@@ -61,7 +61,7 @@ async def test_analysis_agent_emits_report() -> None:
     assert update["confidence"] == 1.0
 
 
-async def test_analysis_agent_rejects_result_id_mismatch() -> None:
+async def test_analysis_agent_ignores_model_supplied_ids() -> None:
     mismatched = AnalysisReport(
         result_id=uuid4(),  # not RESULT.id
         interpretations=(Interpretation(statement="x", rank=0, likelihood=0.5),),
@@ -69,12 +69,23 @@ async def test_analysis_agent_rejects_result_id_mismatch() -> None:
     )
     fake = FakeLLMClient()
     fake.register("analysis.report", build_analysis_prompt(RESULT), mismatched.model_dump_json())
-
+    register_trivial_trace(
+        fake,
+        agent="analysis",
+        trace_purpose="analysis.trace",
+        trace_prompt=build_analysis_trace_prompt(RESULT, mismatched),
+        conclusion="x",
+        facts=measurement_facts(RESULT),
+    )
     state = empty_state("Q?")
     state["results"] = [RESULT]
-    agent = AnalysisAgent(verifier=Verifier(fake), llm=fake)
-    with pytest.raises(ValueError, match="result_id"):
-        await agent(state)
+
+    update = await AnalysisAgent(verifier=Verifier(fake), llm=fake)(state)
+
+    (report,) = update["analysis_reports"]
+    assert report.result_id == RESULT.id
+    assert report.id != mismatched.id and report.created_at > mismatched.created_at
+    assert str(RESULT.id) not in build_analysis_prompt(RESULT)
 
 
 async def test_analysis_agent_requires_results() -> None:

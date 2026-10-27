@@ -15,11 +15,45 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Any, Final
 
-from autolab.state.models import FormalizedStep, ReasoningStep, ReasoningTrace
+from pydantic import BaseModel
+
+from autolab.agents.design import DesignEstimate, build_estimate_prompt
+from autolab.state.models import ExperimentDesign, FormalizedStep, ReasoningStep, ReasoningTrace
 from autolab.verification.formalizer import Vocabulary, prompt_for
 from autolab.verification.llm import FakeLLMClient
 from tests.fixtures.golden_traces import GoldenStep
+
+CODE_OWNED: Final = frozenset({"id", "created_at", "hypothesis_id", "result_id"})
+"""Fields agents assign in code, never from the model's reply."""
+
+
+def content(*models: BaseModel) -> list[dict[str, Any]]:
+    """Each model without its `CODE_OWNED` fields, for comparing agent output to a fixture."""
+    return [m.model_dump(exclude=set(CODE_OWNED)) for m in models]
+
+
+def register_estimate(
+    fake: FakeLLMClient,
+    design: ExperimentDesign,
+    *,
+    cost_usd: float | None = None,
+    duration_minutes: float | None = None,
+) -> None:
+    """Register the Design agent's independent estimate of `design` (SG25).
+
+    By default it agrees with the design's own figures; pass what an honest
+    estimator would read from the design to model an understated one.
+    """
+    reply = DesignEstimate(
+        estimated_cost_usd=design.estimated_cost_usd if cost_usd is None else cost_usd,
+        estimated_duration_minutes=(
+            design.estimated_duration_minutes if duration_minutes is None else duration_minutes
+        ),
+        rationale="read from the protocol, parameters and success criteria",
+    )
+    fake.register("design.estimate", build_estimate_prompt(design), reply.model_dump_json())
 
 
 def _sym(agent: str, letter: str) -> str:
