@@ -45,6 +45,7 @@ from autolab.state.models import (
 )
 from autolab.state.schema import AutoLabState, empty_state
 from autolab.verification import formalizer as formalizer_mod
+from autolab.verification import solver_workers
 from autolab.verification.formalizer import FormalizationError, Formalizer, Vocabulary
 from autolab.verification.llm import FakeLLMClient
 from autolab.verification.solver import SmtFormula, SolverExecutor, Z3Solver
@@ -332,49 +333,41 @@ async def test_design_concluding_the_bound_claim_cannot_hide_its_protocol_cost()
 _WAIT_S = 10.0
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-12 #2")
 async def test_cancel_between_the_two_z3_checks_still_stops_the_second(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Since SG29 a cancel kills the check's worker (ADR 0009), wherever in the check
+    # it lands; here it lands once the worker has the request and is solving it.
     executor = SolverExecutor(1)
-    reached, cancelled, done = threading.Event(), threading.Event(), threading.Event()
+    reached, done = threading.Event(), threading.Event()
     elapsed: list[float] = []
-    calls = 0
-    real_check = z3.Solver.check
-    ours = threading.local()  # only this test's check counts, not a Z3 thread left by another
+    real_call = solver_workers.Worker.call
 
-    def check(self: z3.Solver, *args: object) -> object:
-        nonlocal calls
-        if getattr(ours, "check", False):
-            calls += 1
-            if calls == 2:  # the entailment check: the cancel lands just before it starts
-                reached.set()
-                assert cancelled.wait(_WAIT_S)
-                started = time.perf_counter()
-                try:
-                    return real_check(self, *args)
-                finally:
-                    elapsed.append(time.perf_counter() - started)
-                    done.set()
-        return real_check(self, *args)
+    def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        reached.set()
+        started = time.perf_counter()
+        try:
+            return real_call(worker, args, budget_s)
+        finally:
+            elapsed.append(time.perf_counter() - started)
+            done.set()
 
-    monkeypatch.setattr(z3.Solver, "check", check)
+    monkeypatch.setattr(solver_workers.Worker, "call", call)
 
     def undecidable() -> object:
-        ours.check = True
         solver = Z3Solver(timeout_seconds=3.0)
         return solver.check_entailment([SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES))
 
     try:
         task = asyncio.create_task(executor.run(undecidable))
         assert await asyncio.to_thread(reached.wait, _WAIT_S)
+        await asyncio.sleep(0.1)  # inside the worker's checks
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        cancelled.set()
         assert await asyncio.to_thread(done.wait, _WAIT_S)
     finally:
         await asyncio.to_thread(executor.shutdown)
 
-    # Today: about 3.0 s, the full Z3 timeout; an interrupted check returns at once.
+    # Before SG19: about 3.0 s, the full Z3 timeout; a cancelled check returns at once.
     assert elapsed[0] < 1.0

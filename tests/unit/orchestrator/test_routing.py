@@ -71,3 +71,43 @@ def test_verification_request_without_history_escalates() -> None:
     state = _state("research", "verification")
     state["verification_history"] = []
     assert node(state).goto == "hitl"
+
+
+# SG25 (AUDIT-19 #2, AUDIT-15 #3): a request with its own `feedback` (a Design
+# figure rejection or estimate disagreement) is retried with that reason first.
+
+
+def _fixable(score: float, retries: int = 0, trigger: str = "verification") -> AutoLabState:
+    state = _state("design", trigger, score, retries=retries)
+    state["hitl_pending"] = HITLRequest(
+        agent="design", reason="fix it", payload={"trigger": trigger, "feedback": "fix it"}
+    )
+    return state
+
+
+def test_a_fixable_request_on_a_passing_verdict_is_retried_with_its_reason() -> None:
+    cmd = node(_fixable(0.9, retries=1))
+    assert cmd.goto == "design"
+    assert cmd.update == {
+        "hitl_pending": None,
+        "hitl_payload": None,
+        "retry_count": 2,
+        "feedback": "fix it",
+    }
+
+
+def test_a_fixable_request_on_a_retry_verdict_carries_both_reasons() -> None:
+    cmd = node(_fixable(0.5))
+    assert cmd.goto == "design"
+    assert isinstance(cmd.update, dict)
+    assert cmd.update["feedback"] == "summary 0.5; fix it"
+
+
+def test_a_fixable_request_still_escalates_when_exhausted_or_rated_escalate() -> None:
+    assert node(_fixable(0.9, retries=2)).goto == "hitl"
+    assert node(_fixable(0.1)).goto == "hitl"
+    assert node(_fixable(0.9, trigger="policy")).goto == "hitl"
+
+
+def test_a_passing_verdict_without_feedback_is_not_retried() -> None:
+    assert node(_state("design", "verification", 0.9)).goto == "hitl"

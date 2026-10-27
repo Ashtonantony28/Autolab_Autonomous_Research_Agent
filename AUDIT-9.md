@@ -201,6 +201,8 @@ check. Alternatively, make an inconclusive circularity check blocking, with reas
 `no_premises` and "could not rule out a circular premise". That keeps "fail closed" true
 for the trace and not just for the premise. Doing both is cheap.
 
+**Resolution (SG16).** `_payload_overrides` now applies both halves of the fix, without iterating. A premise that is not VALID in pass 1 keeps its pass-1 verdict as an override, so pass 2 never assumes it. Dropping the premise it conflicted with therefore cannot turn it into VALID/`assumed`. Every other pass-1 premise was VALID and has already been checked for circularity, so a fixed point adds nothing. An inconclusive circularity check is now UNGROUNDED/`no_premises` ("could not rule out a circular premise"), which `blocking_reason` blocks, even when the remaining premises prove the conclusion. The pass-1 verdicts are carried over only when some premise is dropped, so a trace with no circular premise is still checked once. The repro passes as a plain test: [UNGROUNDED/no_premises, INVALID/premises_inconsistent, INVALID].
+
 ---
 
 ## Low
