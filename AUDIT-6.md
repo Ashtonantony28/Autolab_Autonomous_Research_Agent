@@ -72,6 +72,8 @@ Precondition: no entry point in this repository runs verifies on two threads tod
 
 **Suggested fix.** For SQLite, set `connect_args={"timeout": 30}` and `PRAGMA journal_mode=WAL` on connect. Serialize writes per engine with an `asyncio.Lock`, or write each `record_node` batch in one transaction. Retry `OperationalError` "database is locked" a bounded number of times. Measure Postgres separately.
 
+**Resolution (SG23).** `StateStore.create` now opens SQLite with a 30 s busy timeout (`SQLITE_BUSY_TIMEOUT_S`) and puts file databases in WAL mode on connect, so a writer waits for another writer's lock instead of failing, and readers no longer block it. Every store write is a single upsert, so a transaction never upgrades from a read lock. `test_store_append_waits_out_a_concurrent_writer` now passes as a plain test. Not done: writes are not serialized per engine and `OperationalError` is still not retried, so a lock held for longer than 30 s still fails the run. Postgres is unchanged.
+
 ---
 
 ## 3. Medium: `retry-after` overrides the jitter, so rate-limited clients retry in lockstep

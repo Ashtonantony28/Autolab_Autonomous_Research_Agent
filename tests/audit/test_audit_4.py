@@ -73,7 +73,7 @@ def test_solver_unknown_is_never_valid(
     """Z3 `unknown` on either check is UNGROUNDED/timeout, whatever the claim (kills M02)."""
     _unknown_on_call(monkeypatch, which)
 
-    out = Z3Solver().check_entailment([_PQ], SmtFormula(_PQ.declarations, claim))
+    out = Z3Solver()._check_here([_PQ], SmtFormula(_PQ.declarations, claim))
 
     assert (out.verdict, out.reason) == ("UNGROUNDED", "timeout")
 

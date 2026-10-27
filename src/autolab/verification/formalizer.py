@@ -5,6 +5,11 @@ trace: when step N is formalized, the symbol declarations from steps 1..N-1
 are passed in so the LLM keeps names consistent (CLAUDE.md §7 Pattern C).
 Re-declaring a symbol with a different signature is rejected.
 
+No step can change the meaning of a symbol it did not introduce (AUDIT-13 #1, #2):
+a declared name may not be a Z3 builtin, bare or applied to its declared
+argument sorts, nor a name an earlier step already used, and an assertion may
+not carry `!` annotations, whose `:named` would define a symbol for later checks.
+
 The LLM returns a `FormalizedStep` (via `LLMClient.call_structured`) whose
 `declarations` and `assertion` are SMT-LIB 2 strings. The vocabulary is only
 extended once the step's SMT parses, and a merge either applies fully or not
@@ -17,6 +22,7 @@ import functools
 import json
 import re
 import threading
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -51,13 +57,23 @@ class Vocabulary:
         Raises:
             FormalizationError: on an unrecognized or conflicting declaration,
                 or one that names an SMT-LIB reserved word (AUDIT-5 #1), a Z3
-                builtin, or anything but a plain identifier (AUDIT-9 #1).
+                builtin, or anything but a plain identifier (AUDIT-9 #1), or that
+                takes more than `MAX_ARITY` arguments (AUDIT-22 #1) or nests deeper
+                than `MAX_NESTING`, or if probing the reply's declarations for
+                builtins would parse more than `MAX_PROBE_CHARS` (AUDIT-26 #2).
         """
         out = dict(self.declarations)
+        probes: list[tuple[str, str, tuple[str, ...]]] = []
+        cost = 0
         for line in new_decls.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
+            if _too_deep(stripped):
+                raise FormalizationError(
+                    f"declaration nests parentheses more than {MAX_NESTING} deep inside its "
+                    f"own: {stripped[:60]!r}..."
+                )
             name = _decl_name(stripped)
             if name is None:
                 raise FormalizationError(f"unrecognized declaration: {stripped!r}")
@@ -65,15 +81,33 @@ class Vocabulary:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             if not _IDENTIFIER.fullmatch(name):
                 raise FormalizationError(f"declared name {name!r} is not a plain identifier")
-            if _is_z3_builtin(name):
-                raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
+            tokens = _decl_tokens(stripped)
+            arity = _arity(tokens)
+            if arity > MAX_ARITY:
+                raise FormalizationError(
+                    f"declaration of {name!r} takes {arity} arguments; at most {MAX_ARITY} allowed"
+                )
             existing = out.get(name)
             if existing is not None and existing != stripped:
                 raise FormalizationError(
                     f"symbol {name!r} re-declared with conflicting signature: "
                     f"had {existing!r}, got {stripped!r}"
                 )
+            mentioned = _tokens(stripped)
+            sorts = tuple(
+                d for n, d in out.items() if d.startswith("(declare-sort") and n in mentioned
+            )
+            cost += _probe_chars(tokens, stripped, sorts)
+            if cost > MAX_PROBE_CHARS:
+                raise FormalizationError(
+                    f"declarations up to {name!r} need over {MAX_PROBE_CHARS} characters of "
+                    "builtin probes; declare fewer or narrower symbols"
+                )
+            probes.append((name, stripped, sorts))
             out[name] = stripped
+        for name, stripped, sorts in probes:
+            if _is_z3_builtin(name) or _applied_builtin(stripped, sorts):
+                raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
         return Vocabulary(out)
 
     def merge(self, new_decls: str) -> None:
@@ -91,6 +125,7 @@ class Formalizer:
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
         self.vocabulary = Vocabulary()
+        self._used: set[str] = set()
 
     async def formalize(self, step: ReasoningStep) -> SmtFormula:
         """Formalize `step` and, on success only, extend the vocabulary.
@@ -98,8 +133,9 @@ class Formalizer:
         Raises:
             FormalizationError: if the LLM refuses or returns no structured
                 output, if its output fails schema validation (including an
-                empty assertion), conflicts with the vocabulary, has an
-                assertion that is not exactly one term, or does not parse as SMT-LIB.
+                empty assertion), conflicts with the vocabulary, declares a
+                name an earlier step used, has an assertion that is not exactly
+                one term or carries a `!` annotation, or does not parse as SMT-LIB.
         """
         prompt = prompt_for(step, self.vocabulary)
         try:
@@ -112,7 +148,16 @@ class Formalizer:
 
         if not _is_single_term(out.assertion):
             raise FormalizationError(f"assertion of step {step.index} is not exactly one term")
+        tokens = _tokens(out.assertion)
+        if "!" in tokens or any(t.startswith(":") for t in tokens):
+            raise FormalizationError(f"assertion of step {step.index} has a `!` annotation")
         candidate = self.vocabulary.merged(out.declarations)
+        used = self._used | _tokens(self.vocabulary.smt())
+        for name in candidate.declarations.keys() - self.vocabulary.declarations.keys():
+            if name in used:
+                raise FormalizationError(
+                    f"declaration of {name!r} would change the meaning of an earlier step"
+                )
         full_decls = candidate.smt()
         try:
             z3.parse_smt2_string(f"{full_decls}\n(assert {out.assertion})", ctx=_parse_context())
@@ -120,6 +165,7 @@ class Formalizer:
             raise FormalizationError(f"invalid SMT for step {step.index}: {exc}") from exc
 
         self.vocabulary = candidate
+        self._used |= tokens
         return SmtFormula(declarations=full_decls, assertion=out.assertion)
 
 
@@ -153,6 +199,19 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
         "",
         "Existing vocabulary (do not re-declare these):",
         vocab.smt() or "(none)",
+        "",
+        "Rules (a step that breaks one fails formalization):",
+        "- Every declared name is a plain identifier [A-Za-z_][A-Za-z0-9_]*, never a "
+        "|quoted| symbol, and not an SMT-LIB reserved word or Z3 builtin, with or without "
+        "arguments (for example not map, union, default, sin, equals, if_then_else).",
+        "- Do not declare a name that an earlier step already used.",
+        f"- A declared function or sort takes at most {MAX_ARITY} arguments, and a "
+        f"declaration nests parentheses at most {MAX_NESTING} deep inside its own.",
+        "- Declare only the symbols this step needs: a step's declarations must stay small "
+        "(each function of many Int or Real arguments costs the most).",
+        "- declarations holds only declare-const, declare-fun or declare-sort lines, one per line.",
+        "- assertion is exactly one Bool term: no SMT commands, no second term, no ! "
+        "annotations (:named, :pattern), and no | or ; anywhere (so no ; comments).",
         "",
         'Reply with JSON: {"declarations": "...", "assertion": "..."}',
     ]
@@ -225,7 +284,162 @@ def _is_z3_builtin(name: str) -> bool:
     return False
 
 
-_TERM_TOKEN: Final = re.compile(r'\s*("(?:[^"]|"")*"|[()]|[^\s()"]+)')
+_NUMERIC: Final = frozenset({"Int", "Real"})
+
+MAX_ARITY: Final = 32
+"""Most arguments a declared function or sort may take; bounds the applied probe (AUDIT-22 #1)."""
+
+MAX_NESTING: Final = 8
+"""Deepest parenthesis nesting inside a declaration's outer pair: Z3 parses a declared
+nested sort in time quadratic in its depth (AUDIT-26 #2)."""
+
+MAX_PROBE_CHARS: Final = 163_840
+"""Most characters the builtin probes of one reply's declarations may parse, counted
+before any parse: one `MAX_ARITY` Int function and a few dozen constants (AUDIT-26 #2)."""
+
+_PARSE_OVERHEAD: Final = 512
+"""A Z3 parse call's fixed cost, in characters of parsed text."""
+
+
+def _decl_tokens(decl: str) -> list[str]:
+    """Tokens of a declaration form, parentheses split out, its outer pair dropped."""
+    return decl[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+
+
+def _arity(tokens: list[str]) -> int:
+    """Arguments the declaration in `tokens` takes; `MAX_ARITY + 1` for any longer numeral."""
+    head = tokens[0]
+    if head == "declare-sort":
+        n = tokens[2] if len(tokens) > 2 else ""
+        if not (n.isascii() and n.isdigit()):
+            return 0
+        digits = n.lstrip("0") or "0"
+        return int(digits) if len(digits) <= len(str(MAX_ARITY)) else MAX_ARITY + 1
+    if head == "declare-fun" and len(tokens) > 2 and tokens[2] == "(":
+        return len(_sexprs(tokens[3:]))
+    return 0
+
+
+_PAREN: Final = re.compile(r"[()]")
+
+
+def _too_deep(decl: str) -> bool:
+    """True if `decl` nests parentheses over `MAX_NESTING` deep inside its outer pair.
+
+    Stops at the first paren past the cap, so a refusal costs the same at any depth.
+    """
+    depth = 0
+    for m in _PAREN.finditer(decl):
+        depth += 1 if m.group() == "(" else -1
+        if depth > MAX_NESTING + 1:
+            return True
+    return False
+
+
+def _probe_chars(tokens: list[str], decl: str, sort_decls: tuple[str, ...]) -> int:
+    """An upper bound on the characters `_is_z3_builtin` and `_applied_builtin` parse for `decl`.
+
+    Counted before any parse: with nesting capped, Z3's parse time is linear in it.
+    """
+    head, arity, parses = tokens[0], _arity(tokens), 2
+    if head == "declare-sort":
+        parses += arity > 0
+    elif head == "declare-fun" and arity:
+        parses += sum(1 for _ in _numeric_variants(_sexprs(tokens[3:])))
+    per_parse = _PARSE_OVERHEAD + 3 * len(decl) + 32 * (arity + 1) + sum(map(len, sort_decls))
+    return parses * per_parse
+
+
+@functools.lru_cache(maxsize=4096)
+def _applied_builtin(decl: str, sort_decls: tuple[str, ...]) -> bool:
+    """True if Z3 resolves the declared name, applied as `decl` declares, with no declaration.
+
+    Z3 resolves a user function only at its declared arity, with Int and Real
+    coerced, so probing those argument sorts covers every use the declaration
+    could take over (AUDIT-13 #1). An unknown sort is left to the parse check.
+    `sort_decls` holds the `declare-sort` lines `decl` mentions. `merged` refuses
+    more than `MAX_ARITY` arguments first, so the probe's total size is bounded.
+    """
+    tokens = _decl_tokens(decl)
+    head, name = tokens[0], tokens[1]
+    if head == "declare-sort":
+        arity = _arity(tokens)
+        if arity == 0:
+            return False
+        uses: Iterable[str] = [f"(declare-const x ({name}{' Int' * arity}))"]
+    else:
+        args = _sexprs(tokens[3:]) if head == "declare-fun" and tokens[2] == "(" else []
+        if not args:
+            return False
+        uses = (_applied_use(name, sorts) for sorts in _numeric_variants(args))
+    ctx = _parse_context()
+    for use in uses:
+        try:
+            z3.Z3_parse_smtlib2_string(
+                ctx.ref(), "".join(sort_decls) + use, 0, None, None, 0, None, None
+            )
+        except z3.Z3Exception as exc:
+            msg = exc.value.decode() if isinstance(exc.value, bytes) else str(exc.value)
+            if "unknown constant" not in msg and "unknown sort" not in msg:
+                return True
+        else:
+            return True
+    return False
+
+
+def _numeric_variants(args: list[str]) -> Iterator[tuple[str, ...]]:
+    """`args` with its Int/Real positions all Int, all Real, and each one flipped from either.
+
+    2k + 2 variants for k numeric arguments, not all 2^k (AUDIT-18 #1). Z3
+    resolves each builtin it knows the same on these as on every combination
+    (checked over every libz3 identifier that resolves with arguments).
+    """
+    numeric = [i for i, a in enumerate(args) if a in _NUMERIC]
+    seen: set[tuple[str, ...]] = set()
+    for base, other in (("Int", "Real"), ("Real", "Int")):
+        uniform = [base if a in _NUMERIC else a for a in args]
+        for flip in (None, *numeric):
+            variant = tuple(other if i == flip else a for i, a in enumerate(uniform))
+            if variant not in seen:
+                seen.add(variant)
+                yield variant
+
+
+def _applied_use(name: str, sorts: tuple[str, ...]) -> str:
+    """An assertion applying `name` to constants of `sorts`."""
+    consts = "".join(f"(declare-const a{i} {s})" for i, s in enumerate(sorts))
+    app = f"({name} {' '.join(f'a{i}' for i in range(len(sorts)))})"
+    return f"{consts}(assert (= {app} {app}))"
+
+
+def _sexprs(tokens: list[str]) -> list[str]:
+    """Split tokens up to the first unmatched `)` into top-level S-expressions."""
+    out: list[str] = []
+    depth, cur = 0, []
+    for tok in tokens:
+        if tok == ")" and depth == 0:
+            break
+        cur.append(tok)
+        depth += {"(": 1, ")": -1}.get(tok, 0)
+        if depth == 0:
+            out.append(" ".join(cur).replace("( ", "(").replace(" )", ")"))
+            cur = []
+    return out
+
+
+def _tokens(text: str) -> set[str]:
+    """Every symbol, keyword and literal token in `text`, split as Z3's lexer splits it."""
+    # Stripped first: trailing blanks make every `\s*` scan to the end (quadratic, AUDIT-22).
+    return {m.group(1) for m in _TERM_TOKEN.finditer(text.rstrip())} - {"(", ")"}
+
+
+_SYMBOL_CHARS: Final = r"A-Za-z0-9~!@$%^&*_\-+=<>.?/,"
+# As Z3 reads them: `:` starts a keyword and `#` a bit-vector literal, so both end
+# a symbol (AUDIT-20 #4, AUDIT-17 #5); a numeral ends at its last digit.
+_TERM_TOKEN: Final = re.compile(
+    r'\s*("(?:[^"]|"")*"|[()]|#b[01]*|#x[0-9A-Fa-f]*|[0-9]+(?:\.[0-9]*)?'
+    rf"|:?[{_SYMBOL_CHARS}]+|[^\s()\"])"
+)
 
 
 def _is_single_term(text: str) -> bool:
@@ -273,7 +487,7 @@ def _decl_name(decl: str) -> str | None:
             break
     if depth != 0:
         return None
-    tokens = body[1:-1].replace("(", " ( ").replace(")", " ) ").split()
+    tokens = _decl_tokens(body)
     if len(tokens) < 2 or tokens[0] not in _DECL_HEADS or tokens[1] in {"(", ")"}:
         return None
     return tokens[1]
