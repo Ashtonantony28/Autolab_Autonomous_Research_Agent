@@ -6,7 +6,7 @@ import pytest
 
 import autolab
 from autolab import cli
-from autolab.config import Settings
+from autolab.config import Settings, get_settings
 
 
 def test_package_version_is_pinned() -> None:
@@ -18,6 +18,20 @@ def test_cli_main_prints_banner(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert "AutoLab v0.0.0" in captured.out
     assert "skeleton OK" in captured.out
+
+
+def test_cli_run_without_api_key_exits_with_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["run", "Why?"])
+    finally:
+        get_settings.cache_clear()
+    assert exc.value.code == 2
+    assert "ANTHROPIC_API_KEY is not set" in capsys.readouterr().err
 
 
 def test_settings_load_from_env(settings: Settings) -> None:

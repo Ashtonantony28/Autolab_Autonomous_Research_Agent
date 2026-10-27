@@ -38,13 +38,17 @@ def _unregistered(*steps: tuple[str, ClaimType]) -> ReasoningTrace:
 
 
 async def test_matching_conclusion_verifies_normally() -> None:
-    trace, fake = _registered(_P, GoldenStep("So P holds", "conclusion", "", "P", (0,)))
-
-    result = await Verifier(fake).verify(
-        trace, context=VerificationContext(payload_claim="  so  p\tHOLDS ")
+    trace, fake = _registered(
+        _P,
+        GoldenStep("P implies Q", "premise", "(declare-const Q Bool)", "(=> P Q)"),
+        GoldenStep("So Q holds", "conclusion", "", "Q", (0, 1)),
     )
 
-    assert [v.reason for v in result.step_verdicts] == ["assumed", "entailed"]
+    result = await Verifier(fake).verify(
+        trace, context=VerificationContext(payload_claim="  so  q\tHOLDS ")
+    )
+
+    assert [v.reason for v in result.step_verdicts] == ["assumed", "assumed", "entailed"]
     assert result.consistency_score == 1.0
 
 

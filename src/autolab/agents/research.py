@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from autolab.agents.base import AgentOutput, BaseAgent
-from autolab.agents.common import conclusion_instruction, parse_trace
+from autolab.agents.common import conclusion_instruction, parse_trace, with_feedback
 from autolab.state.models import Hypothesis, VerificationContext
 from autolab.state.schema import AutoLabState
 from autolab.verification.llm import LLMClient
@@ -31,10 +31,15 @@ class ResearchAgent(BaseAgent[Hypothesis]):
 
     async def _produce(self, state: AutoLabState) -> AgentOutput[Hypothesis]:
         question = state.get("research_question", "")
-        raw = await self._llm.call("research.hypothesis", build_hypothesis_prompt(question))
+        feedback = state.get("feedback", "")
+        raw = await self._llm.call(
+            "research.hypothesis", with_feedback(build_hypothesis_prompt(question), feedback)
+        )
         payload = Hypothesis.model_validate_json(raw)
 
-        trace_raw = await self._llm.call("research.trace", build_trace_prompt(question, payload))
+        trace_raw = await self._llm.call(
+            "research.trace", with_feedback(build_trace_prompt(question, payload), feedback)
+        )
         trace = parse_trace(self.name, trace_raw)
         context = VerificationContext(payload_claim=payload.statement)
         return AgentOutput(payload=payload, reasoning_trace=trace, context=context)

@@ -10,6 +10,7 @@ from autolab.agents.common import (
     measurement_facts,
     parse_trace,
     result_claim,
+    with_feedback,
 )
 from autolab.state.models import ExperimentDesign, ExperimentResult, VerificationContext
 from autolab.state.schema import AutoLabState
@@ -46,7 +47,8 @@ class ExecuteAgent(BaseAgent[ExperimentResult]):
         result = self._simulator.run(design)
 
         trace_raw = await self._llm.call(
-            "execute.trace", build_execute_trace_prompt(design, result)
+            "execute.trace",
+            with_feedback(build_execute_trace_prompt(design, result), state.get("feedback", "")),
         )
         trace = parse_trace(self.name, trace_raw)
         context = VerificationContext(

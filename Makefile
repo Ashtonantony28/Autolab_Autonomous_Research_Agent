@@ -1,4 +1,4 @@
-.PHONY: install test test-cov lint format typecheck run clean help
+.PHONY: install test test-cov lint format typecheck run dashboard clean help
 
 help:  ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,6 +25,9 @@ typecheck:  ## Strict mypy
 
 run:  ## Run the CLI entry point
 	uv run autolab
+
+dashboard:  ## Audit persisted runs in Streamlit (DATABASE_URL)
+	uv run streamlit run scripts/dashboard.py
 
 clean:  ## Remove caches & build artifacts
 	rm -rf .pytest_cache .mypy_cache .ruff_cache build dist *.egg-info .coverage coverage.xml htmlcov
