@@ -62,6 +62,8 @@ Concurrent cited-chain verifies on one loop, by pool size, on a quiet machine (`
 - Cut ctypes round trips per check, and assert the parsed document with one call (`solver.from_string(smt)`, with `push`/`pop` or `check(assumption)` for the negated claim) instead of indexing the AstVector in Python.
 - Also record `solver_ms` as thread CPU time (`time.thread_time()`), next to wall time, so the budget can tell Z3's own time apart from GIL waits.
 
+**Resolution (SG19).** Two changes in `solver.py`. The default pool is `min(2, cpu)` workers, and each check asserts the whole document with one `Solver.from_string` call instead of parsing it and adding each assertion from Python. The negated claim is named by a Bool `claim!` that no formalized step can declare, and the entailment check passes it as an assumption, so both checks still run on one solver. The context is still fresh per check (finding 4 stays open), because Z3 reads global parameters when a context is created. Measured on this 4-CPU machine when quiet (`audit_load_3 pool concurrent`): 10 × 100-step verifies went from 13.00 s and step p95 315.9 ms (8 workers) to 2.74 s and 5.8 ms (2 workers); 50 × 100 from 48.1 s and 266.7 ms to 13.9 s and 6.0 ms; 30 × 40 from 13.66 s and 310.6 ms to 3.16 s and 5.9 ms. On the new check path 10 × 100 takes 4.9–5.4 s on 1 worker, 2.7 s on 2, 2.1–2.2 s on 3, 2.0–2.4 s on 4 and 3.3–3.5 s on 8 (p95 5.6–6.1, 6.1–6.3, 7.3–7.6, 9.3–11.2, 38.8–39.2 ms). Two workers keep p95 within 1.05–1.27× of one worker on the repro's load (12 × 30), against 1.16–1.40× for 3 and 1.62–2.31× for 4. The repro is flipped and its assertion is unchanged. `test_audit_2::test_slow_checks_do_not_starve_the_default_executor` now installs a default solver pool as large as asyncio's default executor, because it needs that many slow checks to run at once; mutant S07 still fails it.
+
 ---
 
 ## 2. Medium: `pytest-timeout` cannot stop a Z3 call on the main thread
@@ -139,6 +141,8 @@ So the concrete hang that AUDIT-8 H1 reported (S08) still hangs the suite, and C
 **Root cause.** `src/autolab/verification/solver.py:134-141` (`model = solver.model()` and `counter_model=str(model)` on the worker thread), `src/autolab/verification/vericot.py:215-222` (the field is dropped), and z3's `z3printer.py:1423-1424` (module-global `_PP` and `_Formatter`).
 
 **Suggested fix.** Stop building `counter_model` in the verifier path: make it opt-in, or drop the field. If it is kept, use `model.sexpr()`, which is formatted in C by `Z3_model_to_string` with no shared Python state, or format under a process-wide lock. Add it to `StepVerdict` only if something will read it.
+
+**Resolution (SG19).** `counter_model` is now `solver.model().sexpr()`, formatted in C, so no worker enters z3py's printer. The field is kept because `test_solver.py` reads it. The repro is flipped and its assertion is unchanged; `test_counter_model_does_not_use_the_shared_printer` fails if the printer is called.
 
 ---
 
