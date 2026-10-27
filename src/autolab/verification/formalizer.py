@@ -58,13 +58,22 @@ class Vocabulary:
             FormalizationError: on an unrecognized or conflicting declaration,
                 or one that names an SMT-LIB reserved word (AUDIT-5 #1), a Z3
                 builtin, or anything but a plain identifier (AUDIT-9 #1), or that
-                takes more than `MAX_ARITY` arguments (AUDIT-22 #1).
+                takes more than `MAX_ARITY` arguments (AUDIT-22 #1) or nests deeper
+                than `MAX_NESTING`, or if probing the reply's declarations for
+                builtins would parse more than `MAX_PROBE_CHARS` (AUDIT-26 #2).
         """
         out = dict(self.declarations)
+        probes: list[tuple[str, str, tuple[str, ...]]] = []
+        cost = 0
         for line in new_decls.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
+            if _too_deep(stripped):
+                raise FormalizationError(
+                    f"declaration nests parentheses more than {MAX_NESTING} deep inside its "
+                    f"own: {stripped[:60]!r}..."
+                )
             name = _decl_name(stripped)
             if name is None:
                 raise FormalizationError(f"unrecognized declaration: {stripped!r}")
@@ -72,24 +81,33 @@ class Vocabulary:
                 raise FormalizationError(f"declaration shadows reserved symbol {name!r}")
             if not _IDENTIFIER.fullmatch(name):
                 raise FormalizationError(f"declared name {name!r} is not a plain identifier")
-            arity = _arity(_decl_tokens(stripped))
+            tokens = _decl_tokens(stripped)
+            arity = _arity(tokens)
             if arity > MAX_ARITY:
                 raise FormalizationError(
                     f"declaration of {name!r} takes {arity} arguments; at most {MAX_ARITY} allowed"
                 )
-            mentioned = _tokens(stripped)
-            sorts = tuple(
-                d for n, d in out.items() if d.startswith("(declare-sort") and n in mentioned
-            )
-            if _is_z3_builtin(name) or _applied_builtin(stripped, sorts):
-                raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
             existing = out.get(name)
             if existing is not None and existing != stripped:
                 raise FormalizationError(
                     f"symbol {name!r} re-declared with conflicting signature: "
                     f"had {existing!r}, got {stripped!r}"
                 )
+            mentioned = _tokens(stripped)
+            sorts = tuple(
+                d for n, d in out.items() if d.startswith("(declare-sort") and n in mentioned
+            )
+            cost += _probe_chars(tokens, stripped, sorts)
+            if cost > MAX_PROBE_CHARS:
+                raise FormalizationError(
+                    f"declarations up to {name!r} need over {MAX_PROBE_CHARS} characters of "
+                    "builtin probes; declare fewer or narrower symbols"
+                )
+            probes.append((name, stripped, sorts))
             out[name] = stripped
+        for name, stripped, sorts in probes:
+            if _is_z3_builtin(name) or _applied_builtin(stripped, sorts):
+                raise FormalizationError(f"declaration shadows Z3 builtin {name!r}")
         return Vocabulary(out)
 
     def merge(self, new_decls: str) -> None:
@@ -187,7 +205,10 @@ def prompt_for(step: ReasoningStep, vocab: Vocabulary) -> str:
         "|quoted| symbol, and not an SMT-LIB reserved word or Z3 builtin, with or without "
         "arguments (for example not map, union, default, sin, equals, if_then_else).",
         "- Do not declare a name that an earlier step already used.",
-        f"- A declared function or sort takes at most {MAX_ARITY} arguments.",
+        f"- A declared function or sort takes at most {MAX_ARITY} arguments, and a "
+        f"declaration nests parentheses at most {MAX_NESTING} deep inside its own.",
+        "- Declare only the symbols this step needs: a step's declarations must stay small "
+        "(each function of many Int or Real arguments costs the most).",
         "- declarations holds only declare-const, declare-fun or declare-sort lines, one per line.",
         "- assertion is exactly one Bool term: no SMT commands, no second term, no ! "
         "annotations (:named, :pattern), and no | or ; anywhere (so no ; comments).",
@@ -268,6 +289,17 @@ _NUMERIC: Final = frozenset({"Int", "Real"})
 MAX_ARITY: Final = 32
 """Most arguments a declared function or sort may take; bounds the applied probe (AUDIT-22 #1)."""
 
+MAX_NESTING: Final = 8
+"""Deepest parenthesis nesting inside a declaration's outer pair: Z3 parses a declared
+nested sort in time quadratic in its depth (AUDIT-26 #2)."""
+
+MAX_PROBE_CHARS: Final = 163_840
+"""Most characters the builtin probes of one reply's declarations may parse, counted
+before any parse: one `MAX_ARITY` Int function and a few dozen constants (AUDIT-26 #2)."""
+
+_PARSE_OVERHEAD: Final = 512
+"""A Z3 parse call's fixed cost, in characters of parsed text."""
+
 
 def _decl_tokens(decl: str) -> list[str]:
     """Tokens of a declaration form, parentheses split out, its outer pair dropped."""
@@ -286,6 +318,36 @@ def _arity(tokens: list[str]) -> int:
     if head == "declare-fun" and len(tokens) > 2 and tokens[2] == "(":
         return len(_sexprs(tokens[3:]))
     return 0
+
+
+_PAREN: Final = re.compile(r"[()]")
+
+
+def _too_deep(decl: str) -> bool:
+    """True if `decl` nests parentheses over `MAX_NESTING` deep inside its outer pair.
+
+    Stops at the first paren past the cap, so a refusal costs the same at any depth.
+    """
+    depth = 0
+    for m in _PAREN.finditer(decl):
+        depth += 1 if m.group() == "(" else -1
+        if depth > MAX_NESTING + 1:
+            return True
+    return False
+
+
+def _probe_chars(tokens: list[str], decl: str, sort_decls: tuple[str, ...]) -> int:
+    """An upper bound on the characters `_is_z3_builtin` and `_applied_builtin` parse for `decl`.
+
+    Counted before any parse: with nesting capped, Z3's parse time is linear in it.
+    """
+    head, arity, parses = tokens[0], _arity(tokens), 2
+    if head == "declare-sort":
+        parses += arity > 0
+    elif head == "declare-fun" and arity:
+        parses += sum(1 for _ in _numeric_variants(_sexprs(tokens[3:])))
+    per_parse = _PARSE_OVERHEAD + 3 * len(decl) + 32 * (arity + 1) + sum(map(len, sort_decls))
+    return parses * per_parse
 
 
 @functools.lru_cache(maxsize=4096)
