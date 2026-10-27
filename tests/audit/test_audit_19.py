@@ -38,7 +38,11 @@ from autolab.state.store import SQLITE_BUSY_TIMEOUT_S, StateStore
 from autolab.verification.formalizer import FormalizationError, Formalizer, prompt_for
 from autolab.verification.llm import FakeLLMClient, LLMPurpose, SchemaT
 from autolab.verification.vericot import Verifier
-from tests.fixtures.agent_helpers import register_failing_trace, register_trivial_trace
+from tests.fixtures.agent_helpers import (
+    register_estimate,
+    register_failing_trace,
+    register_trivial_trace,
+)
 
 HYPOTHESIS = Hypothesis(question="Q?", statement="S", rationale="R")
 
@@ -64,6 +68,7 @@ def _design_fake(design: ExperimentDesign, *, passing: bool) -> FakeLLMClient:
         conclusion=design_claim(design),
         facts=design_facts(design),
     )
+    register_estimate(fake, design)
     return fake
 
 
@@ -84,7 +89,6 @@ def _with(update: dict[str, Any]) -> AutoLabState:
 # writes them, and the design is withheld for a human.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-19 #1")
 @pytest.mark.parametrize(
     "protocol",
     [
@@ -102,7 +106,6 @@ def test_ordinary_protocol_text_is_not_a_figure(protocol: str) -> None:
     assert protocol_figures(protocol) == ()
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-19 #1")
 async def test_a_design_on_8_week_old_mice_is_admitted() -> None:
     design = _design("Dose 8-week-old C57BL/6 mice on a liquid handler")
     fake = _design_fake(design, passing=True)
@@ -116,7 +119,6 @@ async def test_a_design_on_8_week_old_mice_is_admitted() -> None:
 # --- #2 (medium): a figure rejection never reaches the model --------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-19 #2")
 async def test_a_figure_rejection_is_retried_with_its_reason() -> None:
     # SG21 fold-in (PLAN.md): "a figure rejection is retried with feedback before
     # it escalates". The verdict passes, so the monitor sends it to `hitl`.
@@ -132,7 +134,6 @@ async def test_a_figure_rejection_is_retried_with_its_reason() -> None:
     assert isinstance(command.update, dict) and "$500" in command.update["feedback"]
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-19 #2")
 async def test_a_retried_design_is_told_about_its_figures() -> None:
     # With a blocked trace the monitor does retry, but the feedback is the verdict
     # summary ("0 valid, ..."); the figures the guard found never reach the model.

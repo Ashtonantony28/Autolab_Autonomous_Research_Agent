@@ -115,7 +115,7 @@ def check_phases(
     try:
         for _ in range(rounds):
             stamps.clear()
-            reason = Z3Solver(30.0).check_entailment(premises, claim).reason
+            reason = Z3Solver(30.0)._check_here(premises, claim).reason
             entail = stamps[3] - stamps[2] if len(stamps) == 4 else 0.0
             got = (stamps[1] - stamps[0], entail, reason)
             best = got if best is None or got < best else best
@@ -145,29 +145,37 @@ def real_int_ratio(n: int = 800) -> tuple[float, float]:
 
 
 class _GatedIdle:
-    """Stands in for `ThreadPoolExecutor._idle_semaphore`.
+    """Stands in for the step a pool worker takes to mark itself idle after a job:
+    `_Pool._next`, or SG22's `ThreadPoolExecutor._idle_semaphore.release`.
 
-    Once armed, the worker's next "I am idle" release waits until the pool's next
+    Once armed, the worker's next "I am idle" step waits until the pool's next
     `submit` has returned. That is the interleaving the event loop produces on its
     own whenever it submits a caller's next check before the worker thread that
     finished the previous one has marked itself idle.
     """
 
-    def __init__(self, inner: threading.Semaphore) -> None:
-        self._inner = inner
+    def __init__(
+        self, idle: Callable[..., Any], semaphore: threading.Semaphore | None = None
+    ) -> None:
+        self._idle = idle
+        self._semaphore = semaphore
         self.armed_at: int | None = None
         self.submitted = 0
         self._cond = threading.Condition()
 
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        return self._inner.acquire(blocking, timeout)
-
-    def release(self, n: int = 1) -> None:
+    def __call__(self, *args: Any) -> Any:
         with self._cond:
             target, self.armed_at = self.armed_at, None
             if target is not None:
                 self._cond.wait_for(lambda: self.submitted > target, timeout=10.0)
-        self._inner.release(n)
+        return self._idle(*args)
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        assert self._semaphore is not None
+        return self._semaphore.acquire(blocking, timeout)
+
+    def release(self, n: int = 1) -> None:
+        self(n)
 
     def note_submit(self) -> None:
         with self._cond:
@@ -179,16 +187,21 @@ class _GatedIdle:
 def gated_pool(ex: SolverExecutor) -> Iterator[_GatedIdle]:
     """Install `_GatedIdle` on `ex`'s pool and count its submits."""
     pool = ex._pool
-    gate = _GatedIdle(pool._idle_semaphore)
+    semaphore = getattr(pool, "_idle_semaphore", None)
+    if semaphore is not None:  # SG22's ThreadPoolExecutor
+        gate = _GatedIdle(semaphore.release, semaphore)
+        setattr(pool, "_idle_semaphore", gate)  # noqa: B010 - not an attribute of `_Pool`
+    else:
+        gate = _GatedIdle(pool._next)
+        pool._next = gate  # type: ignore[method-assign]
     real_submit = pool.submit
 
-    def submit(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+    def submit(fn: Callable[..., Any], /, *args: Any) -> Future[Any]:
         try:
-            return real_submit(fn, *args, **kwargs)
+            return real_submit(fn, *args)
         finally:
             gate.note_submit()
 
-    pool._idle_semaphore = gate  # type: ignore[assignment]
     pool.submit = submit  # type: ignore[method-assign]
     try:
         yield gate
@@ -201,8 +214,8 @@ async def easy_check_beside_a_slow_one(hard_timeout_s: float = 3.0) -> tuple[flo
 
     1-worker pool. Two trivial jobs run back to back, and the second is submitted
     before the worker has marked itself idle after the first (forced with
-    `_GatedIdle`; it happens on its own in about one hand-off in six). The pool then
-    holds one more idle permit than idle threads. A hard check takes the slot, runs
+    `_GatedIdle`; it happens on its own in about one hand-off in six). SG22's pool then
+    held one more idle permit than idle threads. A hard check takes the slot, runs
     past `_SLICE_S` and gives the slot up, raising `_max_workers` to 2. The easy check
     that takes the slot is submitted next. Returns (easy check s, pool threads then).
     """

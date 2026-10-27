@@ -158,6 +158,7 @@ StepReason = Literal[
     "formalization_failed",
     "no_premises",
     "timeout",
+    "worker_died",
 ]
 
 

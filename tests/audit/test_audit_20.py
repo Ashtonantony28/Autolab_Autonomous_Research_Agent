@@ -37,7 +37,6 @@ from autolab.verification.solver import (
 )
 from scripts.audit_load import NO_CUBES, POSITIVE, XYZ
 from scripts.audit_load_2 import slow_check
-from scripts.audit_load_4 import lia_chain
 from tests.audit import test_audit_13
 from tests.audit import test_audit_14 as audit_14
 
@@ -105,7 +104,6 @@ async def test_the_audit_6_7_setup_admits_a_schedule_where_nothing_is_queued() -
     assert outcomes == ["timeout", "timeout"]
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-20 #1")
 async def test_shutdown_does_not_cancel_a_queued_caller_on_another_loop() -> None:
     # AUDIT-6 #7 with no slow slot, so the second check always waits in the pool.
     executor = _ObservedExecutor(slow_workers=0)
@@ -141,7 +139,6 @@ def _without_annotation_ban(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(formalizer, "_tokens", tokens)
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-20 #2")
 @pytest.mark.parametrize(
     "repro",
     [
@@ -172,6 +169,7 @@ def _hard(timeout_s: float) -> Callable[[], SolverOutcome]:
     )
 
 
+@pytest.mark.skipif(solver_mod.SOLVER_SLOW_WORKERS < 2, reason="fewer than 4 CPUs")
 async def test_an_easy_check_overtakes_hard_ones_on_the_default_slow_workers() -> None:
     # S12, S24, S25: with the default `slow_workers`, two hard checks on a 1-slot pool
     # each leave the slot, so an easy check ends while both are still in Z3.
@@ -281,7 +279,7 @@ def test_the_entailment_check_gets_the_time_left_not_the_initial_budget(
 
     monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3.Solver, "check", slow_check)
-    out = Z3Solver(2.0).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(2.0)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     assert out.verdict == "VALID"
     assert len(timeouts) == 2
     assert timeouts[1] <= timeouts[0] - 250
@@ -302,9 +300,7 @@ def test_the_entailment_check_asserts_the_negated_claim_instead_of_assuming_it(
 
     monkeypatch.setattr(z3.Solver, "check", check)
     decls = "(declare-const x Int)"
-    out = Z3Solver(5.0).check_entailment(
-        [SmtFormula(decls, "(> x 1)")], SmtFormula(decls, "(> x 0)")
-    )
+    out = Z3Solver(5.0)._check_here([SmtFormula(decls, "(> x 1)")], SmtFormula(decls, "(> x 0)"))
     assert out.verdict == "VALID"
     assert calls == [0, 0]
 
@@ -316,13 +312,10 @@ def test_the_entailment_check_asserts_the_negated_claim_instead_of_assuming_it(
 # the guard, by timing (it caught S03 in 1 of 3 runs), and never times the check.
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-20 #3")
 def test_the_audit_14_1_timeout_repro_reaches_the_entailment_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    premises, claim = lia_chain(audit_14._POOL)
-    until_s, entail_s = audit_14._phases_s(premises, claim)
-    timeout_s = until_s + audit_14._INTO_ENTAILMENT * entail_s
+    premises, claim, timeout_s = audit_14._timeout_case()
     calls: list[int] = []
     real_check = z3.Solver.check
 
@@ -331,10 +324,10 @@ def test_the_audit_14_1_timeout_repro_reaches_the_entailment_check(
         return real_check(self, *args)
 
     monkeypatch.setattr(z3.Solver, "check", check)
-    out = Z3Solver(timeout_s).check_entailment(premises, claim)
+    out = Z3Solver(timeout_s)._check_here(premises, claim)
     assert out.reason == "timeout"
-    # Today: 1 call. The guard returns (or, on a slow run, the consistency check
-    # itself times out); either way no entailment check is timed.
+    # Before SG26: 1 call. The guard returned (or, on a slow run, the consistency check
+    # itself timed out); either way no entailment check was timed.
     assert len(calls) == 2
 
 
@@ -373,7 +366,7 @@ def _guarded_run(
     monkeypatch.setattr(solver_mod, "time", clock)
     monkeypatch.setattr(z3.Solver, "check", check)
     monkeypatch.setattr(z3.Solver, "from_string", parse)
-    out = Z3Solver(budget_s).check_entailment([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
+    out = Z3Solver(budget_s)._check_here([SmtFormula(_DECLS, "p")], SmtFormula(_DECLS, "p"))
     return out, len(calls)
 
 
@@ -429,7 +422,7 @@ async def test_a_file_store_uses_wal_and_the_busy_timeout(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------
 
 _GLUED: Final = "(! p:named false)"
-"""Z3 reads `p:named` as `p :named`; `_tokens` reads it as one token."""
+"""Z3 reads `p:named` as `p :named`; since SG24 `_tokens` does too (it read one token)."""
 
 
 def test_a_glued_named_annotation_really_redefines_false_in_z3() -> None:
@@ -440,7 +433,7 @@ def test_a_glued_named_annotation_really_redefines_false_in_z3() -> None:
     s = z3.Solver(ctx=second.ctx)
     s.add(second)
     assert s.check() == z3.sat
-    assert ":named" not in formalizer._tokens(_GLUED)
+    assert ":named" in formalizer._tokens(_GLUED)  # SG24: tokenized as Z3 lexes it
 
 
 async def test_a_glued_named_annotation_is_refused() -> None:
