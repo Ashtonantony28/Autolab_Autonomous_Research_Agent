@@ -125,3 +125,37 @@ def test_resume_of_a_paused_run_requires_an_action(
     assert "is paused for human review; give approve|retry|abort" in capsys.readouterr().err
     autolab(["resume", str(THREAD), "approve", "--checkpoints", ckpt])
     assert f"Run {THREAD} complete." in capsys.readouterr().out
+
+
+def test_resume_abort_reports_an_aborted_run(
+    env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ckpt = str(tmp_path / "ckpt.db")
+    use_llm(env, EXPENSIVE)
+    autolab(["run", QUESTION, "--checkpoints", ckpt])
+    assert "Paused for human review (design)" in capsys.readouterr().out
+
+    autolab(["resume", str(THREAD), "abort", "--note", "too expensive", "--checkpoints", ckpt])
+
+    assert capsys.readouterr().out == (
+        f"Run {THREAD} aborted at human review; it will not resume.\n"
+    )
+    with pytest.raises(SystemExit) as exc:
+        autolab(["resume", str(THREAD), "--checkpoints", ckpt])
+    assert exc.value.code == 2
+
+
+def test_abort_given_to_a_crashed_run_is_ignored(
+    env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ckpt = str(tmp_path / "ckpt.db")
+    use_llm(env, failures=3)
+    with pytest.raises(ConnectionError):
+        autolab(["run", QUESTION, "--checkpoints", ckpt])
+    capsys.readouterr()
+
+    autolab(["resume", str(THREAD), "abort", "--checkpoints", ckpt])
+
+    out, err = capsys.readouterr()
+    assert f"Run {THREAD} complete." in out
+    assert "ignoring 'abort'" in err
