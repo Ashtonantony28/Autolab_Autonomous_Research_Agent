@@ -39,6 +39,7 @@ from autolab.state.models import (
 )
 from autolab.state.schema import AutoLabState, empty_state
 from autolab.verification import solver as solver_mod
+from autolab.verification import solver_workers
 from autolab.verification.formalizer import (
     FormalizationError,
     Formalizer,
@@ -52,7 +53,6 @@ from scripts.audit_load import NO_CUBES, POSITIVE, XYZ
 from tests.fixtures.agent_helpers import register_failing_trace, register_trace
 from tests.fixtures.golden_traces import GoldenStep
 from tests.integration.orchestrator import test_graph as tg
-from tests.unit.verification.test_solver_executor import z3_spy  # noqa: F401 (AUDIT-16 #2)
 
 _WAIT_S: Final = 10.0
 """Bounds a failing wait on an event; a passing run never waits this long."""
@@ -249,58 +249,41 @@ async def test_premise_ungrounded_in_pass_one_is_not_assumed_in_pass_two() -> No
 
 
 # --------------------------------------------------------------------------
-# S10, S11, S12, S13, S18: the `_Interrupt` re-send, deterministically.
-# `test_solver_executor.py`'s spy sets its `interrupted` event *before* it calls
-# the real `Context.interrupt()`, so the held check can start before the first
-# interrupt is even sent; whether that interrupt is dropped depends on thread
-# scheduling (AUDIT-16 #2). Here the check is held until three interrupts have
-# been sent while no check runs, so every one of them is dropped and only a
-# re-send that continues once the check is running can stop it.
+# S10, S11, S12, S13, S18: a cancel that lands before the check has started.
+# In-process, Z3 dropped an interrupt sent before `Solver.check()` ran, so SG19
+# re-sent it until the check ended (AUDIT-16 #2). Since SG29 a cancel kills the
+# check's worker (ADR 0009), and there is no window to drop it in: here the request
+# is held back until the caller has been cancelled, so the kill lands before the
+# worker has the request, and the check must still stop at once and leave no thread.
 # --------------------------------------------------------------------------
 
 _CHECK_S: Final = 5.0
-"""Z3 timeout of the held check; an interrupted check returns far sooner."""
-_DROPPED: Final = 3
-"""Interrupts sent, and dropped by Z3, before the held check starts."""
+"""Z3 timeout of the held check; a killed check returns far sooner."""
 
 
 class _HeldCheck:
-    """Holds this test's entailment check until `_DROPPED` interrupts have been sent."""
+    """Holds this test's request to its worker until its caller has been cancelled."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.reached = threading.Event()
-        self.sent = 0
-        self.sent_cond = threading.Condition()
+        self.cancelled = threading.Event()
         self.check_s: list[float] = []
-        self.ours = threading.local()
-        real_check, real_interrupt = z3.Solver.check, z3.Context.interrupt
-        calls = [0]
+        self.workers: list[solver_workers.Worker] = []
+        real_call = solver_workers.Worker.call
 
-        def check(solver: z3.Solver, *args: object) -> object:
-            if getattr(self.ours, "on", False):
-                calls[0] += 1
-                if calls[0] == 2:  # the entailment check
-                    self.reached.set()
-                    with self.sent_cond:
-                        self.sent_cond.wait_for(lambda: self.sent >= _DROPPED, timeout=2.0)
-                    started = time.perf_counter()
-                    try:
-                        return real_check(solver, *args)
-                    finally:
-                        self.check_s.append(time.perf_counter() - started)
-            return real_check(solver, *args)
+        def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+            self.workers.append(worker)
+            self.reached.set()
+            self.cancelled.wait(_WAIT_S)
+            started = time.perf_counter()
+            try:
+                return real_call(worker, args, budget_s)
+            finally:
+                self.check_s.append(time.perf_counter() - started)
 
-        def interrupt(ctx: z3.Context) -> None:
-            real_interrupt(ctx)  # sent first, then counted
-            with self.sent_cond:
-                self.sent += 1
-                self.sent_cond.notify_all()
-
-        monkeypatch.setattr(z3.Solver, "check", check)
-        monkeypatch.setattr(z3.Context, "interrupt", interrupt)
+        monkeypatch.setattr(solver_workers.Worker, "call", call)
 
     def undecidable(self) -> solver_mod.SolverOutcome:
-        self.ours.on = True
         solver = Z3Solver(timeout_seconds=_CHECK_S)
         return solver.check_entailment([SmtFormula(XYZ, POSITIVE)], SmtFormula(XYZ, NO_CUBES))
 
@@ -311,12 +294,13 @@ async def _cancel_held_check(held: _HeldCheck, executor: SolverExecutor) -> None
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    held.cancelled.set()
     deadline = time.monotonic() + _WAIT_S
     while not held.check_s and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
 
 
-async def test_interrupt_is_resent_until_a_check_that_started_late_stops(
+async def test_a_cancel_before_the_worker_has_the_request_stops_the_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     held = _HeldCheck(monkeypatch)
@@ -325,36 +309,37 @@ async def test_interrupt_is_resent_until_a_check_that_started_late_stops(
         await _cancel_held_check(held, executor)
     finally:
         await asyncio.to_thread(executor.shutdown)
-    assert held.sent > _DROPPED
     assert held.check_s and held.check_s[0] < _CHECK_S / 2
+    assert not held.workers[0].alive()
 
 
-async def test_the_resend_thread_ends_when_its_check_ends(
+async def test_a_cancelled_check_leaves_no_thread_behind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    before = set(threading.enumerate())
     held = _HeldCheck(monkeypatch)
     executor = SolverExecutor(1)
     try:
         await _cancel_held_check(held, executor)
     finally:
         await asyncio.to_thread(executor.shutdown)
-    resenders = [t for t in threading.enumerate() if t.name == "z3-interrupt"]
-    for t in resenders:
+    left = [t for t in set(threading.enumerate()) - before if t.name.startswith("z3")]
+    for t in left:
         await asyncio.to_thread(t.join, 1.0)
-    assert not [t for t in resenders if t.is_alive()]
+    assert not [t for t in left if t.is_alive()]
 
 
 async def test_a_cancel_before_the_context_is_attached_refuses_the_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checks: list[object] = []
-    real_check = z3.Solver.check
+    calls: list[object] = []
+    real_call = solver_workers.Worker.call
 
-    def check(solver: z3.Solver, *args: object) -> object:
-        checks.append(solver)
-        return real_check(solver, *args)
+    def call(worker: solver_workers.Worker, args: tuple[Any, ...], budget_s: float) -> Any:
+        calls.append(args)
+        return real_call(worker, args, budget_s)
 
-    monkeypatch.setattr(z3.Solver, "check", check)
+    monkeypatch.setattr(solver_workers.Worker, "call", call)
     entered, go = threading.Event(), threading.Event()
     outcome: list[solver_mod.SolverOutcome] = []
 
@@ -377,7 +362,7 @@ async def test_a_cancel_before_the_context_is_attached_refuses_the_check(
     finally:
         await asyncio.to_thread(executor.shutdown)
     assert outcome and outcome[0].details == "interrupted"
-    assert checks == []
+    assert calls == []
 
 
 # --------------------------------------------------------------------------
@@ -537,33 +522,3 @@ async def test_hitl_event_keeps_the_outcomes_timing() -> None:
 
     [event] = tracer.events
     assert (event.started_at, event.latency_ms) == (started, 123.5)
-
-
-# --------------------------------------------------------------------------
-# AUDIT-16 #2 (medium): the `z3_spy` fixture in `test_solver_executor.py` sets
-# `interrupted` before it sends the real interrupt. The held entailment check can
-# then start before the interrupt is sent, so the interrupt lands inside the check
-# and the "drop window" the tests claim to hold is not held. With the re-send
-# removed (S10), `test_cancelling_a_caller_interrupts_its_z3_context` passed in 1
-# of 15 runs. The spy should signal only after the real `Context.interrupt()`.
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(strict=True, reason="AUDIT-16 #2")
-def test_z3_spy_signals_only_after_the_interrupt_is_sent(
-    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
-) -> None:
-    seen: list[bool] = []
-    spy_box: list[Any] = []
-
-    def recorder(ctx: z3.Context) -> None:
-        seen.append(spy_box[0].interrupted.is_set())
-
-    # Installed before the spy, so the spy's "real" interrupt is this recorder.
-    monkeypatch.setattr(z3.Context, "interrupt", recorder)
-    spy_box.append(request.getfixturevalue("z3_spy"))
-
-    z3.Context().interrupt()
-
-    # Today: [True], the event was already set when the interrupt was sent.
-    assert seen == [False]

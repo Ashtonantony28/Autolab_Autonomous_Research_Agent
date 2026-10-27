@@ -97,6 +97,8 @@
 
 **Fix.** Always wrap: `_wrap_assert` should return `f"(assert {body})"`. The `(assert` branch is dead for every formalized step since SG15, and `vericot` never passes one.
 
+**Resolution (SG22).** `_wrap_assert` always returns `(assert <body>)`. The repro passes as a plain test with its assertion unchanged.
+
 ## 6. Low: the dashboard drops the `hitl` event's agent and note
 
 **Impact.** SG18 added `TraceEvent.agent` and `TraceEvent.note` so a human decision can be audited (`monitoring/events.py:37-40`), and the store persists them. `EVENT_COLUMNS` and `render_event_table` show neither (`monitoring/dashboard.py:21`, `:45-61`). On the dashboard a `hitl` row reads `hitl / approve / policy / <reason>`: it does not say whose request was approved or what the human wrote. PLAN.md SG18 lists this as open (`PLAN.md:318`). The docstring "one row per agent execution" (`dashboard.py:46`) is also stale.
