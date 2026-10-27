@@ -117,7 +117,6 @@ def test_the_parent_verifies_after_forking(forked_run: dict[str, str]) -> None:
 
 
 @fork_only
-@pytest.mark.xfail(strict=True, reason="AUDIT-29 #1")
 def test_a_child_forked_after_build_can_verify(forked_run: dict[str, str]) -> None:
     # Today: "AssertionError: can only test a child process" (then ChildProcessError
     # from the forkserver on later checks). Before SG32: "VALID VALID".
