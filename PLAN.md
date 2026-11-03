@@ -16,43 +16,43 @@ Status legend: `todo` · `active` · `blocked` · `done`. Every subagent reads t
 | ID | Title | Depends on | Owns (files) | Status |
 |---|---|---|---|---|
 | SG0 | Shared interfaces | — | `state/models.py`, `verification/llm.py`, `config.py`, `state/schema.py` | done (PR open) |
-| SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | done (PR pending) |
-| SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | done (PR pending) |
-| SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | done (PR pending) |
-| SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | done (PR pending) |
+| SG1 | Verifier soundness | SG0 | `verification/solver.py`, `premise_grounder.py`, `confidence.py`, `formalizer.py`, `tests/fixtures/golden_traces.py` | done (merged) |
+| SG2 | Checker latency budget | SG1 | `verification/vericot.py` (timing only), `scripts/bench_verifier.py` | done (merged) |
+| SG3 | Bind traces to payloads | SG1 | `agents/*.py` (except monitor), `verification/vericot.py` (claim binding) | done (merged) |
+| SG4 | Orchestration completion | SG3 | `orchestrator/*`, `agents/base.py`, `agents/verification_monitor.py`, `cli.py` | done (merged) |
 | SG5 | Live LLM path | SG1–SG4 | `verification/llm.py` (Claude adapter), `tests/live/` | built, live run pending API key |
-| SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | done (PR pending) |
-| SG7 | Soundness round 2 (AUDIT-1 #1–#4, AUDIT-3 #1) | audit round 1 | `verification/*` (except solver executor), `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/*` | done (PR pending) |
-| SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | done (PR pending) |
-| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | done (PR pending) |
-| SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | done (PR pending) |
-| SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | done (PR pending) |
-| SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (PR pending) |
-| SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | done (PR pending) |
-| SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | done (PR pending) |
-| SG15 | Formalizer input hardening (AUDIT-9 #1, #2, AUDIT-12 #3) | audit round 3 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG16 | Circularity in the second payload pass (AUDIT-9 #3) | SG15 | `verification/vericot.py` (payload proof only), `tests/unit/verification/test_payload_proof.py` | done (PR pending) |
-| SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
-| SG18 | Trace and persist HITL outcomes (AUDIT-11 #1, #3, #7) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*`, `cli.py` (abort message) | done (PR pending) |
-| SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
-| SG20 | No step can redefine a symbol it did not declare (AUDIT-13 #1, #2) | audit round 4 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG21 | Design figures and fact symbols (AUDIT-13 #3, AUDIT-15 #1, AUDIT-16 #1) | audit round 4 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (PR pending) |
-| SG22 | Solver timeout and fair scheduling (AUDIT-14 #1, #2) | SG23 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
-| SG23 | Deterministic gate (flaky AUDIT-6 #7 repro, SQLite lock in concurrent-store test) | audit round 4 | `tests/audit/test_audit_6.py` (#7 repro only), `state/store.py` (connection setup only), `tests/integration/monitoring/test_graph_observability.py`, `tests/audit/test_audit_14.py` (#1 repros), `tests/audit/test_audit_10.py` (#1 test), `tests/audit/test_audit_6.py` (#3 repro) | done (PR pending) |
-| SG24 | Formalizer probe cost and annotation tokenizing (AUDIT-18 #1, AUDIT-20 #2, #4) | audit round 5 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py`, `tests/audit/test_audit_13.py` (#2 helper only) | done (PR pending) |
-| SG25 | Independent cost and duration estimate for designs (AUDIT-17 #1–#3, AUDIT-19 #1, #2) | audit round 5 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/`, `orchestrator/routing.py` (figure retry only) | done (PR pending) |
-| SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | done (PR pending) |
-| SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | done (PR pending) |
-| SG28 | Formalizer probe cost linear in arity (AUDIT-22 #1) | audit round 6 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | done (PR pending) |
-| SG30 | Slot fairness by elapsed time with aging (AUDIT-22 #4, AUDIT-24 #2, #3) | SG29 | `verification/solver.py` scheduling only, `tests/unit/verification/test_solver_scheduling.py` | done (PR pending) |
-| SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (PR pending) |
-| SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (PR pending) |
-| SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (PR pending) |
-| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
-| SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (PR pending); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
-| SG36 | Pause the lending check's worker (AUDIT-34 #2, #3, AUDIT-38 #1, #2, AUDIT-40 #5, #6) | owner's choice after audit round 10 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/` | done (PR pending); loaded runs since repeated: 4 of 5 green twice, misses in tests SG36 does not change |
-| SG37 | Bound paused checks (AUDIT-42 #1, #2, AUDIT-41 #1, AUDIT-43 #2, #3) | audit round 11 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (PR pending) |
+| SG6 | Persistence and observability wiring | SG4 | `monitoring/*`, `state/store.py`, `state/checkpointer.py` | done (merged) |
+| SG7 | Soundness round 2 (AUDIT-1 #1–#4, AUDIT-3 #1) | audit round 1 | `verification/*` (except solver executor), `agents/verification_monitor.py`, `agents/base.py`, `tests/fixtures/*` | done (merged) |
+| SG8 | Permanent-error escalation and retry hygiene (AUDIT-3 #2, #4, #11) | audit round 1 | `orchestrator/recovery.py`, `verification/llm.py` | done (merged) |
+| SG9 | Entity identity and store keys (AUDIT-3 #3, AUDIT-2 store findings) | SG7 | `agents/*.py` (id handling), `state/store.py` | done (merged) |
+| SG10 | Bounded solver executor (AUDIT-2 #1) | SG7 | `verification/vericot.py` (executor only), `verification/solver.py` | done (merged) |
+| SG11 | Formalizer symbol safety (AUDIT-5 #1, AUDIT-6 #1) | audit round 2 | `verification/formalizer.py`, `verification/vericot.py` (declaration checks only), `tests/fixtures/golden_traces.py` | done (merged) |
+| SG12 | Bind structured payload fields (AUDIT-5 #2, #3) | audit round 2 | `agents/common.py`, `agents/design.py`, `orchestrator/checkpoints.py`, `orchestrator/graph.py` | done (merged) |
+| SG13 | Resume after a crash (AUDIT-7 #1) | SG11, SG12 | `cli.py`, `orchestrator/recovery.py` | done (merged) |
+| SG14 | Bounded, load-tolerant timing tests (AUDIT-8 H1, flaky AUDIT-2 starvation test) | SG11, SG12 | `pyproject.toml`, `uv.lock`, `Makefile`, wall-clock tests under `tests/` | done (merged) |
+| SG15 | Formalizer input hardening (AUDIT-9 #1, #2, AUDIT-12 #3) | audit round 3 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (merged) |
+| SG16 | Circularity in the second payload pass (AUDIT-9 #3) | SG15 | `verification/vericot.py` (payload proof only), `tests/unit/verification/test_payload_proof.py` | done (merged) |
+| SG17 | Protocol figures bound to Design fields (AUDIT-12 #1, reopens AUDIT-5 #2) | audit round 3 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (merged) |
+| SG18 | Trace and persist HITL outcomes (AUDIT-11 #1, #3, #7) | SG17 | `orchestrator/graph.py`, `orchestrator/checkpoints.py`, `monitoring/*`, `cli.py` (abort message) | done (merged) |
+| SG19 | Solver pool throughput and reliable interrupts (AUDIT-10 #1, AUDIT-12 #2) | SG16 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (merged) |
+| SG20 | No step can redefine a symbol it did not declare (AUDIT-13 #1, #2) | audit round 4 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (merged) |
+| SG21 | Design figures and fact symbols (AUDIT-13 #3, AUDIT-15 #1, AUDIT-16 #1) | audit round 4 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/` | done (merged) |
+| SG22 | Solver timeout and fair scheduling (AUDIT-14 #1, #2) | SG23 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py` | done (merged) |
+| SG23 | Deterministic gate (flaky AUDIT-6 #7 repro, SQLite lock in concurrent-store test) | audit round 4 | `tests/audit/test_audit_6.py` (#7 repro only), `state/store.py` (connection setup only), `tests/integration/monitoring/test_graph_observability.py`, `tests/audit/test_audit_14.py` (#1 repros), `tests/audit/test_audit_10.py` (#1 test), `tests/audit/test_audit_6.py` (#3 repro) | done (merged) |
+| SG24 | Formalizer probe cost and annotation tokenizing (AUDIT-18 #1, AUDIT-20 #2, #4) | audit round 5 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py`, `tests/audit/test_audit_13.py` (#2 helper only) | done (merged) |
+| SG25 | Independent cost and duration estimate for designs (AUDIT-17 #1–#3, AUDIT-19 #1, #2) | audit round 5 | `agents/common.py`, `agents/design.py`, `tests/unit/agents/`, `orchestrator/routing.py` (figure retry only) | done (merged) |
+| SG26 | Solver scheduling without executor internals (AUDIT-18 #2, AUDIT-20 #1, #3, #5) | audit round 5 | `verification/solver.py`, `tests/unit/verification/test_solver_executor.py`, `tests/audit/test_audit_6.py` (#7 repro), `tests/audit/test_audit_14.py` (#1 repros) | done (merged) |
+| SG27 | Real-valued premise pools honour timeouts (AUDIT-18 #3) | SG26 | `verification/solver.py`, `verification/vericot.py` (check composition only) | done (merged) |
+| SG28 | Formalizer probe cost linear in arity (AUDIT-22 #1) | audit round 6 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (merged) |
+| SG29 | Solver checks bounded by process isolation (AUDIT-22 #2, #3, #5, #6, AUDIT-24 #1, #4–#6) | audit round 6 | `verification/solver.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_14.py` #1 | done (merged) |
+| SG30 | Slot fairness by elapsed time with aging (AUDIT-22 #4, AUDIT-24 #2, #3) | SG29 | `verification/solver.py` scheduling only, `tests/unit/verification/test_solver_scheduling.py` | done (merged) |
+| SG31 | Worker replies matched to their request (AUDIT-28 #1, #4, #5, AUDIT-25 #2, #3, AUDIT-27 #1, #2) | audit round 7 | `verification/solver.py` worker path, `verification/solver_workers.py`, `tests/unit/verification/test_solver_workers.py` | done (merged) |
+| SG32 | Newcomers and cold start (AUDIT-26 #1, #3, #4, #5, AUDIT-25 #1, AUDIT-28 #2, #3) | SG31 | `verification/solver.py` scheduling and start-up, `verification/solver_workers.py` boot, `tests/unit/verification/test_solver_executor.py` | done (merged) |
+| SG33 | Bounded probe work per reply (AUDIT-26 #2) | audit round 7 | `verification/formalizer.py`, `tests/unit/verification/test_formalizer.py` | done (merged) |
+| SG34 | Runs that start together and fork safety (AUDIT-30 #1, #2, AUDIT-29 #1) | audit round 8 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (merged) |
+| SG35 | Stopped newcomers keep their place; fork exit safety (AUDIT-34 #1–#3, AUDIT-35 #1, AUDIT-36 #1, #9) | audit round 9 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/test_audit_28.py` | done (merged); AUDIT-34 #2, #3 wait on the owner (ADR 0009) |
+| SG36 | Pause the lending check's worker (AUDIT-34 #2, #3, AUDIT-38 #1, #2, AUDIT-40 #5, #6) | owner's choice after audit round 10 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py`, `tests/audit/` | done (merged); loaded runs since repeated: 4 of 5 green twice, misses in tests SG36 does not change |
+| SG37 | Bound paused checks (AUDIT-42 #1, #2, AUDIT-41 #1, AUDIT-43 #2, #3) | audit round 11 | `verification/solver.py` scheduling, `verification/solver_workers.py`, `tests/unit/verification/test_solver_*.py` | done (merged) |
 
 Out of scope unless the owner asks: multimodal RAG (`tools/rag/`), real lab hardware.
 
@@ -488,6 +488,16 @@ Round 11 (AUDIT-41..44, fresh agents, base `3d2d7b4`) found 0 critical and 3 hig
 Result: done (ADR 0009, SG37 amendment). A lender frozen for `_FROZEN_SHARE` (1.5) times its check's timeout runs on while the earliest lent check is frozen instead, so Z3 checks stay within the places and a lender's wall within 2.5 timeouts plus one lent check: `audit_load_11`'s 1.0 s checks beside 1–4 short loops end in 2.50–2.57 s (not done in 10 s before). Measured on AUDIT-30 #1's fresh-task load, an easy newcomer waited 0.0–1.5 s (34 of 36 probes ≤ 0.5 s; SG36 0.0–0.3); resting or alternating lenders gave up to 2.2–3.0 s and were rejected. At most `workers` newcomers wait paused; past that a newcomer is stopped and re-queued for a slot only (its `fn` runs again, so `fn` must be pure), and none is paused without SIGSTOP (AUDIT-43 #4 passes too): 16/64/128 fresh tasks peak at 8 worker processes and 270–307 MB PSS (48–100 and 1.2–2.5 GB before). When a lender ends with its place lent, the earliest lent check keeps its slot, so no caller runs beside it. One watchdog thread per worker process serves every check. Run time counts overlapping pauses and freezes once (a negative `solver_ms` under load is fixed). Tests adapted: AUDIT-34 #2 allows one restart, AUDIT-44 #13's scenario and R11 mutant strings, the watchdog checks in `test_audit_24.py` and `test_solver_loading.py`, three scheduling tests. Verify: `make lint typecheck test` green (one idle run before it failed SG36's `test_a_check_paused_past_its_timeout_keeps_its_budget` on timing; 20 of 20 alone under 4 burners since); `make test` 5 of 5 green under 4 CPU burners; error injection 34/34, 26/26; bench step p50 6.12 ms, p95 9.65 ms; AUDIT-38 #2's /proc test 3 of 3. Open: AUDIT-42 #3 and AUDIT-43 #1 stay strict xfails; a short caller's lent check may stay frozen for up to a lender's remaining share.
 
 Medium and low round-11 findings not folded in above stay in the AUDIT files, among them a newcomer that gives way to every short caller in a stream (AUDIT-42 #3, not a regression), non-POSIX growth (AUDIT-43 #4), stale docs (AUDIT-43 #5) and the AUDIT-44 survivors now killed by its plain tests. AUDIT-31 #1 and AUDIT-21 #1 / AUDIT-23 #1 (medium) are still open.
+### Final audit round 12: project closed
+
+Round 12 (AUDIT-45, AUDIT-46, fresh agents, base `2a6ee8f`) was the last round, on the owner's ask to finish at a reasonable end point. It found 0 critical and 0 high findings. Soundness held: no wrong trace admitted and no timeout or UNKNOWN turned VALID (2048 checks in stress runs, 0 wrong verdicts). SG37's claims hold: a lender's wall stays near 2.5 timeouts, bursts of 16–128 fresh tasks peak at 8 worker processes and about 0.3 GB, Z3 processes average 3.8–3.9 on 4 CPUs, and nothing leaks. All SG rows are merged into the default branch.
+
+Left open, with repros in the AUDIT files:
+- AUDIT-46 #1 (medium): once a lender is due, the check on its lent place is frozen for the lender's remaining run, so an easy check can wait up to about one timeout (0.03 s under SG36). Options: alternate lender and lent check by slice, or stop lending a due lender's place.
+- AUDIT-45 #1 (low): a lent check frozen before its pool thread starts can report a negative `solver_ms`, which makes `Verifier.verify` raise (fails closed; seen only with an injected delay). An unconfirmed stall with one worker left stopped is described in AUDIT-45.md.
+- AUDIT-46 #2, #3 (low): extra re-runs past the paused cap (+18 % on 64-task bursts) and slower hard bursts beside endless short loops.
+- Older mediums: AUDIT-31 #1 (`worker_died` on a non-final step passes the trace), AUDIT-21 #1 / AUDIT-23 #1 (approval re-checks cost on the design's own figures), AUDIT-42 #3, AUDIT-43 #1, AUDIT-33 #1, #2 / AUDIT-37 #1 (fork during a worker start).
+- SG5's live LLM run still needs an `ANTHROPIC_API_KEY`.
 ## Audits (after SG6)
 
 Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md` with findings ranked by severity, each with a repro or a failing test. Critical and high findings become new SG rows here. Audits repeat until a full round finds no critical or high issues.
@@ -508,9 +518,11 @@ Each audit is a fresh agent that wrote none of the code. It writes `AUDIT-<n>.md
 | AUDIT-33..36 | Round 9, on SG34 |
 | AUDIT-37..40 | Round 10, on SG35 |
 | AUDIT-41..44 | Round 11, on SG36 |
+| AUDIT-45..46 | Round 12 (final), on SG37 |
 
 ## Log
 
+- 2026-11-03: final audit round 12 done (0 critical, 0 high); SG36 and SG37 merged; the project is closed with the open items listed under round 12.
 - 2026-10-27: SG37 done (PR pending): a lender's pause is bounded by 1.5 timeouts, paused newcomers by the slots (past the cap, stopped and re-queued); one watchdog thread per worker.
 - 2026-10-27: audit round 11 done (0 critical, 3 high); SG37 added. Soundness held; the highs are unbounded pauses and paused workers piling up.
 - 2026-10-27: SG36 done (PR pending): a lending slot's worker is paused (SIGSTOP), so Z3 checks stay within slots plus slow places; paused time is not budget.
