@@ -10,6 +10,7 @@ spends), never absolute seconds. Measurements: `uv run python -m scripts.audit_l
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -47,30 +48,39 @@ class _Held:
         return "held"
 
 
-class _UntilStopped:
-    """A check that runs until its worker is killed; run again, it decides at once."""
+class _UntilPaused:
+    """A check that runs until its worker is paused; resumed, it decides at once. `order`
+    records each start and resume (SG36 pauses a check that gives way, not stops it)."""
 
     def __init__(self, name: str, order: list[str]) -> None:
         self.name = name
         self.order = order
         self.started = threading.Event()
-        self._stop = threading.Event()
+        self._paused = False
+        self._end = threading.Event()
 
     def interrupt(self) -> None:
-        self._stop.set()
+        self._end.set()
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        if self._paused:
+            self._paused = False
+            self.order.append(self.name)
+            self._end.set()
 
     def __call__(self) -> str:
         self.order.append(self.name)
-        if self._stop.is_set():
-            return "decided"
         interrupt = solver_mod._worker.interrupt
         assert interrupt.attach(self)
         self.started.set()
         try:
-            assert self._stop.wait(_WAIT_S)
+            assert self._end.wait(_WAIT_S)
         finally:
             interrupt.detach()
-        return "stopped"
+        return "decided"
 
 
 class _FakeClock:
@@ -109,6 +119,47 @@ async def _until(condition: Callable[[], bool]) -> None:
         await asyncio.sleep(0.005)
 
 
+@contextlib.contextmanager
+def _running() -> Iterator[list[int]]:
+    """[the most worker calls in flight at once whose worker is not paused]: since SG36 a
+    lending slot's worker is paused while its place is lent, so it is not counted."""
+    worker = solver_workers.Worker
+    call, pause, resume = worker.call, worker.pause, worker.resume
+    lock = threading.Lock()
+    calls: set[solver_workers.Worker] = set()
+    paused: set[solver_workers.Worker] = set()
+    peak = [0]
+
+    def counted_call(self: solver_workers.Worker, args: Any, budget_s: float) -> Any:
+        with lock:
+            calls.add(self)
+            peak[0] = max(peak[0], len(calls - paused))
+        try:
+            return call(self, args, budget_s)
+        finally:
+            with lock:
+                calls.discard(self)
+
+    def counted_pause(self: solver_workers.Worker) -> None:
+        pause(self)
+        with lock:
+            paused.add(self)
+
+    def counted_resume(self: solver_workers.Worker) -> None:
+        with lock:
+            paused.discard(self)
+            peak[0] = max(peak[0], len(calls - paused))
+        resume(self)
+
+    worker.call = counted_call  # type: ignore[method-assign]
+    worker.pause = counted_pause  # type: ignore[method-assign]
+    worker.resume = counted_resume  # type: ignore[method-assign]
+    try:
+        yield peak
+    finally:
+        worker.call, worker.pause, worker.resume = call, pause, resume  # type: ignore[method-assign]
+
+
 # --- #1: a newcomer that gives way goes to the back of the hard queue ----------------------
 
 
@@ -145,7 +196,7 @@ async def test_a_newcomer_that_gives_way_to_a_short_caller_is_served_before_hard
     await _until(lambda: slots.stuck == 1)
     go_hard.set()
     await _until(lambda: len(slots._waiters) == 2)
-    newcomer = _UntilStopped("new", order)
+    newcomer = _UntilPaused("new", order)
     new_task = asyncio.create_task(executor.run(newcomer))
     assert await asyncio.to_thread(newcomer.started.wait, _WAIT_S)
     go_short.set()
@@ -212,24 +263,23 @@ async def test_a_newcomer_is_not_stopped_while_its_worker_starts(
 # --- #2: lent places run hard checks beside every slot and slow place ------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-34 #2")
 async def test_z3_checks_never_outnumber_the_slots_and_slow_places() -> None:
     # A 1-CPU host's defaults: 1 slot, no slow place. AUDIT-18 #5: slots and slow checks
-    # together do not outnumber the CPUs. Three hard checks in new tasks: today one runs
-    # in the slot and another on a lent place for `_HARD_SLICES` beside it (peak 2), and
-    # the lent one is killed and run again.
+    # together do not outnumber the CPUs. Three hard checks in new tasks: before SG36 one
+    # ran in the slot and another on a lent place for `_HARD_SLICES` beside it (peak 2),
+    # and the lent one was killed and run again. Counted as calls in flight whose worker
+    # is not paused; AUDIT-38 #2 counts running processes.
     executor = SolverExecutor(1, 0)
     check = partial(Z3Solver(0.5).check_entailment, *UNDECIDABLE)
     try:
-        with metered() as meter:
+        with metered() as meter, _running() as peak:
             await asyncio.gather(*(executor.run(check) for _ in range(3)))
     finally:
         executor.shutdown()
-    assert meter.peak <= 1, f"{meter.peak} Z3 checks at once, {meter.restarts} worker restarts"
+    assert (peak[0], meter.restarts) == (1, 0)
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-34 #2")
 async def test_runs_that_check_in_fresh_tasks_waste_little_z3_time() -> None:
     # LangGraph's shape: every node is a new task, so every run's first check is a
     # newcomer's. 8 hard runs, 1 check per task, 2 slots + 2 slow places, timeout 0.4 s.
@@ -247,33 +297,26 @@ async def test_runs_that_check_in_fresh_tasks_waste_little_z3_time() -> None:
 # --- #3: the retuned tests, at their old strength --------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-34 #3")
 async def test_slow_checks_are_bounded_by_slow_workers_as_before_sg34() -> None:
     # `test_slow_checks_are_bounded_by_slow_workers` before SG34. Its new `peak <= 3` with
     # three callers, and `threads <= 3`, cannot fail; `calls in (3, 4)` accepts the re-run.
+    # Since SG36 a lending slot's check is paused, not counted (`_running`).
     executor = SolverExecutor(1, slow_workers=1)
-    lock = threading.Lock()
-    running, peak, calls = 0, 0, 0
+    calls = 0
     check = partial(Z3Solver(0.3).check_entailment, *UNDECIDABLE)
 
     def hard() -> SolverOutcome:
-        nonlocal running, peak, calls
-        with lock:
-            running += 1
-            calls += 1
-            peak = max(peak, running)
-        try:
-            return check()
-        finally:
-            with lock:
-                running -= 1
+        nonlocal calls
+        calls += 1
+        return check()
 
     try:
-        outs = await asyncio.gather(*(executor.run(hard) for _ in range(3)))
+        with _running() as peak:
+            outs = await asyncio.gather(*(executor.run(hard) for _ in range(3)))
     finally:
         executor.shutdown()
     assert [o.reason for o, _ in outs] == ["timeout"] * 3
-    assert (peak, calls) == (2, 3)
+    assert (peak[0], calls) == (2, 3)
 
 
 # --- #4: a forked child starts cold ----------------------------------------------------------

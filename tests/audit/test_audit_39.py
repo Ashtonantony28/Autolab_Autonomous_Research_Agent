@@ -53,7 +53,6 @@ def _flips(plan: str, sg: str) -> list[str]:
     return items
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-39 #1")
 def test_a_done_sub_goal_leaves_none_of_its_flips_open() -> None:
     # PLAN.md: a sub-goal that cannot meet its verification stops and reports (Rules);
     # SG35's row says "done (PR pending)", but two of its flips are still strict xfails.
@@ -138,14 +137,13 @@ def test_a_worker_started_at_the_fork_survives_a_child_that_exits_normally(
 # --- #3 (low): `run`'s contract: a stop between two checks of one `fn` is returned ----------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-39 #3")
 async def test_a_stop_between_two_checks_of_one_fn_is_never_its_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # `run`: "`fn` must be pure: a newcomer's call stopped on a lent place is made again".
-    # A pure `fn` of two checks, stopped after its first check has left its worker: the
-    # stop is not counted (`request` found no target), so the second check comes back
-    # "interrupted" and `run` returns that, with the executor still open.
+    # Was: a pure `fn` of two checks, stopped after its first check had left its worker,
+    # returned the second check's "interrupted". SG36 pauses a newcomer that gives way
+    # instead of stopping it, so the second check, attached while the call is frozen,
+    # starts paused and runs once the call has a place again.
     gap, go = threading.Event(), threading.Event()
 
     def two_checks() -> tuple[SolverOutcome, SolverOutcome]:
@@ -154,24 +152,26 @@ async def test_a_stop_between_two_checks_of_one_fn_is_never_its_result(
         go.wait(_JOIN_S)
         return first, Z3Solver(5.0).check_entailment(*_EASY)
 
-    def yields(interrupt: solver_mod._Interrupt, slots: solver_mod._Slots) -> bool:
+    def yields(
+        interrupt: solver_mod._Interrupt, slots: solver_mod._Slots, gave_way: bool = False
+    ) -> bool:
         # The interleaving under test: `_yields` saw the check attached, and the pool
-        # thread detached it before `request` ran.
-        if not interrupt.attached():
+        # thread detached it before `freeze` ran.
+        if gave_way or not interrupt.attached():
             return False
         gap.wait(_JOIN_S)
         return True
 
-    real_request = solver_mod._Interrupt.request
+    real_freeze = solver_mod._Interrupt.freeze
 
-    def request(self: solver_mod._Interrupt) -> bool:
+    def freeze(self: solver_mod._Interrupt) -> None:
         try:
-            return real_request(self)
+            real_freeze(self)
         finally:
             go.set()
 
     monkeypatch.setattr(SolverExecutor, "_yields", staticmethod(yields))
-    monkeypatch.setattr(solver_mod._Interrupt, "request", request)
+    monkeypatch.setattr(solver_mod._Interrupt, "freeze", freeze)
     ex = SolverExecutor(workers=1, slow_workers=0)
     try:
         hog = asyncio.create_task(ex.run(lambda: Z3Solver(20.0).check_entailment(*_HARD)))
@@ -186,5 +186,4 @@ async def test_a_stop_between_two_checks_of_one_fn_is_never_its_result(
     finally:
         ex.shutdown()
     assert first.reason == "timeout"
-    # Today: UNGROUNDED/timeout "interrupted", from an executor that was not shut down.
     assert second.reason == "entailed", second

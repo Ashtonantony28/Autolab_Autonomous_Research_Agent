@@ -203,6 +203,7 @@ def _piped_worker() -> tuple[solver_workers.Worker, Connection]:
     parent, child = multiprocessing.Pipe()
     worker = solver_workers.Worker.__new__(solver_workers.Worker)
     worker.conn, worker._ready, worker._seq, worker.fault = parent, True, 0, ""
+    worker._lock, worker._paused_at, worker._paused_s = threading.Lock(), None, 0.0
     return worker, child
 
 

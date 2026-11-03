@@ -439,9 +439,9 @@ async def printer_peak_concurrency(checks: int, workers: int, hold_s: float = 0.
 S08_PLUGIN: Final = """
 from autolab.verification import solver as solver_mod
 
-solver_mod._remaining_ms = lambda deadline: 0
+solver_mod._Watchdog._watch = lambda self: None
 """
-"""Mutant S08 (AUDIT-8 H1): every solver check gets Z3's "no limit" timeout."""
+"""Mutant S08 (AUDIT-8 H1): no solver check is ever interrupted (no limit)."""
 
 S08_TEST: Final = (
     "tests/unit/verification/test_latency.py::test_hard_premise_consistency_check_times_out"

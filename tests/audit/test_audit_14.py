@@ -18,7 +18,7 @@ import pytest
 import z3
 
 from autolab.verification.solver import SmtFormula, SolverExecutor, Z3Solver
-from scripts.audit_load_4 import core_check, fast_trace_under_slow_runs, lia_chain, timed_check
+from scripts.audit_load_4 import fast_trace_under_slow_runs, lia_chain, timed_check
 from tests.unit.verification.test_solver_executor import attached_worker
 
 _OVERRUN_LIMIT: Final = 1.5
@@ -105,7 +105,32 @@ def _timeout_case() -> tuple[list[SmtFormula], SmtFormula, float]:
     return premises, hard, _TIMEOUT_SHARE * until_s
 
 
+_NOT_STARTED: Final = (
+    "too little time left for the entailment check",
+    "premise consistency check returned unknown",
+)
+_RECALIBRATIONS: Final = 4
+
+
+def _core_check_into_entailment(
+    premises: list[SmtFormula], claim: SmtFormula, timeout_s: float
+) -> tuple[str, float, float]:
+    """(reason, wall s, timeout s) of `_solve` in this process, the timeout doubled until
+    its entailment check starts: on a machine that slowed down after `_timeout_case`
+    calibrated it, the consistency check runs out, or the `_SETUP_SHARE` guard skips the
+    entailment check (AUDIT-40 #5)."""
+    for _ in range(_RECALIBRATIONS):
+        started = time.perf_counter()
+        outcome = Z3Solver(timeout_s)._check_here(premises, claim)
+        wall_s = time.perf_counter() - started
+        if outcome.details not in _NOT_STARTED:
+            return outcome.reason, wall_s, timeout_s
+        timeout_s *= 2
+    pytest.fail(f"the entailment check never started, last timeout {timeout_s / 2:.2f} s")
+
+
 @pytest.mark.perf
+@pytest.mark.timeout(180)  # two calibration runs and two checks, each slower under load
 def test_a_check_returns_within_its_timeout() -> None:
     # The pre-SG19 add-based check honours the timeout; checking `claim!` as an assumption
     # runs into a phase Z3 does not interrupt, and returns `timeout` after ~3x the timeout.
@@ -114,7 +139,7 @@ def test_a_check_returns_within_its_timeout() -> None:
     # the kill stays a backstop (AUDIT-24 #1). The pool is Int, so it is parsed in one
     # call, the path with the unpolled phase.
     premises, claim, timeout_s = _timeout_case()
-    reason, wall_s = core_check(premises, claim, timeout_s)
+    reason, wall_s, timeout_s = _core_check_into_entailment(premises, claim, timeout_s)
     assert reason == "timeout"
     assert wall_s / timeout_s <= _OVERRUN_LIMIT
     reason, wall_s = timed_check(premises, claim, timeout_s)  # in a worker

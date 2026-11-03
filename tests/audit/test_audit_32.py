@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,7 @@ def _silent_worker() -> tuple[solver_workers.Worker, Any]:
     parent, child = multiprocessing.Pipe()
     worker = solver_workers.Worker.__new__(solver_workers.Worker)
     worker.conn, worker._ready, worker._seq, worker.fault = parent, False, 0, ""
+    worker._lock, worker._paused_at, worker._paused_s = threading.Lock(), None, 0.0
     worker.process = SimpleNamespace(
         kill=lambda: None, join=lambda: None, exitcode=None, is_alive=lambda: True
     )
@@ -100,8 +102,8 @@ def test_a_worker_that_never_says_ready_failed_to_start(monkeypatch: pytest.Monk
 
 
 _S04: Final = (
-    "if not self.conn.poll(_BOOT_S):\n                self.fault = FAILED_TO_START\n",
-    "if not self.conn.poll(_BOOT_S):\n",
+    "if not self._poll(_BOOT_S):\n                self.fault = FAILED_TO_START\n",
+    "if not self._poll(_BOOT_S):\n",
 )
 
 

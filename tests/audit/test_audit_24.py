@@ -135,29 +135,28 @@ async def test_a_check_that_ran_long_while_the_loop_was_busy_counts_as_hard() ->
 # --------------------------------------------------------------------------
 
 _ASSUME: Final = (
-    "solver.add(z3.Bool(_NEGATED_CLAIM, ctx))\n"
-    '        solver.set("timeout", _remaining_ms(deadline))\n'
-    "        result = solver.check()\n",
-    'solver.set("timeout", _remaining_ms(deadline))\n'
-    "        result = solver.check(z3.Bool(_NEGATED_CLAIM, ctx))\n",
+    "solver.add(z3.Bool(_NEGATED_CLAIM, ctx))\n        result = solver.check()\n",
+    "result = solver.check(z3.Bool(_NEGATED_CLAIM, ctx))\n",
 )
 
 
 @pytest.mark.perf
+@pytest.mark.timeout(180)  # as the AUDIT-14 #1 repro it runs
 def test_the_audit_14_1_timeout_repro_fails_with_the_assumption_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _mutant(monkeypatch, solver_mod, "_solve", *_ASSUME)
+    _mutant(monkeypatch, solver_mod, "_decide", *_ASSUME)
     with pytest.raises(AssertionError):
         audit_14.test_a_check_returns_within_its_timeout()
 
 
 @pytest.mark.perf
+@pytest.mark.timeout(180)  # as the AUDIT-14 #1 repro it runs
 def test_on_the_one_call_path_the_audit_14_1_repro_catches_the_assumption_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The suggested fix: the same repro with its pool kept on the one-call path.
-    _mutant(monkeypatch, solver_mod, "_solve", *_ASSUME)
+    _mutant(monkeypatch, solver_mod, "_decide", *_ASSUME)
     monkeypatch.setattr(solver_mod, "_LOAD_ABOVE", 10 * audit_14._POOL)
     with pytest.raises(AssertionError):
         audit_14.test_a_check_returns_within_its_timeout()
@@ -223,65 +222,42 @@ async def test_a_lent_check_never_lends_a_place_under_s06(monkeypatch: pytest.Mo
 
 # --------------------------------------------------------------------------
 # #4 (medium): SG27's loading checks run without a Z3 limit once `or not limit`
-# goes (mutant L01 survived). `_load` starts with `limit = 0`, so only that clause
-# sets a timeout before the first loading check; without it no loading check has
-# one, and only the deadline poll between checks bounds the pool. The SG27 test
-# `test_a_loading_check_never_gets_much_more_than_the_time_left` passes regardless:
-# it compares the last limit set, which stays 0, against the time left.
+# goes (mutant L01 survived). Since SG36 one `_Watchdog` interrupts every check of
+# `_solve`, loading checks included, so the pinned rule is that it is armed for each
+# (its old twin pinned the per-check `timeout`, and #5 its re-set share; both gone).
 # --------------------------------------------------------------------------
 
 _L01: Final = (
-    "if remaining < _RESET_SHARE * limit or not limit:",
-    "if remaining < _RESET_SHARE * limit:",
+    "    with _Watchdog(ctx, deadline):\n        return _decide(",
+    "    if True:\n        return _decide(",
 )
 
 
-def _limits_at_the_first_loading_check(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    limits: list[int] = []
-    at_first: list[list[int]] = []
-    real_set, real_load = z3.Solver.set, z3.Z3_solver_check
-
-    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
-        if args and args[0] == "timeout":
-            limits.append(int(str(args[1])))
-        real_set(self, *args, **kwargs)
+def _loading_checks_without_a_watchdog(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    unwatched: list[int] = []
+    real_load = z3.Z3_solver_check
 
     def load(ctx: object, solver: object) -> int:
-        if not at_first:
-            at_first.append(list(limits))
+        if not any(t.name == "z3-watchdog" for t in threading.enumerate()):
+            unwatched.append(1)
         return int(real_load(ctx, solver))
 
-    monkeypatch.setattr(z3.Solver, "set", record)
     monkeypatch.setattr(z3, "Z3_solver_check", load)
     premises, claim = _chain(solver_mod._LOAD_ABOVE + 20)
     out = Z3Solver(30.0)._check_here(premises, claim)  # `_solve`, as its worker runs it
     assert out.reason == "not_entailed"
-    return at_first[0]
+    return unwatched
 
 
 def test_every_loading_check_runs_under_a_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    limits = _limits_at_the_first_loading_check(monkeypatch)
-    assert limits and 0 < limits[-1] <= 30_000
+    assert _loading_checks_without_a_watchdog(monkeypatch) == []
 
 
 def test_every_loading_check_runs_under_a_limit_kills_l01(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # AUDIT-24 #4, pinned: the guard above (and its twin in `test_solver_loading.py`)
-    # fails under L01.
-    _mutant(monkeypatch, solver_mod, "_load", *_L01)
-    limits = _limits_at_the_first_loading_check(monkeypatch)
-    assert not (limits and 0 < limits[-1] <= 30_000)
-
-
-# --------------------------------------------------------------------------
-# #5 (medium): the SG27 bound on a loading check's limit is derived from the constant
-# it bounds (mutant L02, `_RESET_SHARE = 0.1`, survived). The test asserts each limit
-# is at most `time left / _RESET_SHARE`, so any share passes it; at 0.1 a loading
-# check may be given 10x the time left. Here the bound is SG27's documented 0.9.
-# --------------------------------------------------------------------------
-
-_DOCUMENTED_RESET_SHARE: Final = 0.9
+    _mutant(monkeypatch, solver_mod, "_solve", *_L01)
+    assert _loading_checks_without_a_watchdog(monkeypatch) != []
 
 
 class _Clock:
@@ -293,50 +269,6 @@ class _Clock:
 
     def monotonic(self) -> float:
         return self.now
-
-
-def _loading_limits_over_the_time_left(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
-    """Each loading check "takes" 1% of a 1 s budget; the (limit, ms left) pairs where
-    the limit Z3 runs under exceeds the time left by more than the documented share."""
-    clock = _Clock()
-    deadline = clock.now + 1.0
-    limit = [0]
-    over: list[tuple[int, int]] = []
-    real_set, real_load = z3.Solver.set, z3.Z3_solver_check
-
-    def record(self: z3.Solver, *args: object, **kwargs: object) -> None:
-        if args and args[0] == "timeout":
-            limit[0] = int(str(args[1]))
-        real_set(self, *args, **kwargs)
-
-    def load(ctx: object, solver: object) -> int:
-        left_ms = int((deadline - clock.now) * 1000)
-        if limit[0] > left_ms / _DOCUMENTED_RESET_SHARE + 1:
-            over.append((limit[0], left_ms))
-        clock.now += 0.01
-        return int(real_load(ctx, solver))
-
-    monkeypatch.setattr(solver_mod, "time", clock)
-    monkeypatch.setattr(z3.Solver, "set", record)
-    monkeypatch.setattr(z3, "Z3_solver_check", load)
-    premises, claim = _chain(solver_mod._LOAD_ABOVE + 20)
-    assert Z3Solver(1.0)._check_here(premises, claim).reason == "timeout"
-    return over
-
-
-def test_a_loading_check_never_gets_more_than_the_documented_share(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert _loading_limits_over_the_time_left(monkeypatch) == []
-
-
-def test_a_loading_check_never_gets_more_than_the_documented_share_kills_l02(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # AUDIT-24 #5, pinned: the guard above (and its twin in `test_solver_loading.py`)
-    # fails under L02.
-    monkeypatch.setattr(solver_mod, "_RESET_SHARE", 0.1)
-    assert _loading_limits_over_the_time_left(monkeypatch) != []
 
 
 # --------------------------------------------------------------------------
@@ -546,8 +478,8 @@ def test_a_batch_with_a_new_sort_reuses_the_probe_under_f14(
 # now relies on). No deterministic test pins which time the guard measures.
 _LOADED: Final = "consistency = z3.sat if loading is None else _load(solver, loading, deadline)\n"
 _L06: Final = (
-    f"    {_LOADED}    started = time.monotonic()\n",
-    f"    started = time.monotonic()\n    {_LOADED}",
+    f"    {_LOADED}    started = _now()\n",
+    f"    started = _now()\n    {_LOADED}",
 )
 
 
@@ -579,5 +511,5 @@ def test_a_pool_that_loaded_slowly_gets_its_entailment_check(
 def test_a_pool_that_loaded_slowly_gets_its_entailment_check_under_l06(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _mutant(monkeypatch, solver_mod, "_solve", *_L06)
+    _mutant(monkeypatch, solver_mod, "_decide", *_L06)
     _a_pool_that_loaded_slowly_gets_its_entailment_check(monkeypatch)

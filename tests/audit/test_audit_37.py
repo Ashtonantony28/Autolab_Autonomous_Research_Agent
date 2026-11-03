@@ -130,6 +130,7 @@ def exit_run(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 
 
 @fork_only
+@pytest.mark.timeout(300)  # the fixture's checks run 50x a child's exit time, longer under load
 def test_a_child_forked_outside_a_start_spares_the_owners_worker(exit_run: dict[str, Any]) -> None:
     """Control: SG35's fix: the child's normal exit leaves the owner's busy worker running."""
     control = exit_run["control"]
@@ -138,6 +139,7 @@ def test_a_child_forked_outside_a_start_spares_the_owners_worker(exit_run: dict[
 
 
 @fork_only
+@pytest.mark.timeout(300)
 @pytest.mark.xfail(strict=True, reason="AUDIT-37 #1")
 def test_a_child_forked_during_a_worker_start_spares_that_worker(
     exit_run: dict[str, Any],
