@@ -29,7 +29,6 @@ _FACTOR: Final = 4.0
 
 
 @pytest.mark.perf
-@pytest.mark.xfail(strict=True, reason="AUDIT-42 #1")
 async def test_a_lending_checks_wall_stays_bounded_while_short_callers_stream() -> None:
     # 1 slot, no slow place. A runs-to-timeout check holds the slot and, once stuck, lends
     # its place; two short callers then keep that place busy. SG36 freezes the lender
@@ -65,7 +64,6 @@ async def test_a_lending_checks_wall_stays_bounded_while_short_callers_stream() 
 # --- #2: paused newcomers each hold a worker process and a pool thread --------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-42 #2")
 async def test_a_burst_of_new_runs_holds_worker_processes_bounded_by_the_places() -> None:
     # 2 slots and 2 slow places; 32 new tasks each make one runs-to-timeout check at once.
     # Each newcomer is lent a place, runs `_HARD_SLICES`, and is paused (not stopped) with
@@ -134,7 +132,6 @@ async def test_a_newcomer_that_gave_way_is_served_beside_a_stream_of_short_calle
 # --- #4: a watchdog thread per check --------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="AUDIT-42 #4")
 def test_checks_share_one_watchdog_thread() -> None:
     # SG36 starts and joins a `z3-watchdog` thread inside every check. Each start and join
     # is a hand-off between two threads, which waits for a CPU: measured in-process, it

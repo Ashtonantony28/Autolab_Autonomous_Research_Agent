@@ -168,7 +168,7 @@ def test_every_loading_check_runs_under_a_limit(monkeypatch: pytest.MonkeyPatch)
     real_load = z3.Z3_solver_check
 
     def load(ctx: object, solver: object) -> int:
-        if not any(t.name == "z3-watchdog" for t in threading.enumerate()):
+        if not solver_mod._Watchdog._armed:  # one thread watches every armed check (SG37)
             unwatched.append(1)
         return int(real_load(ctx, solver))
 

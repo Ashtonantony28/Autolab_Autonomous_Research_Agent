@@ -694,10 +694,10 @@ async def test_a_lent_place_pauses_the_slot_check_that_lent_it_under_r11(
         monkeypatch,
         SolverExecutor,
         "run",
-        "            if stuck:\n                slots.unstick(interrupt)\n"
-        "            slots.release(lent)\n        if extra",
-        "            if stuck:\n                slots.unstick()\n"
-        "            slots.release(lent)\n        if extra",
+        "                if stuck:\n                    slots.unstick(interrupt)\n"
+        "                slots.release(lent, interrupt)\n            if extra",
+        "                if stuck:\n                    slots.unstick()\n"
+        "                slots.release(lent, interrupt)\n            if extra",
     )
     assert await _paused_for_a_lent_place(monkeypatch, "ends") == ["pause C"]
 
@@ -933,7 +933,7 @@ class _Spinning(Exception):
 async def _a_newcomer_back_on_a_slot_while_a_short_caller_waits(
     monkeypatch: pytest.MonkeyPatch, clock: audit_40._Clock, executors: list[SolverExecutor]
 ) -> list[Any]:
-    """The results of the newcomer and the two short callers, in that order."""
+    """The results of the newcomer and the three short callers, in that order."""
     calls = [0]
     real_short_waiting = solver_mod._Slots.short_waiting
 
@@ -947,9 +947,9 @@ async def _a_newcomer_back_on_a_slot_while_a_short_caller_waits(
     executor = SolverExecutor(1, 0)
     executors.append(executor)
     log: list[str] = []
-    s1 = _Gated("s1", log)  # holds the place it is lent
-    go = {name: asyncio.Event() for name in ("s1", "s2")}
-    fns: dict[str, Callable[[], Any]] = {"s1": s1, "s2": lambda: "s2"}
+    s1, s3 = _Gated("s1", log), _Gated("s3", log)  # each holds the place it is lent
+    go = {name: asyncio.Event() for name in ("s1", "s2", "s3")}
+    fns: dict[str, Callable[[], Any]] = {"s1": s1, "s2": lambda: "s2", "s3": s3}
 
     async def short(name: str) -> Any:
         await executor.run(lambda: None)  # this task's last check was short
@@ -957,7 +957,7 @@ async def _a_newcomer_back_on_a_slot_while_a_short_caller_waits(
         return (await executor.run(fns[name]))[0]
 
     shorts = [asyncio.create_task(short(name)) for name in go]
-    await _until(lambda: len(executor._short) == 2)
+    await _until(lambda: len(executor._short) == 3)
     blocker, newcomer = _Gated("blocker", log), _Gated("new", log)
     held = asyncio.create_task(executor.run(blocker))
     assert await asyncio.to_thread(blocker.started.wait, _WAIT_S)
@@ -969,15 +969,19 @@ async def _a_newcomer_back_on_a_slot_while_a_short_caller_waits(
     go["s1"].set()
     assert await asyncio.to_thread(s1.started.wait, _WAIT_S)  # it gave way; s1 holds the place
     blocker.gate.set()
-    await held
+    await held  # s1, on the lent place, keeps the slot (AUDIT-43 #3)
+    s1.gate.set()
     await _until(lambda: slots.held == 1 and not slots._waiters)  # the newcomer has the slot
+    await _until(lambda: slots.stuck == 1)  # and lends it once more
+    go["s3"].set()
+    assert await asyncio.to_thread(s3.started.wait, _WAIT_S)  # s3 holds the lent place
     go["s2"].set()
     try:
         await _until(lambda: bool(slots._waiters) or shorts[1].done())  # s2 waits
         for _ in range(4):
             await asyncio.sleep(solver_mod._SLICE_S)  # the newcomer's loop runs a few slices
     finally:
-        s1.gate.set()
+        s3.gate.set()
         newcomer.gate.set()
         results = await asyncio.gather(new_task, *shorts, return_exceptions=True)
     return [r[0] if isinstance(r, tuple) else r for r in results]
@@ -987,7 +991,7 @@ async def test_a_newcomer_back_on_a_slot_waits_its_slices(
     monkeypatch: pytest.MonkeyPatch, clock: audit_40._Clock, executors: list[SolverExecutor]
 ) -> None:
     out = await _a_newcomer_back_on_a_slot_while_a_short_caller_waits(monkeypatch, clock, executors)
-    assert out == ["new", "s1", "s2"], out
+    assert out == ["new", "s1", "s2", "s3"], out
 
 
 @pytest.mark.xfail(strict=True, reason="AUDIT-44 #13")
@@ -996,7 +1000,7 @@ async def test_a_newcomer_back_on_a_slot_waits_its_slices_under_r01(
 ) -> None:
     _mutant(monkeypatch, SolverExecutor, "run", "ceded = lent and gave_way", "ceded = gave_way")
     out = await _a_newcomer_back_on_a_slot_while_a_short_caller_waits(monkeypatch, clock, executors)
-    assert out == ["new", "s1", "s2"], out
+    assert out == ["new", "s1", "s2", "s3"], out
 
 
 # --------------------------------------------------------------------------
@@ -1076,8 +1080,10 @@ async def _places_after_a_cancel_at_the_grant(
     assert await asyncio.to_thread(newcomer.started.wait, _WAIT_S)
     real_release = solver_mod._Slots.release
 
-    def release(self: solver_mod._Slots, lent: bool) -> None:
-        real_release(self, lent)
+    def release(
+        self: solver_mod._Slots, lent: bool, check: solver_mod._Interrupt | None = None
+    ) -> None:
+        real_release(self, lent, check)
         if lent and not new_task.done() and self.lent == 1:  # the newcomer got it back
             new_task.cancel()
 

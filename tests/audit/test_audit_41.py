@@ -116,7 +116,6 @@ def test_a_stuck_check_alone_ends_near_its_timeout(tmp_path: Path) -> None:
 
 @posix_only
 @pytest.mark.timeout(300)
-@pytest.mark.xfail(strict=True, reason="AUDIT-41 #1")
 def test_a_frozen_lender_ends_near_its_timeout_beside_a_short_stream(tmp_path: Path) -> None:
     # Today: the hard check ends only after the stream (6 timeouts) stops, at about
     # 6.8 timeouts, frozen the whole time; before SG36 it ended at 1.0 timeout.
